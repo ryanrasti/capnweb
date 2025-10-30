@@ -2,7 +2,7 @@
 // Licensed under the MIT license found in the LICENSE.txt file or at:
 //     https://opensource.org/license/mit
 
-import { StubHook, PropertyPath, RpcPayload, RpcStub, RpcPromise, withCallInterceptor, ErrorStubHook, mapImpl, PayloadStubHook, unwrapStubAndPath, unwrapStubNoProperties } from "./core.js";
+import { StubHook, PropertyPath, RpcPayload, RpcStub, RpcPromise, withCallInterceptor, mapImpl, PayloadStubHook, unwrapStubNoProperties } from "./core.js";
 import { Devaluator, Exporter, Importer, ExportId, ImportId, Evaluator } from "./serialize.js";
 
 let currentMapBuilder: MapBuilder | undefined;
@@ -243,14 +243,14 @@ class MapApplicator implements Importer {
     }
   }
 
-  apply(instructions: unknown[]): RpcPayload {
+  apply(instructions: unknown[], returnRaw: boolean = false): RpcPayload | unknown {
     try {
       if (instructions.length < 1) {
         throw new Error("Invalid empty mapper function.");
       }
 
       for (let instruction of instructions.slice(0, -1)) {
-        let payload = new Evaluator(this).evaluateCopy(instruction);
+        let payload = new Evaluator(this, true).evaluateCopy(instruction);
 
         // The payload almost always contains a single stub. As an optimization, unwrap it.
         if (payload.value instanceof RpcStub) {
@@ -264,7 +264,36 @@ class MapApplicator implements Importer {
         this.variables.push(new PayloadStubHook(payload));
       }
 
-      return new Evaluator(this).evaluateCopy(instructions[instructions.length - 1]);
+      const finalResult = new Evaluator(this, true).evaluateCopy(instructions[instructions.length - 1]);
+      
+      if (returnRaw) {
+        // Return the raw value instead of the RpcPayload
+        const value = finalResult.value;
+        
+        // Check if the result is a wrapper object from directInputHook
+        if (value && typeof value === 'object' && 'value' in (value as any) && 'parent' in (value as any) && 'owner' in (value as any)) {
+          // Unwrap the value from the wrapper object
+          return (value as any).value;
+        }
+        
+        // Check if the result is a Typegres object with toExpression method
+        if (value && typeof value === 'object' && typeof (value as any).toExpression === 'function') {
+          // This is likely a Typegres Bool or Any object, return it directly
+          return value;
+        }
+        
+        // Unwrap PayloadStubHook if present
+        if (value && typeof value === 'object' && 'payload' in (value as any)) {
+          const payload = (value as any).payload;
+          if (payload && payload.value !== undefined) {
+            return payload.value;
+          }
+        }
+        
+        return value;
+      }
+      
+      return finalResult;
     } finally {
       for (let variable of this.variables) {
         variable.dispose();
@@ -298,7 +327,7 @@ function applyMapToElement(input: unknown, parent: object | undefined, owner: Rp
   let inputHook = new PayloadStubHook(RpcPayload.deepCopyFrom(input, parent, owner));
   let mapper = new MapApplicator(captures, inputHook);
   try {
-    return mapper.apply(instructions);
+    return mapper.apply(instructions) as RpcPayload;
   } finally {
     mapper.dispose();
   }
@@ -335,6 +364,191 @@ mapImpl.applyMap = (input: unknown, parent: object | undefined, owner: RpcPayloa
     // TODO(perf): We should probably return a hook that allows pipelining but whose pull() doesn't
     //   resolve until all promises in the payload have been substituted.
     return new PayloadStubHook(result);
+  } finally {
+    for (let cap of captures) {
+      cap.dispose();
+    }
+  }
+}
+
+mapImpl.applyMapToMethod = (method: Function, parent: object | undefined, owner: RpcPayload | null,
+                            captures: StubHook[], instructions: unknown[]) => {
+  try {
+    // Create a function that can be called by the method
+    // This function will apply the recorded instructions to its input
+    const callbackFunc = (input: unknown) => {
+      
+      // We need to duplicate captures for each invocation since they might be disposed
+      let dupedCaptures = captures.map(cap => cap.dup());
+      
+      // The input already contains the actual Typegres objects, so we can use them directly
+      // Create a hook that can handle property access on Typegres objects
+      const directInputHook = {
+        get: (path: PropertyPath) => {
+          if (path.length === 0) {
+            return { value: input, parent: undefined, owner: null };
+          }
+          // Handle property access on the input object
+          let current = input;
+          for (const part of path) {
+            if (current && typeof current === 'object' && part in current) {
+              current = (current as any)[part];
+            } else {
+              return { value: undefined, parent: undefined, owner: null };
+            }
+          }
+          return { value: current, parent: undefined, owner: null };
+        },
+        call: (path: PropertyPath, argsPayload: unknown) => {
+          console.log("DBG directInputHook.call: path:", path);
+          console.log("DBG directInputHook.call: argsPayload:", argsPayload);
+          
+          // Extract the actual arguments from the RpcPayload
+          const args = (argsPayload as any)?.value || [];
+          console.log("DBG directInputHook.call: extracted args:", args);
+          
+          // Handle method calls on Typegres objects
+          let current: any = input;
+          let parent: any = input;
+          
+          // Navigate to the property, keeping track of the parent
+          for (let i = 0; i < path.length; i++) {
+            const part = path[i];
+            if (current && typeof current === 'object' && part in current) {
+              // For the last part, we want to keep the parent to use as 'this'
+              if (i < path.length - 1) {
+                parent = current;
+              } else {
+                parent = current; // The object that owns the method
+              }
+              current = current[part];
+            } else {
+              throw new Error(`Property ${part} not found`);
+            }
+          }
+          
+          // Call the method with the correct 'this' context
+          if (typeof current === 'function') {
+            const result = current.apply(parent, args);
+            return { value: result, parent: undefined, owner: null };
+          } else {
+            throw new Error(`Cannot call ${path.join('.')} - not a function`);
+          }
+        },
+        map: () => { throw new Error("Not implemented"); },
+        dup: () => directInputHook,
+        dispose: () => {},
+        pull: () => { throw new Error("Not implemented"); },
+        ignoreUnhandledRejections: () => {},
+        onBroken: () => { throw new Error("Not implemented"); }
+      };
+      
+      let mapper = new MapApplicator(dupedCaptures, directInputHook as any);
+      try {
+        // Use returnRaw=true to get the raw value instead of wrapped in RpcPayload
+        let value = mapper.apply(instructions, true);
+        console.log("DBG callback result before unwrap:", typeof value, (value as any)?.constructor?.name, value);
+
+        // Unwrap top-level wrapper returned by directInputHook.call
+        if (value && typeof value === 'object' && 'value' in (value as any) && 'parent' in (value as any) && 'owner' in (value as any)) {
+          console.log("DBG unwrap top-level directInput wrapper to:", (value as any).value?.constructor?.name);
+          return (value as any).value;
+        }
+
+        // Unwrap top-level PayloadStubHook to its payload value if present
+        if (value && typeof value === 'object' && 'payload' in (value as any)) {
+          const payload = (value as any).payload;
+          if (payload && payload.value !== undefined) {
+            console.log("DBG unwrap top-level PayloadStubHook to:", payload.value?.constructor?.name);
+            return payload.value;
+          }
+        }
+
+        // Unwrap top-level RpcStub/RpcPromise carrying a PayloadStubHook
+        if (value && typeof value === 'object' && 'raw' in (value as any)) {
+          const raw = (value as any).raw;
+          if (raw?.hook instanceof PayloadStubHook) {
+            const payload = (raw.hook as any).payload;
+            if (payload && payload.value !== undefined) {
+              console.log("DBG unwrap top-level RpcPromise->PayloadStubHook to:", payload.value?.constructor?.name);
+              return payload.value;
+            }
+          }
+        }
+
+        // The MapApplicator.apply method now handles Typegres object unwrapping
+
+        // If value looks like a Typegres value/expression, return it directly
+        if (value && typeof value === 'object' && (typeof (value as any).toExpression === 'function' || typeof (value as any).getClass === 'function')) {
+          return value;
+        }
+
+        // Check if we need to unwrap anything inside plain objects
+        if (value && typeof value === 'object') {
+          const rawValue: any = {};
+          for (const [k, v] of Object.entries(value)) {
+            // Preserve Typegres instances as-is
+            if (v && typeof v === 'object' && (typeof (v as any).toExpression === 'function' || typeof (v as any).getClass === 'function')) {
+              rawValue[k] = v;
+              continue;
+            }
+            
+            // Check if this is a wrapper object from directInputHook
+            if (v && typeof v === 'object' && 'value' in v && 'parent' in v && 'owner' in v) {
+              rawValue[k] = (v as any).value;
+              continue;
+            }
+            
+            // Check if this is a PayloadStubHook directly
+            if (v && typeof v === 'object' && 'payload' in v) {
+              const payload = (v as any).payload;
+              if (payload && payload.value !== undefined) {
+                rawValue[k] = payload.value;
+                continue;
+              }
+            }
+            
+            // Check if this is an RpcStub or RpcPromise
+            if (v && typeof v === 'object' && 'raw' in v) {
+              const raw = (v as any).raw;
+              
+              // Try to extract the actual value from the PayloadStubHook
+              if (raw?.hook instanceof PayloadStubHook) {
+                const payload = (raw.hook as any).payload;
+                if (payload) {
+                  rawValue[k] = payload.value;
+                  continue;
+                }
+              }
+              
+              // If it's an error stub, we can't unwrap it
+              if (raw?.hook?.error) {
+                // Return null or undefined for error stubs
+                rawValue[k] = undefined;
+              } else {
+                // Pass through if we can't unwrap
+                rawValue[k] = v;
+              }
+            } else {
+              // Not wrapped, use as-is
+              rawValue[k] = v;
+            }
+          }
+          console.log("DBG rawValue:", rawValue, rawValue.constructor?.name);
+          return rawValue;
+        }
+        
+        // The result contains promises that need to be preserved
+        return value;
+      } finally {
+        mapper.dispose();
+      }
+    };
+
+    // Call the method with the callback function
+    let result = method.call(parent, callbackFunc);
+    const payload = RpcPayload.fromAppReturn(result);
+    return new PayloadStubHook(payload);
   } finally {
     for (let cap of captures) {
       cap.dispose();

@@ -41,6 +41,38 @@ class NotSerializable {
   }
 }
 
+describe("callback test", () => {
+  class StringBox extends RpcTarget {
+    constructor(public value: string) {
+      super();
+    }
+    
+    toUpperCase(): string {
+      return this.value.toUpperCase();
+    }
+  }
+
+  class CallbackTarget extends RpcTarget {
+    vals = [new StringBox("a"), new StringBox("b"), new StringBox("c")];
+
+    mapVals(callback: (str: StringBox) => string): string[] {
+      const ret = this.vals.map(callback);
+      return ret;
+    }
+  }
+
+  it("can call a callback passed over RPC", async () => {
+    await using harness = new TestHarness(new CallbackTarget());
+    let stub = harness.stub;
+    const cb = (strBox: StringBox) => {
+      const ret = strBox.toUpperCase();
+      return ret;
+    };
+    let result = await stub.mapVals(cb);
+    expect(result).toEqual(["A", "B", "C"]);
+  });
+});
+
 describe("simple serialization", () => {
   it("can serialize", () => {
     for (let key in SERIALIZE_TEST_CASES) {

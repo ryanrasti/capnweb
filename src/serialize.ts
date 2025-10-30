@@ -274,7 +274,7 @@ const NULL_IMPORTER = new NullImporter();
 // delivery to the app. This is used to implement deserialization, except that it doesn't actually
 // start from a raw string.
 export class Evaluator {
-  constructor(private importer: Importer) {}
+  constructor(private importer: Importer, private skipWrapping: boolean = false) {}
 
   private stubs: RpcStub[] = [];
   private promises: LocatedPromise[] = [];
@@ -371,6 +371,10 @@ export class Evaluator {
           let isPromise = value[0] == "pipeline";
 
           let addStub = (hook: StubHook) => {
+            if (this.skipWrapping) {
+              // For map operations, don't wrap intermediate values to avoid infinite recursion
+              return hook;
+            }
             if (isPromise) {
               let promise = new RpcPromise(hook, []);
               this.promises.push({promise, parent, property});
