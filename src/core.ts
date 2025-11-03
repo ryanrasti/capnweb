@@ -2,7 +2,6 @@
 // Licensed under the MIT license found in the LICENSE.txt file or at:
 //     https://opensource.org/license/mit
 
-import { inspect } from "node:util";
 import type { RpcTargetBranded, __RPC_TARGET_BRAND } from "./types.js";
 
 // Polyfill Symbol.dispose for browsers that don't support it yet
