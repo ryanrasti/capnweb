@@ -2,7 +2,7 @@
 // Licensed under the MIT license found in the LICENSE.txt file or at:
 //     https://opensource.org/license/mit
 
-import { StubHook, PropertyPath, RpcPayload, RpcStub, RpcPromise, withCallInterceptor, mapImpl, PayloadStubHook, unwrapStubNoProperties } from "./core.js";
+import { StubHook, PropertyPath, RpcPayload, RpcStub, RpcPromise, withCallInterceptor, mapImpl, PayloadStubHook, unwrapStubNoProperties, RpcTarget } from "./core.js";
 import { Devaluator, Exporter, Importer, ExportId, ImportId, Evaluator } from "./serialize.js";
 
 let currentMapBuilder: MapBuilder | undefined;
@@ -371,7 +371,7 @@ mapImpl.applyMap = (input: unknown, parent: object | undefined, owner: RpcPayloa
   }
 }
 
-mapImpl.applyMapToMethod = (method: Function, parent: object | undefined, owner: RpcPayload | null,
+mapImpl.applyMapToMethod = async (method: Function, parent: object | undefined, owner: RpcPayload | null,
                             captures: StubHook[], instructions: unknown[]) => {
   try {
     // Create a function that can be called by the method
@@ -380,6 +380,59 @@ mapImpl.applyMapToMethod = (method: Function, parent: object | undefined, owner:
       
       // We need to duplicate captures for each invocation since they might be disposed
       let dupedCaptures = captures.map(cap => cap.dup());
+      
+      // Helper to resolve an RpcStub to its actual server-side instance
+      const resolveStub = (stub: any): any => {
+        if (!stub || typeof stub !== 'object') return stub;
+        
+        // If it's an RpcStub, try to get the actual object from its hook
+        if ('raw' in stub) {
+          const raw = stub.raw;
+          if (raw?.hook) {
+            const hook = raw.hook as any;
+            
+            // First try to get the target directly from the hook
+            if (typeof hook.getTarget === 'function') {
+              try {
+                return hook.getTarget();
+              } catch (e) {
+                // Hook might be disposed, continue to check captures
+              }
+            } else if (hook.target !== undefined) {
+              return hook.target;
+            }
+            
+            // Check if this hook corresponds to one of our captures
+            // The hook might be the same instance or a duplicate
+            for (let i = 0; i < dupedCaptures.length; i++) {
+              const captureHook = dupedCaptures[i] as any;
+              // Check if hooks are the same or if they wrap the same target
+              if (captureHook === hook || 
+                  (captureHook.target && hook.target && captureHook.target === hook.target)) {
+                // This is a capture, get the actual value from it
+                if (typeof captureHook.getTarget === 'function') {
+                  try {
+                    return captureHook.getTarget();
+                  } catch (e) {
+                    // Fall through
+                  }
+                } else if (captureHook.target !== undefined) {
+                  return captureHook.target;
+                } else if (captureHook.getValue) {
+                  try {
+                    const val = captureHook.getValue();
+                    return val?.value;
+                  } catch (e) {
+                    // Fall through
+                  }
+                }
+              }
+            }
+          }
+        }
+        
+        return stub;
+      };
       
       // The input already contains the actual Typegres objects, so we can use them directly
       // Create a hook that can handle property access on Typegres objects
@@ -400,12 +453,14 @@ mapImpl.applyMapToMethod = (method: Function, parent: object | undefined, owner:
           return { value: current, parent: undefined, owner: null };
         },
         call: (path: PropertyPath, argsPayload: unknown) => {
-          console.log("DBG directInputHook.call: path:", path);
-          console.log("DBG directInputHook.call: argsPayload:", argsPayload);
-          
           // Extract the actual arguments from the RpcPayload
-          const args = (argsPayload as any)?.value || [];
-          console.log("DBG directInputHook.call: extracted args:", args);
+          let args = (argsPayload as any)?.value || [];
+          
+          // Resolve any RpcStub arguments to their actual server-side instances
+          // This is needed because when RPC stubs are passed as arguments (like tg),
+          // we need to get the actual object on the server side
+          // Note: tg is a regular RPC argument, not a callback, so it shouldn't go through map()
+          args = args.map((arg: any) => resolveStub(arg));
           
           // Handle method calls on Typegres objects
           let current: any = input;
@@ -429,7 +484,10 @@ mapImpl.applyMapToMethod = (method: Function, parent: object | undefined, owner:
           
           // Call the method with the correct 'this' context
           if (typeof current === 'function') {
-            const result = current.apply(parent, args);
+            // Before calling, resolve any RpcStub arguments from captures
+            // Note: regular arguments like tg shouldn't go through map(), they're resolved here
+            const finalArgs = args.map((arg: any) => resolveStub(arg));
+            const result = current.apply(parent, finalArgs);
             return { value: result, parent: undefined, owner: null };
           } else {
             throw new Error(`Cannot call ${path.join('.')} - not a function`);
@@ -547,6 +605,13 @@ mapImpl.applyMapToMethod = (method: Function, parent: object | undefined, owner:
 
     // Call the method with the callback function
     let result = method.call(parent, callbackFunc);
+    
+    // If the result is a Promise, await it before creating the payload
+    // This prevents serialization errors when trying to send a Promise over RPC
+    if (result instanceof Promise) {
+      result = await result;
+    }
+    
     const payload = RpcPayload.fromAppReturn(result);
     return new PayloadStubHook(payload);
   } finally {
@@ -557,3 +622,8 @@ mapImpl.applyMapToMethod = (method: Function, parent: object | undefined, owner:
 }
 
 export function forceInitMap() {}
+
+// Overwrite the isInMapContext function from core.ts
+mapImpl.isInMapContext = (): boolean => {
+  return currentMapBuilder !== undefined;
+};
