@@ -301,7 +301,7 @@ export function withCallInterceptor<T>(interceptor: CallInterceptor, callback: (
 }
 
 // Private symbol which may be used to unwrap the real stub through the Proxy.
-let RAW_STUB = Symbol("realStub");
+export const RAW_STUB = Symbol("realStub");
 
 export interface RpcStub extends Disposable {
   // Declare magic `RAW_STUB` key that unwraps the proxy.
@@ -313,38 +313,19 @@ const PROXY_HANDLERS: ProxyHandler<{ raw: RpcStub }> = {
     const [arg, ...rest] = argumentsList;
     let stub = target.raw;
     const path = stub.pathIfPromise || [];
-    // Log when execute is being called to see what's happening
-    if (path.length > 0 && path[path.length - 1] === "execute") {
-      console.log(
-        "DBG PROXY_HANDLERS.apply: execute - argumentsList:",
-        argumentsList,
-        "arg type:",
-        typeof arg,
-        "rest.length:",
-        rest.length,
-      );
-    }
     // Only use map machinery if we're NOT already inside a map context
     // This prevents infinite recursion when doRpc calls callbacks with RPC stubs
-    // IMPORTANT: tg should NOT go through map() - it's a regular RPC argument, not a callback
-    if (typeof arg === "function" && rest.length === 0 && !mapImpl.isInMapContext()) {
-      // When a function is the sole argument, use the record-replay mechanism
+    // IMPORTANT: Only treat plain functions as callbacks, not RpcStubs (which are also callable)
+    if (
+      typeof arg === "function" &&
+      rest.length === 0 &&
+      !mapImpl.isInMapContext() &&
+      !(arg as any)?.[RAW_STUB] &&
+      !(arg as any)?.raw
+    ) {
+      // When a plain function (not an RpcStub) is the sole argument, use the record-replay mechanism
       let { hook, pathIfPromise } = target.raw;
-      // Check if this is execute - if so, don't use map machinery
-      if (pathIfPromise && pathIfPromise.length > 0 && pathIfPromise[pathIfPromise.length - 1] === "execute") {
-        console.log("DBG PROXY_HANDLERS.apply: execute called with function arg - this should NOT use map!");
-        // Fall through to normal RPC call
-      } else {
-        return mapImpl.sendMap(hook, pathIfPromise || [], arg);
-      }
-    }
-    // Log when execute is called (it will have pathIfPromise containing 'execute')
-    if (path.length > 0 && path[path.length - 1] === "execute") {
-      console.log("DBG PROXY_HANDLERS.apply: execute called");
-      console.log("  path:", path);
-      console.log("  argumentsList:", argumentsList);
-      console.log("  argumentsList.length:", argumentsList.length);
-      console.log("  calling doCall with args payload:", RpcPayload.fromAppParams(argumentsList).value);
+      return mapImpl.sendMap(hook, pathIfPromise || [], arg);
     }
     return new RpcPromise(doCall(stub.hook, stub.pathIfPromise || [], RpcPayload.fromAppParams(argumentsList)), []);
   },
@@ -1024,100 +1005,60 @@ export class RpcPayload {
   // dispose().
   public async deliverCall(func: Function, thisArg: object | undefined): Promise<RpcPayload> {
     try {
-      console.log("DBG deliverCall: START");
-      console.log("  func.name:", func.name);
-      console.log("  func:", func);
-      console.log("  thisArg:", thisArg);
-      console.log("  this.value (before deliverTo):", this.value);
-
       let promises: Promise<void>[] = [];
       this.deliverTo(this, "value", promises);
-
-      console.log("  promises.length:", promises.length);
-      console.log("  this.value (after deliverTo):", this.value);
 
       // WARNING: It is critical that if the promises list is empty, we do not await anything, so
       //   that the function is called immediately and synchronously. Otherwise, we might violate
       //   e-order.
       if (promises.length > 0) {
         await Promise.all(promises);
-        console.log("  awaited promises, this.value now:", this.value);
       }
 
       // Resolve any RpcStub arguments to their actual server-side instances
       // This is needed when RPC stubs are passed as method arguments (like tg in execute(tg))
       // Note: tg shouldn't go through map() - it's a regular RPC argument, not a callback
       let args = this.value;
-      console.log("  args (before resolution):", args);
-      console.log("  args type:", typeof args, "isArray:", Array.isArray(args));
 
       if (Array.isArray(args)) {
-        args = args.map((arg: any, index: number) => {
-          console.log(`    arg[${index}]:`, arg, "type:", typeof arg);
-
+        args = args.map((arg: any) => {
           // Skip if it's already not an RpcStub
           // RpcStubs are callable functions. To access the raw property, we need to use RAW_STUB
           // because accessing .raw on the proxy goes through the get handler and creates a new RpcPromise
           if (!arg || (typeof arg !== "object" && typeof arg !== "function")) {
-            console.log(`    arg[${index}] is not an object/function, returning as-is`);
             return arg;
           }
 
           // Try to access the raw property using RAW_STUB to bypass the proxy
           const raw = (arg as any)?.[RAW_STUB] || (arg as any)?.raw;
-          console.log(`    arg[${index}] raw (via RAW_STUB or .raw):`, raw);
 
           if (!raw) {
-            console.log(`    arg[${index}] has no raw property, returning as-is`);
             return arg;
           }
 
           if (raw?.hook) {
             const hook = raw.hook as any;
-            console.log(
-              `    arg[${index}] hook type:`,
-              hook?.constructor?.name,
-              "has getTarget:",
-              typeof hook.getTarget === "function",
-              "has target:",
-              hook.target !== undefined,
-            );
 
             // Check if it's a TargetStubHook (which wraps RpcTarget instances like Typegres)
             if (typeof hook.getTarget === "function") {
               try {
-                const target = hook.getTarget();
-                console.log(
-                  `    arg[${index}] resolved to target:`,
-                  target?.constructor?.name,
-                  "instanceof RpcTarget:",
-                  target instanceof RpcTarget,
-                );
                 // Return the actual target, not an RpcStub
-                return target;
+                return hook.getTarget();
               } catch (e) {
-                console.log(`    arg[${index}] getTarget() failed:`, e);
                 // Hook might be disposed, return as-is
                 return arg;
               }
             } else if (hook.target !== undefined) {
-              console.log(`    arg[${index}] resolved via target property:`, hook.target?.constructor?.name);
               // Direct access to target (bypassing private getTarget)
               return hook.target;
             }
           }
-          console.log(`    arg[${index}] could not resolve, returning as-is`);
           return arg;
         });
       }
 
-      console.log("  args (after resolution):", args);
-      console.log("  calling func with args:", args);
-
       // Call the function.
       let result = Function.prototype.apply.call(func, thisArg, args);
-
-      console.log("  result:", result, "type:", typeof result, "isPromise:", result instanceof Promise);
 
       if (result instanceof RpcPromise) {
         // Special case: If the function immediately returns RpcPromise, we don't want to await it,
