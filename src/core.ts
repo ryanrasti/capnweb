@@ -2,7 +2,7 @@
 // Licensed under the MIT license found in the LICENSE.txt file or at:
 //     https://opensource.org/license/mit
 
-import type { RpcTargetBranded, __RPC_TARGET_BRAND } from "./types.js";
+import type { RpcTargetBranded, __RPC_TARGET_BRAND, GlobalRpcSessionOptions } from "./types.js";
 import { WORKERS_MODULE_SYMBOL } from "./symbols.js"
 
 // Polyfill Symbol.dispose for browsers that don't support it yet
@@ -43,6 +43,13 @@ type TypeForRpc = "unsupported" | "primitive" | "object" | "function" | "array" 
 
 const AsyncFunction = (async function () {}).constructor;
 
+
+export let getGlobalRpcSessionOptions: () => GlobalRpcSessionOptions = () => ({});
+
+export const setGlobalRpcSessionOptions = (options: (() => GlobalRpcSessionOptions)) => {
+  getGlobalRpcSessionOptions = options;
+}
+
 export function typeForRpc(value: unknown): TypeForRpc {
   switch (typeof value) {
     case "boolean":
@@ -70,6 +77,20 @@ export function typeForRpc(value: unknown): TypeForRpc {
   if (value === null) {
     return "primitive";
   }
+
+  // // Check for RpcStub/RpcPromise wrapped in proxy first
+  // // These are proxied with a function target, so we need to check for them before
+  // // checking Function.prototype
+  // if (RAW_STUB in <any>value) {
+  //   // It's a proxied RpcStub or RpcPromise
+  //   let stub = (<any>value)[RAW_STUB];
+  //   //console.log("Found proxied stub/promise:", stub, "is RpcPromise?", stub instanceof RpcPromise);
+  //   if (stub instanceof RpcPromise) {
+  //     return "rpc-promise";
+  //   } else {
+  //     return "stub";
+  //   }
+  // }
 
   // Aside from RpcTarget, we generally don't support serializing *subclasses* of serializable
   // types, so we switch on the exact prototype rather than use `instanceof` here.
@@ -134,7 +155,7 @@ function mapNotLoaded(): never {
 
 // map() is implemented in `map.ts`. We can't import it here because it would create an import
 // cycle, so instead we define two hook functions that map.ts will overwrite when it is imported.
-export let mapImpl: MapImpl = { applyMap: mapNotLoaded, sendMap: mapNotLoaded };
+export let mapImpl: MapImpl = { applyMap: mapNotLoaded, sendMap: mapNotLoaded, recordCallback: mapNotLoaded };
 
 type MapImpl = {
   // Applies a map function to an input value (usually an array).
@@ -145,6 +166,8 @@ type MapImpl = {
   // Implements the .map() method of RpcStub.
   sendMap(hook: StubHook, path: PropertyPath, func: (value: RpcPromise) => unknown)
          : RpcPromise;
+
+  recordCallback(callback: Function): StubHook;
 }
 
 // Inner interface backing an RpcStub or RpcPromise.
@@ -282,6 +305,7 @@ export interface RpcStub extends Disposable {
 const PROXY_HANDLERS: ProxyHandler<{raw: RpcStub}> = {
   apply(target: {raw: RpcStub}, thisArg: any, argumentsList: any[]) {
     let stub = target.raw;
+    //console.log("apply", stub.hook, stub.pathIfPromise, argumentsList);
     return new RpcPromise(doCall(stub.hook,
         stub.pathIfPromise || [], RpcPayload.fromAppParams(argumentsList)), []);
   },
@@ -1354,6 +1378,7 @@ abstract class ValueStubHook extends StubHook {
   call(path: PropertyPath, args: RpcPayload): StubHook {
     try {
       let {value, owner} = this.getValue();
+      //console.log("call value:", value, "owner:", owner, "path:", path);
       let followResult = followPath(value, undefined, path, owner);
 
       if (followResult.hook) {
@@ -1362,6 +1387,7 @@ abstract class ValueStubHook extends StubHook {
 
       // It's a local function.
       if (typeof followResult.value != "function") {
+        console.log("followResult.value is not a function:", followResult, followResult.value, typeof followResult.value);
         throw new TypeError(`'${path.join('.')}' is not a function.`);
       }
       let promise = args.deliverCall(followResult.value, followResult.parent);

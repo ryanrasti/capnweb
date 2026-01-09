@@ -130,6 +130,7 @@ class MapBuilder implements Exporter {
     // TODO(someday): Consider carefully if the inline syntax is maybe OK. If so, perhaps the
     //   serializer could try calling `getImport()` even for known-local hooks.
     // TODO(someday): Do we need to support rpc-thenable somehow?
+    console.log("exportStub", hook);
     throw new Error(
         "Can't construct an RpcTarget or RPC callback inside a mapper function. Try creating a " +
         "new RpcStub outside the callback first, then using it inside the callback.");
@@ -172,6 +173,22 @@ mapImpl.sendMap = (hook: StubHook, path: PropertyPath, func: (promise: RpcPromis
   }
 
   return new RpcPromise(builder.makeOutput(result), []);
+}
+
+mapImpl.recordCallback =  (func: Function) => {
+  const builder = new MapBuilder(new PayloadStubHook(RpcPayload.fromAppParams([])), []);
+  let result: RpcPayload;
+  try {
+    result = RpcPayload.fromAppReturn(withCallInterceptor(builder.pushCall.bind(builder), () => {
+      return func(new RpcPromise(builder.makeInput(), []));
+    }));
+  } finally {
+    builder.unregister();
+  }
+  console.log("func is:", func.toString());
+  const res = Devaluator.devaluate(result.value, undefined, builder, result)
+  console.log("res is:", res);
+  return res
 }
 
 function throwMapperBuilderUseError(): never {

@@ -3,6 +3,8 @@
 //     https://opensource.org/license/mit
 
 import { StubHook, RpcPayload, typeForRpc, RpcStub, RpcPromise, LocatedPromise, RpcTarget, PropertyPath, unwrapStubAndPath } from "./core.js";
+import { getGlobalRpcSessionOptions } from "./core.js";
+import { mapImpl } from "./core.js";
 
 export type ImportId = number;
 export type ExportId = number;
@@ -80,7 +82,16 @@ export class Devaluator {
       : unknown {
     let devaluator = new Devaluator(exporter, source);
     try {
-      return devaluator.devaluateImpl(value, parent, 0);
+      const res = devaluator.devaluateImpl(value, parent, 0);
+      console.log("devaluate res is:", res);
+      if (Array.isArray(res) && res[0] === 'error') {
+        try {
+          throw new Error(res.toString())
+        } catch (err) {
+          console.log("stack is:", err.stack);
+        }
+      }
+      return res;
     } catch (err) {
       if (devaluator.exports) {
         try {
@@ -188,6 +199,10 @@ export class Devaluator {
 
       case "stub":
       case "rpc-promise": {
+
+        
+    
+
         if (!this.source) {
           throw new Error("Can't serialize RPC stubs in this context.");
         }
@@ -218,6 +233,15 @@ export class Devaluator {
 
       case "function":
       case "rpc-target": {
+    
+        // Check if any argument is a function and we're in recordReplayMode 'all'
+        if (getGlobalRpcSessionOptions().recordReplayMode === 'all' && kind === 'function') {
+          console.log("recordCallback", value);
+          const res = mapImpl.recordCallback(value as Function);
+          console.log("recordCallback res is:", res);
+          return res;
+        }
+
         if (!this.source) {
           throw new Error("Can't serialize RPC stubs in this context.");
         }
@@ -306,6 +330,7 @@ export class Evaluator {
   }
 
   private evaluateImpl(value: unknown, parent: object, property: string | number): unknown {
+    console.log("evaluateImpl", value, parent, property);
     if (value instanceof Array) {
       if (value.length == 1 && value[0] instanceof Array) {
         // Escaped array. Evaluate the contents.
@@ -345,7 +370,9 @@ export class Evaluator {
         case "error":
           if (value.length >= 3 && typeof value[1] === "string" && typeof value[2] === "string") {
             let cls = ERROR_TYPES[value[1]] || Error;
+            console.log("cls is:", cls);
             let result = new cls(value[2]);
+            console.log("result is:", result);
             if (typeof value[3] === "string") {
               result.stack = value[3];
             }

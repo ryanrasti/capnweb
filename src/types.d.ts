@@ -4,6 +4,10 @@
 
 // This file borrows heavily from `types/defines/rpc.d.ts` in workerd.
 
+export type GlobalRpcSessionOptions = {
+  recordReplayMode?: 'map' | 'all';
+}
+
 // Branded types for identifying `WorkerEntrypoint`/`DurableObject`/`Target`s.
 // TypeScript uses *structural* typing meaning anything with the same shape as type `T` is a `T`.
 // For the classes exported by `cloudflare:workers` we want *nominal* typing (i.e. we only want to

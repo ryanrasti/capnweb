@@ -16,6 +16,11 @@ export class Counter extends RpcTarget {
     return this.i;
   }
 
+  do<R>(fn: (c: Counter) => R): R {
+    console.log("do fn is:", fn.toString());
+    return fn(this);
+  }
+
   get value() {
     return this.i;
   }
