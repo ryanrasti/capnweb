@@ -1560,7 +1560,7 @@ type BoxedRefcount = { count: number };
 // the root of the payload happens to be an RpcTarget), but there can only be one RpcPayload
 // pointing at an RpcTarget whereas there can be several TargetStubHooks pointing at it. Also,
 // TargetStubHook cannot be pull()ed, because it always backs an RpcStub, not an RpcPromise.
-class TargetStubHook extends ValueStubHook {
+export class TargetStubHook extends ValueStubHook {
   // Constructs a TargetStubHook that is not duplicated from an existing hook.
   //
   // If `value` is a function, `parent` is bound as its "this".

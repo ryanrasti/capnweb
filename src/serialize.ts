@@ -2,9 +2,10 @@
 // Licensed under the MIT license found in the LICENSE.txt file or at:
 //     https://opensource.org/license/mit
 
-import { StubHook, RpcPayload, typeForRpc, RpcStub, RpcPromise, LocatedPromise, RpcTarget, PropertyPath, unwrapStubAndPath } from "./core.js";
+import { StubHook, RpcPayload, typeForRpc, RpcStub, RpcPromise, LocatedPromise, RpcTarget, PropertyPath, unwrapStubAndPath, PayloadStubHook, TargetStubHook } from "./core.js";
 import { getGlobalRpcSessionOptions } from "./core.js";
 import { mapImpl } from "./core.js";
+import { MapApplicator } from "./map.js";
 
 export type ImportId = number;
 export type ExportId = number;
@@ -340,6 +341,53 @@ export class Evaluator {
         }
         return result;
       } else switch (value[0]) {
+        case "callback": {
+          // Handle recorded callbacks - create a replay function
+          if (value.length >= 3) {
+            const [tag, capturesData, instructions] = value;
+            const importer = this; // Capture the importer context
+            
+            // Create a function that replays the recorded behavior
+            return function(...args: any[]) {
+              console.log("Replaying callback with args:", args);
+              
+              // Resolve captures
+              const captures = (capturesData as any[]).map((cap: any) => {
+                if (Array.isArray(cap) && cap[0] === 'import' && typeof cap[1] === 'number') {
+                  return importer.getExport(cap[1]);
+                }
+                return undefined;
+              }).filter((c: any) => c !== undefined);
+              
+              // For RPC callbacks, we expect a single argument (the object being operated on)
+              // Wrap it as a stub so the recorded operations can work on it
+              let inputHook;
+              if (args.length === 1 && typeof args[0] === 'object') {
+                // Create a stub hook around the actual object
+                inputHook = TargetStubHook.create(args[0], undefined);
+              } else {
+                // Fall back to wrapping as parameters
+                inputHook = new PayloadStubHook(RpcPayload.fromAppParams(args));
+              }
+              
+              // Apply the recorded instructions
+              const applicator = new MapApplicator(captures, inputHook);
+              try {
+                const resultPayload = applicator.apply(instructions as any[]);
+                
+                // deliverResolve is async, but we want synchronous behavior for callbacks
+                // For now, just return the value directly if it's simple
+                const resultValue = (resultPayload as any).value;
+                console.log("Result value:", resultValue);
+                return resultValue;
+              } catch (err) {
+                console.error("Error replaying callback:", err);
+                throw err;
+              }
+            };
+          }
+          throw new Error("Invalid callback format");
+        }
         case "bigint":
           if (typeof value[1] == "string") {
             return BigInt(value[1]);

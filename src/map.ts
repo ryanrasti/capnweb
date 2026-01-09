@@ -186,9 +186,20 @@ mapImpl.recordCallback =  (func: Function) => {
     builder.unregister();
   }
   console.log("func is:", func.toString());
-  const res = Devaluator.devaluate(result.value, undefined, builder, result)
-  console.log("res is:", res);
-  return res
+  
+  // Devaluate the result and wrap in a callback marker
+  const devaluatedResult = Devaluator.devaluate(result.value, undefined, builder, result);
+  
+  // Access the private context via a getter method or directly access the instructions
+  // The instructions already contain the operations, and the final result
+  const instructions = [...(builder as any).instructions, devaluatedResult];
+  
+  // Get captures from the private context
+  const context = (builder as any).context;
+  const captures = context.parent ? context.captures : [];
+  
+  console.log("res is:", ["callback", captures, instructions]);
+  return ["callback", captures, instructions];
 }
 
 function throwMapperBuilderUseError(): never {
@@ -358,5 +369,7 @@ mapImpl.applyMap = (input: unknown, parent: object | undefined, owner: RpcPayloa
     }
   }
 }
+
+export { MapApplicator };
 
 export function forceInitMap() {}
