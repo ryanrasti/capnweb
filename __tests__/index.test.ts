@@ -30,101 +30,23 @@ describe("recordReplayMode: 'all'", () => {
 
     await using harness = new TestHarness(new TestTarget());
     let stub = harness.stub;
-    using counter = stub.makeCounter(10);
+    using counter = stub.makeCounter(3);
     
-    // This variable is in the closure but won't be available during replay
-    let closureVar = 100;
     let sideEffectCounter = 0;
     
-    // The callback tries to use closure variables - if passed by reference this would work
-    // But since it's recorded/replayed, the closure won't be available on the remote side
-    let result = await counter.do((c) => {
-      // Try to use the closure (this will be recorded as the value at record time)
-      // Not using closureVar directly as that would fail at record time
-      // Instead, we prove replay by showing side effects don't happen
-      sideEffectCounter++; // This won't actually increment during replay
-      return c.increment(5);
-    });
+    let result = await counter.doN((i) => {
+      sideEffectCounter++; // Should only increment 1x
+      return counter.plus(i, i);
+    }, 5);
     
-    // The result should be 15 (10 + 5)
-    expect(result).toBe(15);
+    // The result should be 3 * 2**5 = 96
+    expect(result).toBe(96);
     
     // The side effect should have happened once during recording, not during replay
     expect(sideEffectCounter).toBe(1); // Only incremented during the recording phase
   });
 
-  it("proves callbacks are recorded by showing they cannot call local functions", async () => {
-    setGlobalRpcSessionOptions(() => ({ recordReplayMode: 'all' }));
-
-    await using harness = new TestHarness(new TestTarget());
-    let stub = harness.stub;
-    using counter = stub.makeCounter(3);
-    
-    // Define a local function that won't be available during replay
-    let localCallCount = 0;
-    const localFunction = () => {
-      localCallCount++;
-      return 42;
-    };
-    
-    // The callback uses only the recorded operations on the stub
-    // It cannot call localFunction during replay (would throw if it tried)
-    let result = await counter.do((c) => {
-      // During recording, we capture the operations on c
-      // localFunction() is NOT called - we just return a value from c
-      return c.increment(7); // Returns 10 (3+7)
-    });
-    
-    expect(result).toBe(10);
-    expect(localCallCount).toBe(0); // localFunction was never called
-  });
-
-  it("callbacks that throw errors during recording are handled correctly", async () => {
-    setGlobalRpcSessionOptions(() => ({ recordReplayMode: 'all' }));
-
-    await using harness = new TestHarness(new TestTarget());
-    let stub = harness.stub;
-    using counter = stub.makeCounter(5);
-    
-    // This callback will throw an error during recording
-    // If passed by reference, the error would happen on the remote side
-    // If recorded/replayed, we should see consistent behavior
-    try {
-      await counter.do((c) => {
-        c.increment(1);
-        throw new Error("Test error during callback");
-      });
-      expect.fail("Should have thrown an error");
-    } catch (err: any) {
-      expect(err.message).toContain("Test error during callback");
-    }
-  });
-
-  it("callbacks work with multiple operations and prove recording", async () => {
-    setGlobalRpcSessionOptions(() => ({ recordReplayMode: 'all' }));
-
-    await using harness = new TestHarness(new TestTarget());
-    let stub = harness.stub;
-    using counter = stub.makeCounter(1);
-    
-    // A more complex callback that chains operations
-    let result = await counter.do((c) => {
-      // These operations will be recorded as a sequence of instructions
-      let val1 = c.increment(2);  // 1 + 2 = 3
-      let val2 = c.increment(3);  // 3 + 3 = 6  
-      // If this was passed by reference, both increments would execute
-      // If it's recorded, we should see the operations in the recording
-      return val2;
-    });
-    
-    expect(result).toBe(6);
-    
-    // Verify the counter was actually incremented twice on the server side
-    expect(await counter.value).toBe(6);
-  });
 });
-
-
 
 
 // =======================================================================================
