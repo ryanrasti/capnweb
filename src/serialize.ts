@@ -84,12 +84,10 @@ export class Devaluator {
     let devaluator = new Devaluator(exporter, source);
     try {
       const res = devaluator.devaluateImpl(value, parent, 0);
-      console.log("devaluate res is:", res);
       if (Array.isArray(res) && res[0] === 'error') {
         try {
           throw new Error(res.toString())
         } catch (err) {
-          console.log("stack is:", err.stack);
         }
       }
       return res;
@@ -237,10 +235,18 @@ export class Devaluator {
     
         // Check if any argument is a function and we're in recordReplayMode 'all'
         if (getGlobalRpcSessionOptions().recordReplayMode === 'all' && kind === 'function') {
-          console.log("recordCallback", value);
-          const res = mapImpl.recordCallback(value as Function);
-          console.log("recordCallback res is:", res);
-          return res;
+          const res = mapImpl.recordCallback(value as Function) as any;
+          // res is ["callback", StubHook[], instructions]
+          // Serialize captures the same way sendMap does: check if already an import, otherwise export
+          const serializedCaptures = (res[1] as StubHook[]).map(stub => {
+            const importId = this.exporter.getImport(stub);
+            if (importId !== undefined) {
+              return ["import", importId];
+            } else {
+              return ["export", this.exporter.exportStub(stub)];
+            }
+          });
+          return ["callback", serializedCaptures, res[2]];
         }
 
         if (!this.source) {
@@ -331,7 +337,6 @@ export class Evaluator {
   }
 
   private evaluateImpl(value: unknown, parent: object, property: string | number): unknown {
-    console.log("evaluateImpl", value, parent, property);
     if (value instanceof Array) {
       if (value.length == 1 && value[0] instanceof Array) {
         // Escaped array. Evaluate the contents.
@@ -345,43 +350,41 @@ export class Evaluator {
           // Handle recorded callbacks - create a replay function
           if (value.length >= 3) {
             const [tag, capturesData, instructions] = value;
-            const importer = this; // Capture the importer context
+            const evaluator = this; // Capture the evaluator context
             
             // Create a function that replays the recorded behavior
             return function(...args: any[]) {
-              console.log("Replaying callback with args:", args);
-              
-              // Resolve captures
+              // Resolve captures - handle both import and export, same as sendMap does
               const captures = (capturesData as any[]).map((cap: any) => {
-                if (Array.isArray(cap) && cap[0] === 'import' && typeof cap[1] === 'number') {
-                  return importer.getExport(cap[1]);
+                if (Array.isArray(cap) && typeof cap[1] === 'number') {
+                  if (cap[0] === 'import') {
+                    const hook = (evaluator as any).importer.getExport(cap[1]);
+                    return hook ? hook.dup() : undefined;
+                  } else if (cap[0] === 'export') {
+                    const hook = (evaluator as any).importer.importStub(cap[1]);
+                    return hook ? hook.dup() : undefined;
+                  }
                 }
                 return undefined;
               }).filter((c: any) => c !== undefined);
               
-              // For RPC callbacks, we expect a single argument (the object being operated on)
-              // Wrap it as a stub so the recorded operations can work on it
-              let inputHook;
-              if (args.length === 1 && typeof args[0] === 'object') {
-                // Create a stub hook around the actual object
+              // Wrap input arguments as a stub hook
+              let inputHook: StubHook;
+              if (args.length === 1 && typeof args[0] === 'object' && args[0] !== null) {
+                // Single object argument - likely an RpcTarget
                 inputHook = TargetStubHook.create(args[0], undefined);
               } else {
-                // Fall back to wrapping as parameters
-                inputHook = new PayloadStubHook(RpcPayload.fromAppParams(args));
+                // Single primitive or multiple args - unwrap single arg for primitives
+                const inputVal = args.length === 1 ? args[0] : args;
+                inputHook = new PayloadStubHook(RpcPayload.fromAppParams(inputVal));
               }
               
               // Apply the recorded instructions
               const applicator = new MapApplicator(captures, inputHook);
               try {
                 const resultPayload = applicator.apply(instructions as any[]);
-                
-                // deliverResolve is async, but we want synchronous behavior for callbacks
-                // For now, just return the value directly if it's simple
-                const resultValue = (resultPayload as any).value;
-                console.log("Result value:", resultValue);
-                return resultValue;
+                return (resultPayload as any).value;
               } catch (err) {
-                console.error("Error replaying callback:", err);
                 throw err;
               }
             };
@@ -418,9 +421,7 @@ export class Evaluator {
         case "error":
           if (value.length >= 3 && typeof value[1] === "string" && typeof value[2] === "string") {
             let cls = ERROR_TYPES[value[1]] || Error;
-            console.log("cls is:", cls);
             let result = new cls(value[2]);
-            console.log("result is:", result);
             if (typeof value[3] === "string") {
               result.stack = value[3];
             }

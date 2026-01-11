@@ -21,8 +21,8 @@ export class Counter extends RpcTarget {
     return fn(this);
   }
 
-  doN(fn: (s: string) => string, n: number): string {
-    let result = this.i.toString();
+  doN(fn: (s: number) => number, n: number): number {
+    let result = this.i
     for (let i = 0; i < n; i++) {
       result = fn(result);
     }

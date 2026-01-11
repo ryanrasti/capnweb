@@ -130,7 +130,6 @@ class MapBuilder implements Exporter {
     // TODO(someday): Consider carefully if the inline syntax is maybe OK. If so, perhaps the
     //   serializer could try calling `getImport()` even for known-local hooks.
     // TODO(someday): Do we need to support rpc-thenable somehow?
-    console.log("exportStub", hook);
     throw new Error(
         "Can't construct an RpcTarget or RPC callback inside a mapper function. Try creating a " +
         "new RpcStub outside the callback first, then using it inside the callback.");
@@ -175,7 +174,7 @@ mapImpl.sendMap = (hook: StubHook, path: PropertyPath, func: (promise: RpcPromis
   return new RpcPromise(builder.makeOutput(result), []);
 }
 
-mapImpl.recordCallback =  (func: Function) => {
+mapImpl.recordCallback =  (func: Function): any => {
   const builder = new MapBuilder(new PayloadStubHook(RpcPayload.fromAppParams([])), []);
   let result: RpcPayload;
   try {
@@ -185,8 +184,6 @@ mapImpl.recordCallback =  (func: Function) => {
   } finally {
     builder.unregister();
   }
-  console.log("func is:", func.toString());
-  
   // Devaluate the result and wrap in a callback marker
   const devaluatedResult = Devaluator.devaluate(result.value, undefined, builder, result);
   
@@ -196,9 +193,9 @@ mapImpl.recordCallback =  (func: Function) => {
   
   // Get captures from the private context
   const context = (builder as any).context;
-  const captures = context.parent ? context.captures : [];
-  
-  console.log("res is:", ["callback", captures, instructions]);
+  // When there's no parent, context.captures is StubHook[]
+  // When there's a parent, context.captures is number[] (parent indices), which we don't want
+  const captures = context.parent ? [] : context.captures;
   return ["callback", captures, instructions];
 }
 

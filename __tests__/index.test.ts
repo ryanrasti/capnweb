@@ -39,7 +39,7 @@ describe("recordReplayMode: 'all'", () => {
       return counter.plus(i, i);
     }, 5);
     
-    // The result should be 3 * 2**5 = 96
+    // The result should be 3 + 3 + 6 + 9 + 12 + 15 = 48
     expect(result).toBe(96);
     
     // The side effect should have happened once during recording, not during replay
@@ -907,6 +907,22 @@ describe("map() over RPC", () => {
       [[], [0], [0], [0, 1], [0, 1, 1], [0, 1, 1, 2, 3], [0, 1, 1, 2, 3, 5, 8, 13],
           [0, 1, 1, 2, 3, 5, 8, 13, 21, 34, 55, 89, 144]],
     ]);
+  });
+
+  it("supports map() with closure variable capture (remote stub)", async () => {
+    await using harness = new TestHarness(new TestTarget());
+    let stub = harness.stub;
+    using counter = stub.makeCounter(3);
+    
+    // Similar to the recordReplayMode test - use a closure variable in map()
+    using numbers = stub.generateFibonacci(5);
+    using result = await numbers.map((i) => {
+      // counter is a closure variable (remote stub) - should be captured
+      return counter.plus(i, i);
+    });
+    
+    // Expected: [0+0, 1+1, 1+1, 2+2, 3+3] = [0, 2, 2, 4, 6]
+    expect(result).toStrictEqual([0, 2, 2, 4, 6]);
   });
 });
 
