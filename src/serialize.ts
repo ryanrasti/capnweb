@@ -321,6 +321,26 @@ export class Evaluator {
   private stubs: RpcStub[] = [];
   private promises: LocatedPromise[] = [];
 
+  // Resolve serialized captures to StubHooks. Used by both "callback" and "remap" evaluation.
+  private resolveCaptures(capsData: unknown[]): StubHook[] {
+    return capsData.map(cap => {
+      if (!(cap instanceof Array) || cap.length !== 2 ||
+          (cap[0] !== "import" && cap[0] !== "export") ||
+          typeof cap[1] !== "number") {
+        throw new TypeError(`unknown capture: ${JSON.stringify(cap)}`);
+      }
+      if (cap[0] === "export") {
+        return this.importer.importStub(cap[1]);
+      } else {
+        let exp = this.importer.getExport(cap[1]);
+        if (!exp) {
+          throw new Error(`no such entry on exports table: ${cap[1]}`);
+        }
+        return exp.dup();
+      }
+    });
+  }
+
   public evaluate(value: unknown): RpcPayload {
     let payload = RpcPayload.forEvaluate(this.stubs, this.promises);
     try {
@@ -353,24 +373,8 @@ export class Evaluator {
             break; // report error below
           }
 
-          // Resolve captures now (same as remap) - dup() so they survive outer applicator disposal
-          const captures: StubHook[] = value[1].map((cap: any) => {
-            if (!(cap instanceof Array) || cap.length !== 2 ||
-                (cap[0] !== "import" && cap[0] !== "export") ||
-                typeof cap[1] !== "number") {
-              throw new TypeError(`unknown callback capture: ${JSON.stringify(cap)}`);
-            }
-            if (cap[0] === "export") {
-              return this.importer.importStub(cap[1]);
-            } else {
-              let exp = this.importer.getExport(cap[1]);
-              if (!exp) {
-                throw new Error(`no such entry on exports table: ${cap[1]}`);
-              }
-              return exp.dup();
-            }
-          });
-
+          // Resolve captures now - dup() so they survive outer applicator disposal
+          const captures = this.resolveCaptures(value[1]);
           const instructions = value[2];
 
           // Create a function that replays the recorded behavior
@@ -531,25 +535,7 @@ export class Evaluator {
             break;  // report error below
           }
 
-          let captures: StubHook[] = value[3].map(cap => {
-            if (!(cap instanceof Array) ||
-                cap.length !== 2 ||
-                (cap[0] !== "import" && cap[0] !== "export") ||
-                typeof cap[1] !== "number") {
-              throw new TypeError(`unknown map capture: ${JSON.stringify(cap)}`);
-            }
-
-            if (cap[0] === "export") {
-              return this.importer.importStub(cap[1]);
-            } else {
-              let exp = this.importer.getExport(cap[1]);
-              if (!exp) {
-                throw new Error(`no such entry on exports table: ${cap[1]}`);
-              }
-              return exp.dup();
-            }
-          });
-
+          let captures = this.resolveCaptures(value[3]);
           let instructions = value[4];
 
           let resultHook = hook.map(path, captures, instructions);

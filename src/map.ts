@@ -2,7 +2,7 @@
 // Licensed under the MIT license found in the LICENSE.txt file or at:
 //     https://opensource.org/license/mit
 
-import { StubHook, PropertyPath, RpcPayload, RpcStub, RpcPromise, withCallInterceptor, ErrorStubHook, mapImpl, PayloadStubHook, unwrapStubAndPath, unwrapStubNoProperties } from "./core.js";
+import { StubHook, PropertyPath, RpcPayload, RpcStub, RpcPromise, withCallInterceptor, mapImpl, PayloadStubHook, unwrapStubAndPath, unwrapStubNoProperties } from "./core.js";
 import { Devaluator, Exporter, Importer, ExportId, ImportId, Evaluator } from "./serialize.js";
 
 let currentMapBuilder: MapBuilder | undefined;
@@ -261,54 +261,6 @@ class MapVariableHook extends StubHook {
 
 // =======================================================================================
 
-// A simple StubHook that wraps a function value.
-// Unlike PayloadStubHook, this doesn't try to deep copy the function on dup().
-class FunctionStubHook extends StubHook {
-  constructor(private func: Function) {
-    super();
-  }
-
-  dup(): StubHook {
-    // Functions are immutable, so we can just return a new hook wrapping the same function
-    return new FunctionStubHook(this.func);
-  }
-
-  dispose(): void {
-    // Nothing to dispose
-  }
-
-  call(path: PropertyPath, args: RpcPayload): StubHook {
-    // If someone tries to call through this hook, delegate to the function
-    if (path.length > 0) {
-      throw new TypeError(`Cannot access property '${path[0]}' on a callback function`);
-    }
-    // Callbacks must be synchronous, so we can call directly
-    try {
-      const result = Function.prototype.apply.call(this.func, undefined, args.value);
-      return new PayloadStubHook(RpcPayload.fromAppReturn(result));
-    } catch (err) {
-      return new ErrorStubHook(err);
-    }
-  }
-
-  get(path: PropertyPath): StubHook {
-    throw new TypeError("Cannot get properties from a callback function");
-  }
-
-  map(path: PropertyPath, captures: StubHook[], instructions: unknown[]): StubHook {
-    throw new TypeError("Cannot map over a callback function");
-  }
-
-  pull(): RpcPayload | Promise<RpcPayload> {
-    // Return a payload containing the function
-    return RpcPayload.fromAppReturn(this.func);
-  }
-
-  ignoreUnhandledRejections(): void {}
-
-  onBroken(callback: (error: any) => void): void {}
-}
-
 class MapApplicator implements Importer {
   private variables: StubHook[];
 
@@ -341,13 +293,6 @@ class MapApplicator implements Importer {
           this.variables.push(hook);
           continue;
         }
-      }
-
-      // Handle callback functions specially - they shouldn't go through PayloadStubHook
-      // because that would try to deep copy them, which fails for "owned" payloads.
-      if (typeof payload.value === 'function') {
-        this.variables.push(new FunctionStubHook(payload.value));
-        continue;
       }
 
       this.variables.push(new PayloadStubHook(payload));

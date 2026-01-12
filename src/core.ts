@@ -871,6 +871,12 @@ export class RpcPayload {
       }
 
       case "function":
+        // Plain functions in owned payloads can just be returned as-is (they're immutable).
+        // This handles callback replay functions that don't need to become RpcTarget stubs.
+        if (this.source === "owned" && typeof value === "function" && !(value instanceof RpcTarget)) {
+          return value;
+        }
+        // Fall through to rpc-target handling
       case "rpc-target": {
         let target = <RpcTarget | Function>value;
         let stub: RpcStub;
