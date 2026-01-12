@@ -64,10 +64,11 @@ describe("recordReplayMode: 'all'", () => {
       }, 3);
     }, 3);
     
-    // The result should be 3 + 3 + 6 + 9 + 12 + 15 = 48
-    expect(result).toBe(
-      3 + 3 + 6 + 9 + 12 + 15
-    );
+    // With counter.i=3 and nested doN:
+    // Outer iter 0: i=3, inner produces 3→6→9→12, returns 12
+    // Outer iter 1: i=12, inner produces 3→15→27→39, returns 39
+    // Outer iter 2: i=39, inner produces 3→42→81→120, returns 120
+    expect(result).toBe(120);
     
     // The side effect should have happened once during recording, not during replay
     expect(sideEffectCounterOuter).toBe(1); // Only incremented during the recording phase

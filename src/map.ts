@@ -174,7 +174,8 @@ mapImpl.sendMap = (hook: StubHook, path: PropertyPath, func: (promise: RpcPromis
   return new RpcPromise(builder.makeOutput(result), []);
 }
 
-mapImpl.recordCallback =  (func: Function): any => {
+mapImpl.recordCallback = (func: Function): any => {
+  // Create a MapBuilder with a dummy subject - the actual input will be provided at replay time
   const builder = new MapBuilder(new PayloadStubHook(RpcPayload.fromAppParams([])), []);
   let result: RpcPayload;
   try {
@@ -184,19 +185,24 @@ mapImpl.recordCallback =  (func: Function): any => {
   } finally {
     builder.unregister();
   }
-  // Devaluate the result and wrap in a callback marker
+
+  // Devaluate the result to get the final instruction
   const devaluatedResult = Devaluator.devaluate(result.value, undefined, builder, result);
-  
-  // Access the private context via a getter method or directly access the instructions
-  // The instructions already contain the operations, and the final result
   const instructions = [...(builder as any).instructions, devaluatedResult];
-  
-  // Get captures from the private context
+
   const context = (builder as any).context;
-  // When there's no parent, context.captures is StubHook[]
-  // When there's a parent, context.captures is number[] (parent indices), which we don't want
-  const captures = context.parent ? [] : context.captures;
-  return ["callback", captures, instructions];
+
+  if (context.parent) {
+    // Nested callback: push to parent's instructions with captures as ["import", idx]
+    context.parent.instructions.push(
+      ["callback", context.captures.map((cap: number) => ["import", cap]), instructions]
+    );
+    // Return a MapVariableHook pointing to this instruction's result in the parent
+    return new MapVariableHook(context.parent, context.parent.instructions.length);
+  } else {
+    // Top-level callback: return raw StubHook[] captures for the caller to serialize
+    return ["callback", context.captures, instructions];
+  }
 }
 
 function throwMapperBuilderUseError(): never {
@@ -255,6 +261,54 @@ class MapVariableHook extends StubHook {
 
 // =======================================================================================
 
+// A simple StubHook that wraps a function value.
+// Unlike PayloadStubHook, this doesn't try to deep copy the function on dup().
+class FunctionStubHook extends StubHook {
+  constructor(private func: Function) {
+    super();
+  }
+
+  dup(): StubHook {
+    // Functions are immutable, so we can just return a new hook wrapping the same function
+    return new FunctionStubHook(this.func);
+  }
+
+  dispose(): void {
+    // Nothing to dispose
+  }
+
+  call(path: PropertyPath, args: RpcPayload): StubHook {
+    // If someone tries to call through this hook, delegate to the function
+    if (path.length > 0) {
+      throw new TypeError(`Cannot access property '${path[0]}' on a callback function`);
+    }
+    // Callbacks must be synchronous, so we can call directly
+    try {
+      const result = Function.prototype.apply.call(this.func, undefined, args.value);
+      return new PayloadStubHook(RpcPayload.fromAppReturn(result));
+    } catch (err) {
+      return new ErrorStubHook(err);
+    }
+  }
+
+  get(path: PropertyPath): StubHook {
+    throw new TypeError("Cannot get properties from a callback function");
+  }
+
+  map(path: PropertyPath, captures: StubHook[], instructions: unknown[]): StubHook {
+    throw new TypeError("Cannot map over a callback function");
+  }
+
+  pull(): RpcPayload | Promise<RpcPayload> {
+    // Return a payload containing the function
+    return RpcPayload.fromAppReturn(this.func);
+  }
+
+  ignoreUnhandledRejections(): void {}
+
+  onBroken(callback: (error: any) => void): void {}
+}
+
 class MapApplicator implements Importer {
   private variables: StubHook[];
 
@@ -269,32 +323,37 @@ class MapApplicator implements Importer {
   }
 
   apply(instructions: unknown[]): RpcPayload {
-    try {
-      if (instructions.length < 1) {
-        throw new Error("Invalid empty mapper function.");
-      }
-
-      for (let instruction of instructions.slice(0, -1)) {
-        let payload = new Evaluator(this).evaluateCopy(instruction);
-
-        // The payload almost always contains a single stub. As an optimization, unwrap it.
-        if (payload.value instanceof RpcStub) {
-          let hook = unwrapStubNoProperties(payload.value);
-          if (hook) {
-            this.variables.push(hook);
-            continue;
-          }
-        }
-
-        this.variables.push(new PayloadStubHook(payload));
-      }
-
-      return new Evaluator(this).evaluateCopy(instructions[instructions.length - 1]);
-    } finally {
-      for (let variable of this.variables) {
-        variable.dispose();
-      }
+    // Note: We don't dispose variables here because the returned payload may contain
+    // references to async results (RpcPromises) that are backed by these variables.
+    // If we dispose them immediately, those promises would fail when they resolve.
+    // TODO: Consider proper cleanup when all async operations complete.
+    if (instructions.length < 1) {
+      throw new Error("Invalid empty mapper function.");
     }
+
+    for (let instruction of instructions.slice(0, -1)) {
+      let payload = new Evaluator(this).evaluateCopy(instruction);
+
+      // The payload almost always contains a single stub. As an optimization, unwrap it.
+      if (payload.value instanceof RpcStub) {
+        let hook = unwrapStubNoProperties(payload.value);
+        if (hook) {
+          this.variables.push(hook);
+          continue;
+        }
+      }
+
+      // Handle callback functions specially - they shouldn't go through PayloadStubHook
+      // because that would try to deep copy them, which fails for "owned" payloads.
+      if (typeof payload.value === 'function') {
+        this.variables.push(new FunctionStubHook(payload.value));
+        continue;
+      }
+
+      this.variables.push(new PayloadStubHook(payload));
+    }
+
+    return new Evaluator(this).evaluateCopy(instructions[instructions.length - 1]);
   }
 
   importStub(idx: ImportId): StubHook {

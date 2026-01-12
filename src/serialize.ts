@@ -232,13 +232,25 @@ export class Devaluator {
 
       case "function":
       case "rpc-target": {
-    
         // Check if any argument is a function and we're in recordReplayMode 'all'
         if (getGlobalRpcSessionOptions().recordReplayMode === 'all' && kind === 'function') {
           const res = mapImpl.recordCallback(value as Function) as any;
-          // res is ["callback", StubHook[], instructions]
+
+          // If nested (inside another callback recording), res is a StubHook (MapVariableHook)
+          // and the callback instruction was already pushed to the parent builder.
+          // We return an ["import", idx] reference to that instruction's result.
+          if (res instanceof StubHook) {
+            const importId = this.exporter.getImport(res);
+            if (importId !== undefined) {
+              return ["import", importId];
+            }
+            // Shouldn't happen for MapVariableHook, but fall through to error if it does
+            throw new Error("Nested callback returned unexpected StubHook type");
+          }
+
+          // Top-level: res is ["callback", StubHook[], instructions]
           // Serialize captures the same way sendMap does: check if already an import, otherwise export
-          const serializedCaptures = (res[1] as StubHook[]).map(stub => {
+          const serializedCaptures = (res[1] as StubHook[]).map((stub: StubHook) => {
             const importId = this.exporter.getImport(stub);
             if (importId !== undefined) {
               return ["import", importId];
@@ -350,24 +362,24 @@ export class Evaluator {
           // Handle recorded callbacks - create a replay function
           if (value.length >= 3) {
             const [tag, capturesData, instructions] = value;
-            const evaluator = this; // Capture the evaluator context
-            
+
+            // Resolve captures NOW (at callback creation time), not when called.
+            // This ensures the captures are dup()ed before the outer applicator disposes them.
+            const captures = (capturesData as any[]).map((cap: any) => {
+              if (Array.isArray(cap) && typeof cap[1] === 'number') {
+                if (cap[0] === 'import') {
+                  const hook = this.importer.getExport(cap[1]);
+                  return hook ? hook.dup() : undefined;
+                } else if (cap[0] === 'export') {
+                  const hook = this.importer.importStub(cap[1]);
+                  return hook ? hook.dup() : undefined;
+                }
+              }
+              return undefined;
+            }).filter((c: any): c is StubHook => c !== undefined);
+
             // Create a function that replays the recorded behavior
             return function(...args: any[]) {
-              // Resolve captures - handle both import and export, same as sendMap does
-              const captures = (capturesData as any[]).map((cap: any) => {
-                if (Array.isArray(cap) && typeof cap[1] === 'number') {
-                  if (cap[0] === 'import') {
-                    const hook = (evaluator as any).importer.getExport(cap[1]);
-                    return hook ? hook.dup() : undefined;
-                  } else if (cap[0] === 'export') {
-                    const hook = (evaluator as any).importer.importStub(cap[1]);
-                    return hook ? hook.dup() : undefined;
-                  }
-                }
-                return undefined;
-              }).filter((c: any) => c !== undefined);
-              
               // Wrap input arguments as a stub hook
               let inputHook: StubHook;
               if (args.length === 1 && typeof args[0] === 'object' && args[0] !== null) {
@@ -378,9 +390,12 @@ export class Evaluator {
                 const inputVal = args.length === 1 ? args[0] : args;
                 inputHook = new PayloadStubHook(RpcPayload.fromAppParams(inputVal));
               }
-              
+
+              // Dup captures for this invocation (they may be called multiple times)
+              const capturesForThisCall = captures.map(c => c.dup());
+
               // Apply the recorded instructions
-              const applicator = new MapApplicator(captures, inputHook);
+              const applicator = new MapApplicator(capturesForThisCall, inputHook);
               try {
                 const resultPayload = applicator.apply(instructions as any[]);
                 return (resultPayload as any).value;
