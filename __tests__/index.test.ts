@@ -46,6 +46,34 @@ describe("recordReplayMode: 'all'", () => {
     expect(sideEffectCounter).toBe(1); // Only incremented during the recording phase
   });
 
+  it("nested callbacks can access closure variables", async () => {
+    setGlobalRpcSessionOptions(() => ({ recordReplayMode: 'all' }));
+
+    await using harness = new TestHarness(new TestTarget());
+    let stub = harness.stub;
+    using counter = stub.makeCounter(3);
+    
+    let sideEffectCounterOuter = 0;
+    let sideEffectCounterInner = 0;
+    
+    let result = await counter.doN((i) => {
+      sideEffectCounterOuter++; // Should only increment 1x
+      return counter.doN((j) => {
+        sideEffectCounterInner++; // Should only increment 1x
+        return counter.plus(i, j);
+      }, 3);
+    }, 3);
+    
+    // The result should be 3 + 3 + 6 + 9 + 12 + 15 = 48
+    expect(result).toBe(
+      3 + 3 + 6 + 9 + 12 + 15
+    );
+    
+    // The side effect should have happened once during recording, not during replay
+    expect(sideEffectCounterOuter).toBe(1); // Only incremented during the recording phase
+    expect(sideEffectCounterInner).toBe(1); // Only incremented during the recording phase
+  });
+
 });
 
 
