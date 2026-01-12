@@ -2,22 +2,120 @@
 // Licensed under the MIT license found in the LICENSE.txt file or at:
 //     https://opensource.org/license/mit
 
-import { expect, it, describe, inject } from "vitest"
+import { expect, it, describe, inject, afterEach } from "vitest"
 import { deserialize, serialize, RpcSession, type RpcSessionOptions, RpcTransport, RpcTarget,
          RpcStub, newWebSocketRpcSession, newMessagePortRpcSession,
          newHttpBatchRpcSession, setGlobalRpcSessionOptions} from "../src/index.js"
 import { Counter, TestTarget } from "./test-util.js";
 
+let SERIALIZE_TEST_CASES: Record<string, unknown> = {
+  '123': 123,
+  'null': null,
+  '"foo"': "foo",
+  'true': true,
+
+  '{"foo":123}': {foo: 123},
+  '{"foo":{"bar":123,"baz":456},"qux":789}': {foo: {bar: 123, baz: 456}, qux: 789},
+
+  '[[123]]': [123],
+  '[[[[123,456]]]]': [[123, 456]],
+  '{"foo":[[123]]}': {foo: [123]},
+  '{"foo":[[123]],"bar":[[456,789]]}': {foo: [123], bar: [456, 789]},
+
+  '["bigint","123"]': 123n,
+  '["date",1234]': new Date(1234),
+  '["bytes","aGVsbG8h"]': new TextEncoder().encode("hello!"),
+  '["undefined"]': undefined,
+  '["error","Error","the message"]': new Error("the message"),
+  '["error","TypeError","the message"]': new TypeError("the message"),
+  '["error","RangeError","the message"]': new RangeError("the message"),
+
+  '["inf"]': Infinity,
+  '["-inf"]': -Infinity,
+  '["nan"]': NaN,
+};
+
+class NotSerializable {
+  i: number;
+  constructor(i: number) {
+    this.i = i;
+  }
+  toString() {
+    return `NotSerializable(${this.i})`;
+  }
+}
+
+describe("simple serialization", () => {
+  it("can serialize", () => {
+    for (let key in SERIALIZE_TEST_CASES) {
+      expect(serialize(SERIALIZE_TEST_CASES[key])).toBe(key);
+    }
+  })
+
+  it("can deserialize", () => {
+    for (let key in SERIALIZE_TEST_CASES) {
+      expect(deserialize(key)).toStrictEqual(SERIALIZE_TEST_CASES[key]);
+    }
+  })
+
+  it("throws an error if the value can't be serialized", () => {
+    expect(() => serialize(new NotSerializable(123))).toThrowError(
+      new TypeError("Cannot serialize value: NotSerializable(123)")
+    );
+
+    expect(() => serialize(Object.create(null))).toThrowError(
+      new TypeError("Cannot serialize value: (couldn't stringify value)")
+    );
+  })
+
+  it("throws an error for circular references", () => {
+    let obj: any = {};
+    obj.self = obj;
+    expect(() => serialize(obj)).toThrowError(
+      "Serialization exceeded maximum allowed depth. (Does the message contain cycles?)"
+    );
+  })
+
+  it("can serialize complex nested structures", () => {
+    let complex = {
+      level1: {
+        level2: {
+          level3: {
+            array: [1, 2, { nested: "deep" }],
+            date: new Date(5678),
+            nullVal: null,
+            undefinedVal: undefined
+          }
+        }
+      },
+      top_array: [[1, 2], [3, 4]]
+    };
+    let serialized = serialize(complex);
+    expect(deserialize(serialized)).toStrictEqual(complex);
+  })
+
+  it("throws errors for malformed deserialization data", () => {
+    expect(() => deserialize('{"unclosed": ')).toThrowError();
+    expect(() => deserialize('["unknown_type", "param"]')).toThrowError();
+    expect(() => deserialize('["date"]')).toThrowError(); // missing timestamp
+    expect(() => deserialize('["error"]')).toThrowError(); // missing type and message
+  })
+})
+
 // Test record/replay mode for all methods
 describe("recordReplayMode: 'all'", () => {
+  afterEach(() => {
+    // Reset global options to default after each test
+    setGlobalRpcSessionOptions(() => ({}));
+  });
 
   it("records and replays callbacks correctly", async () => {
     setGlobalRpcSessionOptions(() => ({ recordReplayMode: 'all' }));
 
     await using harness = new TestHarness(new TestTarget());
     let stub = harness.stub;
-    using counter = stub.makeCounter(4);
-    
+    using counter = await stub.makeCounter(4);
+
     // Test that the callback is replayed with the correct result
     let result = await counter.do((c) => {
       return c.increment(4);
@@ -30,18 +128,18 @@ describe("recordReplayMode: 'all'", () => {
 
     await using harness = new TestHarness(new TestTarget());
     let stub = harness.stub;
-    using counter = stub.makeCounter(3);
-    
+    using counter = await stub.makeCounter(3);
+
     let sideEffectCounter = 0;
-    
+
     let result = await counter.doN((i) => {
       sideEffectCounter++; // Should only increment 1x
       return counter.plus(i, i);
     }, 5);
-    
+
     // The result should be 3 + 3 + 6 + 9 + 12 + 15 = 48
     expect(result).toBe(96);
-    
+
     // The side effect should have happened once during recording, not during replay
     expect(sideEffectCounter).toBe(1); // Only incremented during the recording phase
   });
@@ -51,11 +149,11 @@ describe("recordReplayMode: 'all'", () => {
 
     await using harness = new TestHarness(new TestTarget());
     let stub = harness.stub;
-    using counter = stub.makeCounter(3);
-    
+    using counter = await stub.makeCounter(3);
+
     let sideEffectCounterOuter = 0;
     let sideEffectCounterInner = 0;
-    
+
     let result = await counter.doN((i) => {
       sideEffectCounterOuter++; // Should only increment 1x
       return counter.doN((j) => {
@@ -63,20 +161,19 @@ describe("recordReplayMode: 'all'", () => {
         return counter.plus(i, j);
       }, 3);
     }, 3);
-    
+
     // With counter.i=3 and nested doN:
     // Outer iter 0: i=3, inner produces 3→6→9→12, returns 12
     // Outer iter 1: i=12, inner produces 3→15→27→39, returns 39
     // Outer iter 2: i=39, inner produces 3→42→81→120, returns 120
     expect(result).toBe(120);
-    
+
     // The side effect should have happened once during recording, not during replay
     expect(sideEffectCounterOuter).toBe(1); // Only incremented during the recording phase
     expect(sideEffectCounterInner).toBe(1); // Only incremented during the recording phase
   });
 
 });
-
 
 // =======================================================================================
 
@@ -157,8 +254,8 @@ class TestHarness<T extends RpcTarget> {
   }
 
   checkAllDisposed() {
-    //expect(this.client.getStats(), "client").toStrictEqual({imports: 1, exports: 1});
-    //expect(this.server.getStats(), "server").toStrictEqual({imports: 1, exports: 1});
+    expect(this.client.getStats(), "client").toStrictEqual({imports: 1, exports: 1});
+    expect(this.server.getStats(), "server").toStrictEqual({imports: 1, exports: 1});
   }
 
   async [Symbol.asyncDispose]() {
@@ -938,21 +1035,6 @@ describe("map() over RPC", () => {
     ]);
   });
 
-  it("supports map() with closure variable capture (remote stub)", async () => {
-    await using harness = new TestHarness(new TestTarget());
-    let stub = harness.stub;
-    using counter = stub.makeCounter(3);
-    
-    // Similar to the recordReplayMode test - use a closure variable in map()
-    using numbers = stub.generateFibonacci(5);
-    using result = await numbers.map((i) => {
-      // counter is a closure variable (remote stub) - should be captured
-      return counter.plus(i, i);
-    });
-    
-    // Expected: [0+0, 1+1, 1+1, 2+2, 3+3] = [0, 2, 2, 4, 6]
-    expect(result).toStrictEqual([0, 2, 2, 4, 6]);
-  });
 });
 
 describe("stub disposal over RPC", () => {

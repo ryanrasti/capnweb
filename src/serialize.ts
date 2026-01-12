@@ -2,7 +2,7 @@
 // Licensed under the MIT license found in the LICENSE.txt file or at:
 //     https://opensource.org/license/mit
 
-import { StubHook, RpcPayload, typeForRpc, RpcStub, RpcPromise, LocatedPromise, RpcTarget, PropertyPath, unwrapStubAndPath, PayloadStubHook } from "./core.js";
+import { StubHook, RpcPayload, typeForRpc, RpcStub, RpcPromise, LocatedPromise, RpcTarget, PropertyPath, unwrapStubAndPath, PayloadStubHook, CALLBACK_CLEANUP } from "./core.js";
 import { getGlobalRpcSessionOptions } from "./core.js";
 import { mapImpl } from "./core.js";
 import { MapApplicator } from "./map.js";
@@ -239,7 +239,8 @@ export class Devaluator {
 
           // Top-level: res is ["callback", StubHook[], instructions]
           // Serialize captures the same way sendMap does: check if already an import, otherwise export
-          const serializedCaptures = (res[1] as StubHook[]).map((stub: StubHook) => {
+          const captureHooks = res[1] as StubHook[];
+          const serializedCaptures = captureHooks.map((stub: StubHook) => {
             const importId = this.exporter.getImport(stub);
             if (importId !== undefined) {
               return ["import", importId];
@@ -247,6 +248,10 @@ export class Devaluator {
               return ["export", this.exporter.exportStub(stub)];
             }
           });
+          // Dispose the original capture hooks now that they've been serialized
+          for (const hook of captureHooks) {
+            hook.dispose();
+          }
           return ["callback", serializedCaptures, res[2]];
         }
 
@@ -377,14 +382,46 @@ export class Evaluator {
           const captures = this.resolveCaptures(value[1]);
           const instructions = value[2];
 
+          // Cleanup function to dispose the base captures
+          const cleanup = () => {
+            for (const cap of captures) {
+              cap.dispose();
+            }
+          };
+
           // Create a function that replays the recorded behavior
-          return (arg: unknown) => {
+          const replayFn = (arg: unknown) => {
             // Dup captures for this invocation (callback may be called multiple times)
             const capturesForThisCall = captures.map(c => c.dup());
             const inputHook = new PayloadStubHook(RpcPayload.fromAppParams(arg));
             const applicator = new MapApplicator(capturesForThisCall, inputHook);
-            return applicator.apply(instructions).value;
+
+            const disposeInvocation = () => {
+              applicator.dispose();
+              for (const cap of capturesForThisCall) {
+                cap.dispose();
+              }
+            };
+
+            try {
+              const result = applicator.apply(instructions).value;
+              // If result is a promise, dispose after it settles
+              if (result instanceof RpcPromise) {
+                result.finally(disposeInvocation);
+                return result;
+              }
+              // Sync result - dispose immediately
+              disposeInvocation();
+              return result;
+            } catch (err) {
+              disposeInvocation();
+              throw err;
+            }
           };
+
+          // Attach cleanup symbol - caller should use takeOwnership() to manage lifecycle
+          (replayFn as any)[CALLBACK_CLEANUP] = cleanup;
+          return replayFn;
         }
         case "bigint":
           if (typeof value[1] == "string") {

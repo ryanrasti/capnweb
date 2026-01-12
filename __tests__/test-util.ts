@@ -4,7 +4,7 @@
 
 // Common RPC interfaces / implementations used in several tests.
 
-import { RpcStub, RpcTarget } from '../src/index.js';
+import { RpcStub, RpcTarget, takeOwnership } from '../src/index.js';
 
 export class Counter extends RpcTarget {
   constructor(private i: number = 0) {
@@ -17,14 +17,15 @@ export class Counter extends RpcTarget {
   }
 
   do<R>(fn: (c: Counter) => R): R {
-    console.log("do fn is:", fn.toString());
-    return fn(this);
+    using f = takeOwnership(fn);
+    return f(this);
   }
 
-  doN(fn: (s: number) => number, n: number): number {
+  async doN(fnRaw: (s: number) => number | Promise<number>, n: number): Promise<number> {
+    using fn = takeOwnership(fnRaw);
     let result = this.i
     for (let i = 0; i < n; i++) {
-      result = fn(result);
+      result = await fn(result);
     }
     return result;
   }
