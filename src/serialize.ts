@@ -2,7 +2,7 @@
 // Licensed under the MIT license found in the LICENSE.txt file or at:
 //     https://opensource.org/license/mit
 
-import { StubHook, RpcPayload, typeForRpc, RpcStub, RpcPromise, LocatedPromise, RpcTarget, PropertyPath, unwrapStubAndPath, PayloadStubHook, TargetStubHook } from "./core.js";
+import { StubHook, RpcPayload, typeForRpc, RpcStub, RpcPromise, LocatedPromise, RpcTarget, PropertyPath, unwrapStubAndPath, PayloadStubHook } from "./core.js";
 import { getGlobalRpcSessionOptions } from "./core.js";
 import { mapImpl } from "./core.js";
 import { MapApplicator } from "./map.js";
@@ -349,51 +349,38 @@ export class Evaluator {
       } else switch (value[0]) {
         case "callback": {
           // Handle recorded callbacks - create a replay function
-          if (value.length >= 3) {
-            const [tag, capturesData, instructions] = value;
-
-            // Resolve captures NOW (at callback creation time), not when called.
-            // This ensures the captures are dup()ed before the outer applicator disposes them.
-            const captures = (capturesData as any[]).map((cap: any) => {
-              if (Array.isArray(cap) && typeof cap[1] === 'number') {
-                if (cap[0] === 'import') {
-                  const hook = this.importer.getExport(cap[1]);
-                  return hook ? hook.dup() : undefined;
-                } else if (cap[0] === 'export') {
-                  const hook = this.importer.importStub(cap[1]);
-                  return hook ? hook.dup() : undefined;
-                }
-              }
-              return undefined;
-            }).filter((c: any): c is StubHook => c !== undefined);
-
-            // Create a function that replays the recorded behavior
-            return function(...args: any[]) {
-              // Wrap input arguments as a stub hook
-              let inputHook: StubHook;
-              if (args.length === 1 && typeof args[0] === 'object' && args[0] !== null) {
-                // Single object argument - likely an RpcTarget
-                inputHook = TargetStubHook.create(args[0], undefined);
-              } else {
-                // Single primitive or multiple args - unwrap single arg for primitives
-                const inputVal = args.length === 1 ? args[0] : args;
-                inputHook = new PayloadStubHook(RpcPayload.fromAppParams(inputVal));
-              }
-
-              // Dup captures for this invocation (they may be called multiple times)
-              const capturesForThisCall = captures.map(c => c.dup());
-
-              // Apply the recorded instructions
-              const applicator = new MapApplicator(capturesForThisCall, inputHook);
-              try {
-                const resultPayload = applicator.apply(instructions as any[]);
-                return (resultPayload as any).value;
-              } catch (err) {
-                throw err;
-              }
-            };
+          if (value.length < 3 || !(value[1] instanceof Array) || !(value[2] instanceof Array)) {
+            break; // report error below
           }
-          throw new Error("Invalid callback format");
+
+          // Resolve captures now (same as remap) - dup() so they survive outer applicator disposal
+          const captures: StubHook[] = value[1].map((cap: any) => {
+            if (!(cap instanceof Array) || cap.length !== 2 ||
+                (cap[0] !== "import" && cap[0] !== "export") ||
+                typeof cap[1] !== "number") {
+              throw new TypeError(`unknown callback capture: ${JSON.stringify(cap)}`);
+            }
+            if (cap[0] === "export") {
+              return this.importer.importStub(cap[1]);
+            } else {
+              let exp = this.importer.getExport(cap[1]);
+              if (!exp) {
+                throw new Error(`no such entry on exports table: ${cap[1]}`);
+              }
+              return exp.dup();
+            }
+          });
+
+          const instructions = value[2];
+
+          // Create a function that replays the recorded behavior
+          return (arg: unknown) => {
+            // Dup captures for this invocation (callback may be called multiple times)
+            const capturesForThisCall = captures.map(c => c.dup());
+            const inputHook = new PayloadStubHook(RpcPayload.fromAppParams(arg));
+            const applicator = new MapApplicator(capturesForThisCall, inputHook);
+            return applicator.apply(instructions).value;
+          };
         }
         case "bigint":
           if (typeof value[1] == "string") {
