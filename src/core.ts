@@ -61,7 +61,9 @@ export function takeOwnership<T extends Function>(fn: T): T & Disposable {
   const cleanup = (fn as any)[CALLBACK_CLEANUP];
   if (cleanup) {
     // Move cleanup to Symbol.dispose, clear CALLBACK_CLEANUP
-    (fn as any)[Symbol.dispose] = cleanup;
+    (fn as any)[Symbol.dispose] = () => {
+      console.log('calling cleanup in takeOwnership', cleanup.toString());
+      cleanup();};
     delete (fn as any)[CALLBACK_CLEANUP];
   } else if (!(fn as any)[Symbol.dispose]) {
     // Plain function - add no-op dispose

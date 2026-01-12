@@ -382,13 +382,6 @@ export class Evaluator {
           const captures = this.resolveCaptures(value[1]);
           const instructions = value[2];
 
-          // Cleanup function to dispose the base captures
-          const cleanup = () => {
-            for (const cap of captures) {
-              cap.dispose();
-            }
-          };
-
           // Create a function that replays the recorded behavior
           const replayFn = (arg: unknown) => {
             // Dup captures for this invocation (callback may be called multiple times)
@@ -401,26 +394,39 @@ export class Evaluator {
               for (const cap of capturesForThisCall) {
                 cap.dispose();
               }
+
+              const cleanup = (replayFn as any)[CALLBACK_CLEANUP];
+              console.log('cleanup', cleanup);
+              if (typeof cleanup === 'function') {
+                console.log('calling cleanup in evaluateImpl', cleanup.toString());
+                cleanup();
+              }
             };
 
+            let result: unknown;
             try {
-              const result = applicator.apply(instructions).value;
+              result = applicator.apply(instructions).value;
+            } finally {
               // If result is a promise, dispose after it settles
               if (result instanceof RpcPromise) {
-                result.finally(disposeInvocation);
-                return result;
+                console.log('result is a promise, disposing after it settles');
+                result = result.finally(disposeInvocation);
+              } else {
+                disposeInvocation();
               }
-              // Sync result - dispose immediately
-              disposeInvocation();
-              return result;
-            } catch (err) {
-              disposeInvocation();
-              throw err;
+
             }
+            return result;
           };
 
           // Attach cleanup symbol - caller should use takeOwnership() to manage lifecycle
-          (replayFn as any)[CALLBACK_CLEANUP] = cleanup;
+          (replayFn as any)[CALLBACK_CLEANUP] = () => {
+            console.log('calling cleanup', instructions, captures);
+
+            for (const cap of captures) {
+              cap.dispose();
+            }
+          };
           return replayFn;
         }
         case "bigint":
