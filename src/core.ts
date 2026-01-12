@@ -78,20 +78,6 @@ export function typeForRpc(value: unknown): TypeForRpc {
     return "primitive";
   }
 
-  // // Check for RpcStub/RpcPromise wrapped in proxy first
-  // // These are proxied with a function target, so we need to check for them before
-  // // checking Function.prototype
-  // if (RAW_STUB in <any>value) {
-  //   // It's a proxied RpcStub or RpcPromise
-  //   let stub = (<any>value)[RAW_STUB];
-  //   //console.log("Found proxied stub/promise:", stub, "is RpcPromise?", stub instanceof RpcPromise);
-  //   if (stub instanceof RpcPromise) {
-  //     return "rpc-promise";
-  //   } else {
-  //     return "stub";
-  //   }
-  // }
-
   // Aside from RpcTarget, we generally don't support serializing *subclasses* of serializable
   // types, so we switch on the exact prototype rather than use `instanceof` here.
   let prototype = Object.getPrototypeOf(value);
@@ -305,7 +291,6 @@ export interface RpcStub extends Disposable {
 const PROXY_HANDLERS: ProxyHandler<{raw: RpcStub}> = {
   apply(target: {raw: RpcStub}, thisArg: any, argumentsList: any[]) {
     let stub = target.raw;
-    //console.log("apply", stub.hook, stub.pathIfPromise, argumentsList);
     return new RpcPromise(doCall(stub.hook,
         stub.pathIfPromise || [], RpcPayload.fromAppParams(argumentsList)), []);
   },
@@ -1378,7 +1363,6 @@ abstract class ValueStubHook extends StubHook {
   call(path: PropertyPath, args: RpcPayload): StubHook {
     try {
       let {value, owner} = this.getValue();
-      //console.log("call value:", value, "owner:", owner, "path:", path);
       let followResult = followPath(value, undefined, path, owner);
 
       if (followResult.hook) {
@@ -1387,7 +1371,6 @@ abstract class ValueStubHook extends StubHook {
 
       // It's a local function.
       if (typeof followResult.value != "function") {
-        console.log("followResult.value is not a function:", followResult, followResult.value, typeof followResult.value);
         throw new TypeError(`'${path.join('.')}' is not a function.`);
       }
       let promise = args.deliverCall(followResult.value, followResult.parent);

@@ -83,14 +83,7 @@ export class Devaluator {
       : unknown {
     let devaluator = new Devaluator(exporter, source);
     try {
-      const res = devaluator.devaluateImpl(value, parent, 0);
-      if (Array.isArray(res) && res[0] === 'error') {
-        try {
-          throw new Error(res.toString())
-        } catch (err) {
-        }
-      }
-      return res;
+      return devaluator.devaluateImpl(value, parent, 0);
     } catch (err) {
       if (devaluator.exports) {
         try {
@@ -198,10 +191,6 @@ export class Devaluator {
 
       case "stub":
       case "rpc-promise": {
-
-        
-    
-
         if (!this.source) {
           throw new Error("Can't serialize RPC stubs in this context.");
         }
