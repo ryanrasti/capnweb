@@ -193,12 +193,9 @@ mapImpl.recordCallback = (func: Function): any => {
   const context = (builder as any).context;
 
   if (context.parent) {
-    // Nested callback: push to parent's instructions with captures as ["import", idx]
-    context.parent.instructions.push(
-      ["callback", context.captures.map((cap: number) => ["import", cap]), instructions]
-    );
-    // Return a MapVariableHook pointing to this instruction's result in the parent
-    return new MapVariableHook(context.parent, context.parent.instructions.length);
+    // Nested callback: return inline with captures as ["import", idx] references
+    // This treats callbacks consistently with other pass-by-value types
+    return ["callback", context.captures.map((cap: number) => ["import", cap]), instructions];
   } else {
     // Top-level callback: return raw StubHook[] captures for the caller to serialize
     return ["callback", context.captures, instructions];
@@ -275,12 +272,6 @@ class FunctionStubHook extends StubHook {
   }
 
   dispose(): void {
-    // Call cleanup if this is a recorded callback
-    const cleanup = (this.func as any)[CALLBACK_CLEANUP];
-    if (cleanup) {
-      cleanup();
-      delete (this.func as any)[CALLBACK_CLEANUP];
-    }
   }
 
   call(path: PropertyPath, args: RpcPayload): StubHook {
@@ -428,6 +419,6 @@ mapImpl.applyMap = (input: unknown, parent: object | undefined, owner: RpcPayloa
   }
 }
 
-export { MapApplicator };
+export { MapApplicator, FunctionStubHook };
 
 export function forceInitMap() {}

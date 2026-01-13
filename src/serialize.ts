@@ -223,36 +223,33 @@ export class Devaluator {
       case "rpc-target": {
         // Check if any argument is a function and we're in recordReplayMode 'all'
         if (getGlobalRpcSessionOptions().recordReplayMode === 'all' && kind === 'function') {
+          // recordCallback returns ["callback", captures, instructions]
+          // For nested callbacks: captures are already ["import", idx] arrays
+          // For top-level: captures are StubHook[] that need serialization
           const res = mapImpl.recordCallback(value as Function) as any;
+          const captures = res[1];
 
-          // If nested (inside another callback recording), res is a StubHook (MapVariableHook)
-          // and the callback instruction was already pushed to the parent builder.
-          // We return an ["import", idx] reference to that instruction's result.
-          if (res instanceof StubHook) {
-            const importId = this.exporter.getImport(res);
-            if (importId !== undefined) {
-              return ["import", importId];
+          // Check if captures are already serialized (nested case) or need serialization (top-level)
+          if (captures.length === 0 || captures[0] instanceof StubHook) {
+            // Top-level: serialize the StubHook captures
+            const captureHooks = captures as StubHook[];
+            const serializedCaptures = captureHooks.map((stub: StubHook) => {
+              const importId = this.exporter.getImport(stub);
+              if (importId !== undefined) {
+                return ["import", importId];
+              } else {
+                return ["export", this.exporter.exportStub(stub)];
+              }
+            });
+            // Dispose the original capture hooks now that they've been serialized
+            for (const hook of captureHooks) {
+              hook.dispose();
             }
-            // Shouldn't happen for MapVariableHook, but fall through to error if it does
-            throw new Error("Nested callback returned unexpected StubHook type");
+            return ["callback", serializedCaptures, res[2]];
+          } else {
+            // Nested: captures are already ["import", idx] - return as-is
+            return res;
           }
-
-          // Top-level: res is ["callback", StubHook[], instructions]
-          // Serialize captures the same way sendMap does: check if already an import, otherwise export
-          const captureHooks = res[1] as StubHook[];
-          const serializedCaptures = captureHooks.map((stub: StubHook) => {
-            const importId = this.exporter.getImport(stub);
-            if (importId !== undefined) {
-              return ["import", importId];
-            } else {
-              return ["export", this.exporter.exportStub(stub)];
-            }
-          });
-          // Dispose the original capture hooks now that they've been serialized
-          for (const hook of captureHooks) {
-            hook.dispose();
-          }
-          return ["callback", serializedCaptures, res[2]];
         }
 
         if (!this.source) {
@@ -395,10 +392,9 @@ export class Evaluator {
                 cap.dispose();
               }
 
+              // If takeOwnership was not called, cleanup is still present - call it now
               const cleanup = (replayFn as any)[CALLBACK_CLEANUP];
-              console.log('cleanup', cleanup);
               if (typeof cleanup === 'function') {
-                console.log('calling cleanup in evaluateImpl', cleanup.toString());
                 cleanup();
               }
             };
@@ -409,20 +405,16 @@ export class Evaluator {
             } finally {
               // If result is a promise, dispose after it settles
               if (result instanceof RpcPromise) {
-                console.log('result is a promise, disposing after it settles');
                 result = result.finally(disposeInvocation);
               } else {
                 disposeInvocation();
               }
-
             }
             return result;
           };
 
           // Attach cleanup symbol - caller should use takeOwnership() to manage lifecycle
           (replayFn as any)[CALLBACK_CLEANUP] = () => {
-            console.log('calling cleanup', instructions, captures);
-
             for (const cap of captures) {
               cap.dispose();
             }

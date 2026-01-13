@@ -53,25 +53,6 @@ export const setGlobalRpcSessionOptions = (options: (() => GlobalRpcSessionOptio
 // Symbol for callback cleanup - called automatically when method returns
 export const CALLBACK_CLEANUP = Symbol('callback-cleanup');
 
-// Takes ownership of a callback's cleanup responsibility.
-// - If the callback has CALLBACK_CLEANUP, moves it to Symbol.dispose and clears CALLBACK_CLEANUP
-// - If it's a plain function, returns it as-is with a no-op dispose
-// Use with `using` to ensure proper cleanup: `using fn = takeOwnership(fnRaw);`
-export function takeOwnership<T extends Function>(fn: T): T & Disposable {
-  const cleanup = (fn as any)[CALLBACK_CLEANUP];
-  if (cleanup) {
-    // Move cleanup to Symbol.dispose, clear CALLBACK_CLEANUP
-    (fn as any)[Symbol.dispose] = () => {
-      console.log('calling cleanup in takeOwnership', cleanup.toString());
-      cleanup();};
-    delete (fn as any)[CALLBACK_CLEANUP];
-  } else if (!(fn as any)[Symbol.dispose]) {
-    // Plain function - add no-op dispose
-    (fn as any)[Symbol.dispose] = () => {};
-  }
-  return fn as T & Disposable;
-}
-
 export function typeForRpc(value: unknown): TypeForRpc {
   switch (typeof value) {
     case "boolean":
@@ -557,6 +538,23 @@ export function unwrapStubNoProperties(stub: RpcStub): StubHook | undefined {
   }
 
   return hook;
+}
+
+// Takes ownership of a callback's cleanup responsibility.
+// - If the callback has CALLBACK_CLEANUP, moves it to Symbol.dispose and clears CALLBACK_CLEANUP
+// - If it's a plain function, returns it as-is with a no-op dispose
+// Use with `using` to ensure proper cleanup: `using fn = takeOwnership(fnRaw);`
+export function takeOwnership<T extends Function>(fn: T): T & Disposable {
+  const cleanup = (fn as any)[CALLBACK_CLEANUP];
+  if (cleanup) {
+    // Move cleanup to Symbol.dispose, clear CALLBACK_CLEANUP
+    (fn as any)[Symbol.dispose] = cleanup;
+    delete (fn as any)[CALLBACK_CLEANUP];
+  } else if (!(fn as any)[Symbol.dispose]) {
+    // Plain function - add no-op dispose
+    (fn as any)[Symbol.dispose] = () => {};
+  }
+  return fn as T & Disposable;
 }
 
 // Unwrap a stub returning the underlying `StubHook`. If it's a property, return the `StubHook`

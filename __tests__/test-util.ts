@@ -17,8 +17,7 @@ export class Counter extends RpcTarget {
   }
 
   do<R>(fn: (c: Counter) => R): R {
-    using f = takeOwnership(fn);
-    return f(this);
+    return fn(this);
   }
 
   async doN(fnRaw: (s: number) => number | Promise<number>, n: number): Promise<number> {
