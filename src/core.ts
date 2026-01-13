@@ -1658,7 +1658,7 @@ class TargetStubHook extends ValueStubHook {
 
 // StubHook derived from a Promise for some other StubHook. Waits for the promise and then
 // forward calls, being careful to honor e-order.
-export class PromiseStubHook extends StubHook {
+class PromiseStubHook extends StubHook {
   private promise: Promise<StubHook>;
   private resolution: StubHook | undefined;
 

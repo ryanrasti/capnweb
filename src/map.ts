@@ -2,7 +2,7 @@
 // Licensed under the MIT license found in the LICENSE.txt file or at:
 //     https://opensource.org/license/mit
 
-import { StubHook, PropertyPath, RpcPayload, RpcStub, RpcPromise, withCallInterceptor, mapImpl, PayloadStubHook, PromiseStubHook, unwrapStubAndPath, unwrapStubNoProperties, CALLBACK_CLEANUP } from "./core.js";
+import { StubHook, PropertyPath, RpcPayload, RpcStub, RpcPromise, withCallInterceptor, mapImpl, PayloadStubHook, unwrapStubNoProperties, CALLBACK_CLEANUP } from "./core.js";
 import { Devaluator, Exporter, Importer, ExportId, ImportId, Evaluator } from "./serialize.js";
 
 let currentMapBuilder: MapBuilder | undefined;
@@ -258,50 +258,6 @@ class MapVariableHook extends StubHook {
 
 // =======================================================================================
 
-// A StubHook that wraps a callback replay function.
-// Unlike PayloadStubHook, disposing this hook does NOT invalidate the function -
-// the function remains callable. This is needed because callback functions may be
-// passed to methods that call them asynchronously (after the applicator is disposed).
-class FunctionStubHook extends StubHook {
-  constructor(private func: Function) {
-    super();
-  }
-
-  dup(): StubHook {
-    return new FunctionStubHook(this.func);
-  }
-
-  dispose(): void {
-  }
-
-  call(path: PropertyPath, args: RpcPayload): StubHook {
-    if (path.length > 0) {
-      throw new TypeError("Cannot get properties from a callback function");
-    }
-    // Call the function directly with the args
-    let promise = args.deliverCall(this.func, undefined);
-    return new PromiseStubHook(promise.then(payload => {
-      return new PayloadStubHook(payload);
-    }));
-  }
-
-  get(path: PropertyPath): StubHook {
-    throw new TypeError("Cannot get properties from a callback function");
-  }
-
-  map(path: PropertyPath, captures: StubHook[], instructions: unknown[]): StubHook {
-    throw new TypeError("Cannot map over a callback function");
-  }
-
-  pull(): RpcPayload {
-    return RpcPayload.fromAppReturn(this.func);
-  }
-
-  ignoreUnhandledRejections(): void {}
-
-  onBroken(callback: (error: any) => void): void {}
-}
-
 class MapApplicator implements Importer {
   private variables: StubHook[];
 
@@ -316,10 +272,7 @@ class MapApplicator implements Importer {
   }
 
   apply(instructions: unknown[]): RpcPayload {
-    // Note: We don't dispose variables here because the returned payload may contain
-    // references to async results (RpcPromises) that are backed by these variables.
-    // If we dispose them immediately, those promises would fail when they resolve.
-    // TODO: Consider proper cleanup when all async operations complete.
+    try {
     if (instructions.length < 1) {
       throw new Error("Invalid empty mapper function.");
     }
@@ -336,17 +289,15 @@ class MapApplicator implements Importer {
         }
       }
 
-      // Callback functions need special handling - they must remain valid after disposal
-      // because they may be called asynchronously by the target method.
-      if (typeof payload.value === 'function') {
-        this.variables.push(new FunctionStubHook(payload.value));
-        continue;
-      }
-
       this.variables.push(new PayloadStubHook(payload));
     }
 
     return new Evaluator(this).evaluateCopy(instructions[instructions.length - 1]);
+    } finally {
+      for (let variable of this.variables) {
+        variable.dispose();
+      }
+    }
   }
 
   importStub(idx: ImportId): StubHook {
@@ -419,6 +370,6 @@ mapImpl.applyMap = (input: unknown, parent: object | undefined, owner: RpcPayloa
   }
 }
 
-export { MapApplicator, FunctionStubHook };
+export { MapApplicator };
 
 export function forceInitMap() {}
