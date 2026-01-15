@@ -399,18 +399,15 @@ export class Evaluator {
               }
             };
 
-            let result: unknown;
+            let resultPayload: RpcPayload;
             try {
-              result = applicator.apply(instructions).value;
-            } finally {
-              // If result is a promise, dispose after it settles
-              if (result instanceof RpcPromise) {
-                result = result.finally(disposeInvocation);
-              } else {
-                disposeInvocation();
-              }
+              resultPayload = applicator.apply(instructions);
+            } catch (err) {
+              disposeInvocation();
+              throw err;
             }
-            return result;
+
+            return resultPayload.deliverResolve().finally(disposeInvocation);
           };
 
           // Attach cleanup symbol - caller should use takeOwnership() to manage lifecycle
