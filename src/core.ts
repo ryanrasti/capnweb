@@ -126,7 +126,7 @@ export function typeForRpc(value: unknown): TypeForRpc {
         }
       }
 
-      if (value instanceof RpcTarget) {
+      if (value instanceof RpcTarget || value.prototype instanceof RpcTarget) {
         return "rpc-target";
       }
 
@@ -134,6 +134,7 @@ export function typeForRpc(value: unknown): TypeForRpc {
         return "error";
       }
 
+      console.log('unsupported value -->', value, value instanceof RpcTarget)
       return "unsupported";
   }
 }
