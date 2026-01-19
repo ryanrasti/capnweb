@@ -2,7 +2,8 @@
 // Licensed under the MIT license found in the LICENSE.txt file or at:
 //     https://opensource.org/license/mit
 
-import { StubHook, RpcPayload, typeForRpc, RpcStub, RpcPromise, LocatedPromise, RpcTarget, PropertyPath, unwrapStubAndPath, PayloadStubHook, CALLBACK_CLEANUP } from "./core.js";
+import { inspect } from "node:util";
+import { StubHook, RpcPayload, typeForRpc, RpcStub, RpcPromise, LocatedPromise, RpcTarget, PropertyPath, unwrapStubAndPath, PayloadStubHook, CALLBACK_CLEANUP, TargetStubHook } from "./core.js";
 import { getGlobalRpcSessionOptions } from "./core.js";
 import { mapImpl } from "./core.js";
 import { MapApplicator } from "./map.js";
@@ -407,7 +408,12 @@ export class Evaluator {
               throw err;
             }
 
-            return resultPayload.deliverResolve().finally(disposeInvocation);
+            return resultPayload.deliverResolve().then((x) => {
+              //console.log('x:', inspect(x, { depth: null }))
+              const unwrapped = unwrapRpcTargets(x);
+             // console.log('unwrapped:', inspect(unwrapped, { depth: null }))
+              return unwrapped;
+            }).finally(disposeInvocation);
           };
 
           // Attach cleanup symbol - caller should use takeOwnership() to manage lifecycle
@@ -448,6 +454,7 @@ export class Evaluator {
         case "error":
           if (value.length >= 3 && typeof value[1] === "string" && typeof value[2] === "string") {
             let cls = ERROR_TYPES[value[1]] || Error;
+            console.log('creating error cls:', inspect(cls, { depth: null }), 'values', inspect(value, { depth: null }))
             let result = new cls(value[2]);
             if (typeof value[3] === "string") {
               result.stack = value[3];
@@ -490,6 +497,14 @@ export class Evaluator {
           let isPromise = value[0] == "pipeline";
 
           let addStub = (hook: StubHook) => {
+            console.log('addStub hook:', isPromise, inspect(hook, { depth: null }))
+
+            const unwrapped = maybeUnwrapStubHook(hook);
+            if (unwrapped) {
+              hook.dispose();
+              return unwrapped;
+            }
+            
             if (isPromise) {
               let promise = new RpcPromise(hook, []);
               this.promises.push({promise, parent, property});
@@ -638,4 +653,37 @@ export function deserialize(value: string): unknown {
   let payload = new Evaluator(NULL_IMPORTER).evaluate(JSON.parse(value));
   payload.dispose();  // should be no-op but just in case
   return payload.value;
+}
+
+const unwrapRpcTargets = (value: unknown): unknown => {
+  if (value instanceof RpcStub) {
+    const {hook, pathIfPromise} = unwrapStubAndPath(value);
+    if (pathIfPromise == null && hook instanceof TargetStubHook) {
+      const target = hook.getTarget();
+      hook.dispose();
+      return target;
+    }
+  }
+
+  if (value instanceof Array) {
+    return value.map(unwrapRpcTargets);
+  } 
+  
+  const proto = Object.getPrototypeOf(value);
+  if (proto === Object.prototype || proto === null) {
+    return Object.fromEntries(Object.entries(value).map(([key, value]) => [key, unwrapRpcTargets(value)]));
+  } 
+
+  return value;
+}
+
+const maybeUnwrapStubHook = (hook: StubHook): unknown | RpcTarget | Function => {
+  console.log('maybeUnwrapStubHook hook:', inspect(hook, { depth: null }))
+  if (hook instanceof PayloadStubHook && hook.payload instanceof RpcPayload && hook.payload.value instanceof RpcStub) {
+    const {hook: innerHook, pathIfPromise} = unwrapStubAndPath(hook.payload.value);
+    if (pathIfPromise == null && innerHook instanceof TargetStubHook) {
+      return innerHook.getTarget();
+    }
+  }
+  return undefined;
 }
