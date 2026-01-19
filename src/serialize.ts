@@ -110,7 +110,7 @@ export class Devaluator {
       case "unsupported": {
         let msg;
         try {
-          msg = `Cannot serialize value: ${value}`;
+          msg = `Cannot serialize value: ${inspect(value, { depth: null })}`;
         } catch (err) {
           msg = "Cannot serialize value: (couldn't stringify value)";
         }

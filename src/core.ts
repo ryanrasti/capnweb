@@ -1398,7 +1398,7 @@ abstract class ValueStubHook extends StubHook {
 
       // It's a local function.
       if (typeof followResult.value != "function") {
-        throw new TypeError(`'${path.join('.')}' is not a function.`);
+        throw new TypeError(`${value} at '${path.join('.')}' is not a function.`);
       }
       let promise = args.deliverCall(followResult.value, followResult.parent);
       return new PromiseStubHook(promise.then(payload => {
