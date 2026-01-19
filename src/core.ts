@@ -1350,7 +1350,7 @@ function followPath(value: unknown, parent: object | undefined,
 
       case "unsupported": {
         if (i === 0) {
-          throw new TypeError(`RPC stub points at a non-serializable type.`);
+          throw new TypeError(`RPC stub points at a non-serializable type: ${value} (${value instanceof RpcTarget})`);
         } else {
           let prefix = path.slice(0, i).join(".");
           let remainder = path.slice(0, i).join(".");

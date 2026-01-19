@@ -454,7 +454,7 @@ export class Evaluator {
         case "error":
           if (value.length >= 3 && typeof value[1] === "string" && typeof value[2] === "string") {
             let cls = ERROR_TYPES[value[1]] || Error;
-            console.log('creating error cls:', inspect(cls, { depth: null }), 'values', inspect(value, { depth: null }))
+            // console.log('creating error cls:', inspect(cls, { depth: null }), 'values', inspect(value, { depth: null }))
             let result = new cls(value[2]);
             if (typeof value[3] === "string") {
               result.stack = value[3];
@@ -497,7 +497,7 @@ export class Evaluator {
           let isPromise = value[0] == "pipeline";
 
           let addStub = (hook: StubHook) => {
-            console.log('addStub hook:', isPromise, inspect(hook, { depth: null }))
+            // console.log('addStub hook:', isPromise, inspect(hook, { depth: null }))
 
             const unwrapped = maybeUnwrapStubHook(hook);
             if (unwrapped) {
@@ -678,7 +678,7 @@ const unwrapRpcTargets = (value: unknown): unknown => {
 }
 
 const maybeUnwrapStubHook = (hook: StubHook): unknown | RpcTarget | Function => {
-  console.log('maybeUnwrapStubHook hook:', inspect(hook, { depth: null }))
+  // console.log('maybeUnwrapStubHook hook:', inspect(hook, { depth: null }))
   if (hook instanceof PayloadStubHook && hook.payload instanceof RpcPayload && hook.payload.value instanceof RpcStub) {
     const {hook: innerHook, pathIfPromise} = unwrapStubAndPath(hook.payload.value);
     if (pathIfPromise == null && innerHook instanceof TargetStubHook) {
