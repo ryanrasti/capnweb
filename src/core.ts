@@ -4,6 +4,7 @@
 
 import type { RpcTargetBranded, __RPC_TARGET_BRAND, GlobalRpcSessionOptions } from "./types.js";
 import { WORKERS_MODULE_SYMBOL } from "./symbols.js"
+import { inspect } from "node:util";
 
 // Polyfill Symbol.dispose for browsers that don't support it yet
 if (!Symbol.dispose) {
@@ -962,12 +963,30 @@ export class RpcPayload {
 
   // Resolve all promises in this payload and then assign the final value into `parent[property]`.
   private deliverTo(parent: object, property: string | number, promises: Promise<any>[]): void {
+    const unwrapRpcTargets = (value: unknown): unknown => {
+      console.log('unwrapRpcTargets', value)
+      if (value instanceof RpcStub) {
+        const {hook, pathIfPromise} = unwrapStubAndPath(value);
+        if (pathIfPromise == null && hook instanceof TargetStubHook) {
+          const target = hook.getTarget();
+          // hook.dispose();
+          console.log('unwrapRpcTargets target', target)
+          return target;
+        }
+      }
+    
+      return value;
+    }
+    
+
     this.ensureDeepCopied();
 
     if (this.value instanceof RpcPromise) {
       RpcPayload.deliverRpcPromiseTo(this.value, parent, property, promises);
     } else {
-      (<any>parent)[property] = this.value;
+      const unwrapped = unwrapRpcTargets(this.value);
+      console.log('deliverTo', parent, property, this.value, unwrapped);
+      (<any>parent)[property] = unwrapped;
 
       for (let record of this.promises!) {
         // Note that because we already did ensureDeepCopied(), replacing each promise with its
@@ -1013,6 +1032,7 @@ export class RpcPayload {
   // dispose().
   public async deliverCall(func: Function, thisArg: object | undefined): Promise<RpcPayload> {
     try {
+      console.log('deliverCall', func, thisArg, this.value)
       let promises: Promise<void>[] = [];
       this.deliverTo(this, "value", promises);
 
@@ -1398,7 +1418,7 @@ abstract class ValueStubHook extends StubHook {
 
       // It's a local function.
       if (typeof followResult.value != "function") {
-        throw new TypeError(`${value} at '${path.join('.')}' is not a function.`);
+        throw new TypeError(`${inspect(value)} at '${path.join('.')}' is not a function.`);
       }
       let promise = args.deliverCall(followResult.value, followResult.parent);
       return new PromiseStubHook(promise.then(payload => {

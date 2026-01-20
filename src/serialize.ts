@@ -410,9 +410,9 @@ export class Evaluator {
 
             return resultPayload.deliverResolve().then((x) => {
               //console.log('x:', inspect(x, { depth: null }))
-              const unwrapped = unwrapRpcTargets(x);
+              //const unwrapped = unwrapRpcTargets(x);
              // console.log('unwrapped:', inspect(unwrapped, { depth: null }))
-              return unwrapped;
+              return x;
             }).finally(disposeInvocation);
           };
 
@@ -497,7 +497,7 @@ export class Evaluator {
           let isPromise = value[0] == "pipeline";
 
           let addStub = (hook: StubHook) => {
-            // console.log('addStub hook:', isPromise, inspect(hook, { depth: null }))
+            console.log('addStub hook:', isPromise, inspect(hook, { depth: null }))
 
             const unwrapped = maybeUnwrapStubHook(hook);
             if (unwrapped) {
@@ -655,7 +655,7 @@ export function deserialize(value: string): unknown {
   return payload.value;
 }
 
-const unwrapRpcTargets = (value: unknown): unknown => {
+export const unwrapRpcTargets = (value: unknown): unknown => {
   if (value instanceof RpcStub) {
     const {hook, pathIfPromise} = unwrapStubAndPath(value);
     if (pathIfPromise == null && hook instanceof TargetStubHook) {
@@ -678,7 +678,7 @@ const unwrapRpcTargets = (value: unknown): unknown => {
 }
 
 const maybeUnwrapStubHook = (hook: StubHook): unknown | RpcTarget | Function => {
-  // console.log('maybeUnwrapStubHook hook:', inspect(hook, { depth: null }))
+   console.log('maybeUnwrapStubHook hook:', inspect(hook, { depth: null }))
   if (hook instanceof PayloadStubHook && hook.payload instanceof RpcPayload && hook.payload.value instanceof RpcStub) {
     const {hook: innerHook, pathIfPromise} = unwrapStubAndPath(hook.payload.value);
     if (pathIfPromise == null && innerHook instanceof TargetStubHook) {
