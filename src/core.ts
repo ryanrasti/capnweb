@@ -964,13 +964,13 @@ export class RpcPayload {
   // Resolve all promises in this payload and then assign the final value into `parent[property]`.
   private deliverTo(parent: object, property: string | number, promises: Promise<any>[]): void {
     const unwrapRpcTargets = (value: unknown): unknown => {
-      console.log('unwrapRpcTargets', value)
+       //  console.log('unwrapRpcTargets', value)
       if (value instanceof RpcStub) {
         const {hook, pathIfPromise} = unwrapStubAndPath(value);
         if (pathIfPromise == null && hook instanceof TargetStubHook) {
           const target = hook.getTarget();
           // hook.dispose();
-          console.log('unwrapRpcTargets target', target)
+          // console.log('unwrapRpcTargets target', target)
           return target;
         }
       }
@@ -985,7 +985,7 @@ export class RpcPayload {
       RpcPayload.deliverRpcPromiseTo(this.value, parent, property, promises);
     } else {
       const unwrapped = unwrapRpcTargets(this.value);
-      console.log('deliverTo', parent, property, this.value, unwrapped);
+      // console.log('deliverTo', parent, property, this.value, unwrapped);
       (<any>parent)[property] = unwrapped;
 
       for (let record of this.promises!) {
@@ -1032,7 +1032,7 @@ export class RpcPayload {
   // dispose().
   public async deliverCall(func: Function, thisArg: object | undefined): Promise<RpcPayload> {
     try {
-      console.log('deliverCall', func, thisArg, this.value)
+      // console.log('deliverCall', func, thisArg, this.value)
       let promises: Promise<void>[] = [];
       this.deliverTo(this, "value", promises);
 

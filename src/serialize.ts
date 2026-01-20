@@ -497,7 +497,7 @@ export class Evaluator {
           let isPromise = value[0] == "pipeline";
 
           let addStub = (hook: StubHook) => {
-            console.log('addStub hook:', isPromise, inspect(hook, { depth: null }))
+            // console.log('addStub hook:', isPromise, inspect(hook, { depth: null }))
 
             const unwrapped = maybeUnwrapStubHook(hook);
             if (unwrapped) {
