@@ -647,10 +647,16 @@ export function deserialize(value: string): unknown {
 }
 
 const maybeUnwrapStubHook = (hook: StubHook): unknown | RpcTarget | Function => {
-  if (hook instanceof PayloadStubHook && hook.payload instanceof RpcPayload && hook.payload.value instanceof RpcStub) {
-    const {hook: innerHook, pathIfPromise} = unwrapStubAndPath(hook.payload.value);
+  if (!(hook instanceof PayloadStubHook)) {
+    return undefined;
+  }
+  const payload = hook.getPayload();
+  if (payload.value instanceof RpcStub) {
+    const {hook: innerHook, pathIfPromise} = unwrapStubAndPath(payload.value);
     if (pathIfPromise == null && innerHook instanceof TargetStubHook) {
       return innerHook.getTarget();
+    } else {
+      return innerHook;
     }
   }
   return undefined;

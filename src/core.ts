@@ -1498,7 +1498,7 @@ export class PayloadStubHook extends ValueStubHook {
 
   private payload?: RpcPayload;  // cleared when disposed
 
-  private getPayload(): RpcPayload {
+  public getPayload(): RpcPayload {
     if (this.payload) {
       return this.payload;
     } else {
@@ -1618,7 +1618,7 @@ export class TargetStubHook extends ValueStubHook {
   private parent?: object | undefined;  // `this` parameter when calling `target`
   private refcount?: BoxedRefcount;  // undefined if not needed (because target has no disposer)
 
-  private getTarget(): RpcTarget | Function {
+  public getTarget(): RpcTarget | Function {
     if (this.target) {
       return this.target;
     } else {
