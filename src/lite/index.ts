@@ -1,9 +1,5 @@
 import type { RpcTransport, RpcSessionOptions } from "../rpc.js";
 
-const todo = () => {
-    throw new Error("Not implemented");
-}
-
 export class RpcTarget {}
 
 class RpcStub {
@@ -79,9 +75,11 @@ class RpcPromise extends RpcStub implements Promise<unknown> {
 
 }
 
-interface ImportExporter {
-    export(target: RpcTarget | Function): number;
-    import(id: number): Promise<RpcStub>;
+export interface ImportExporter {
+    createExport(target: RpcTarget | Function): number;
+    getExport(id: number): RpcTarget | Function | undefined;
+    createImport(id: number): RpcPromise | RpcStub;
+    getImport(id: number): Promise<RpcStub>;
 }
 
 class RpcSessionImpl implements ImportExporter {
@@ -173,6 +171,25 @@ class RpcSessionImpl implements ImportExporter {
         importPromise.resolve(evaluated);
         // Immediately release the call result:
         await this.sendRelease(id, 1);
+
+        // TODO: Release intermediates that were used by this call.
+        //
+        // Example: `stub.makeCounter(4).increment(3)`
+        //   - push(0, ["makeCounter"], [4]) → importId 1 (the Counter)
+        //   - push(1, ["increment"], [3])  → importId 2 (the result)
+        //   - pull(2) → triggers resolve for importId 2
+        //
+        // When we receive the resolve for importId 2, we also need to release
+        // importId 1 (the intermediate Counter) since it was only used to get
+        // to importId 2 and is no longer needed.
+        //
+        // Options:
+        //   1. Track dependencies: when push(1, ...) happens, record that importId 2
+        //      depends on importId 1. On resolve of 2, release 1.
+        //   2. Server-side tracking: server knows which intermediates were used
+        //      to produce a result and releases them when the result is pulled.
+        //   3. Batch model: buffer all calls until await, send as batch with
+        //      internal refs, intermediates never cross the wire.
     }
 
     async handleReject([id, value, ...rest]: unknown[]) {
@@ -226,196 +243,6 @@ class RpcSessionImpl implements ImportExporter {
             throw new Error(`Import ID not found: ${id}`);
         }
         return importPromise.promise;
-    }
-}
-
-class Serializer {
-    constructor(private exporter: ImportExporter) {}
-
-
-    assert(condition: boolean, message: string): asserts condition {
-        if (!condition) {
-            throw new Error(message);
-        }
-    }
-
-    // Serialize a value into an instruction array:
-    devaluate(value: unknown): unknown[] {
-        return todo();
-    }
-
-    // Deserialize an instruction array into a promise:
-    evaluate(value: unknown): unknown | Promise<unknown> {
-        if (Array.isArray(value)) {
-            if (value.length == 1 && Array.isArray(value[0])) {
-                // Escaped array. Evaluate the contents.
-                return this.evaluateArray(value[0]);
-            } else {
-                const [type, ...args] = value;
-                this.assert(typeof type === "string", "Invalid instruction type");
-                switch (type) {
-                    case "bigint":
-                        return this.evaluateBigInt(args);
-                    case "date":
-                        return this.evaluateDate(args);
-                    case "bytes":
-                        return this.evaluateBytes(args);
-                    case "error":
-                        return this.evaluateError(args);
-                    case "undefined":
-                        return this.evaluateUndefined(args);
-                    case "inf":
-                        return Infinity;
-                    case "-inf":
-                        return -Infinity;
-                    case "nan":
-                        return NaN;
-                    case "callback":
-                        return this.evaluateCallback(args);
-                    case "import":
-                        return this.evaluateImport(args);
-                    case "pipeline":
-                        return this.evaluatePipeline(args);
-                    case "export":
-                        return this.evaluateExport(args);
-                    case "remap":
-                        return this.evaluateRemap(args);
-
-                    default:
-                        throw new Error(`Invalid instruction type: ${JSON.stringify(type)}`);
-                }
-            }
-        } else if (value instanceof Object) {
-            return this.evaluateObject(value);
-        } else {
-            // Other JSON types just pass through.
-            return value;
-        }
-    }
-
-
-    evaluateArray(value: unknown[]): unknown[] | Promise<unknown[]> {
-        let hasPromises = false;
-        const result = value.map((item) => {
-            const res = this.evaluate(item)
-            if (res instanceof Promise) {
-                hasPromises = true;
-            }
-            return res;
-        });
-        if (hasPromises) {
-            return Promise.all(result);
-        } else {
-            return result;
-        }
-    }
-
-    evaluateBigInt([val, ...rest]: unknown[]) {
-        this.assert(rest.length === 0 && typeof val === "string", "Invalid bigint instruction");
-        return BigInt(val);
-    }
-
-    evaluateDate([val, ...rest]: unknown[]) {
-        this.assert(rest.length === 0 && typeof val === "number", "Invalid date instruction");
-        return new Date(val);
-    }
-
-    evaluateBytes([val, ...rest]: unknown[]) {
-        this.assert(rest.length === 0 && typeof val === "string", "Invalid bytes instruction");
-        let b64 = Uint8Array as FromBase64;
-        if (b64.fromBase64) {
-            return b64.fromBase64(val);
-          } else {
-            let bs = atob(val);
-            let len = bs.length;
-            let bytes = new Uint8Array(len);
-            for (let i = 0; i < len; i++) {
-                bytes[i] = bs.charCodeAt(i);
-            }
-            return bytes;
-        }
-    }
-
-    evaluateError([type, message, stack,...rest]: unknown[]) {
-        this.assert(rest.length === 0 && typeof type === "string" && typeof message === "string", "Invalid error instruction");
-        const ERROR_TYPES: Record<string, any> = {
-            Error, EvalError, RangeError, ReferenceError, SyntaxError, TypeError, URIError, AggregateError,
-            // TODO: DOMError? Others?
-          };
-          let cls = ERROR_TYPES[type] || Error;
-          let result = new cls(message);
-          if (typeof stack === "string") {
-            result.stack = stack;
-          }
-          return result;
-    }
-
-    evaluateUndefined([...rest]: unknown[]) {
-        this.assert(rest.length === 0, "Invalid undefined instruction");
-        return undefined;
-    }
-
-    evaluateInf([...rest]: unknown[]) {
-        this.assert(rest.length === 0, "Invalid inf instruction");
-        return Infinity;
-    }
-
-    evaluateNegInf([...rest]: unknown[]) {
-        this.assert(rest.length === 0, "Invalid -inf instruction");
-        return -Infinity;
-    }
-
-    evaluateNan([...rest]: unknown[]) {
-        this.assert(rest.length === 0, "Invalid nan instruction");
-        return NaN;
-    }
-    
-    evaluateCallback([callback, ...rest]: unknown[]) {
-        this.assert(rest.length === 0 && typeof callback === "function", "Invalid callback instruction");
-        return callback;
-    }
-
-    evaluateImport(args: unknown[]) {
-        return this.evaluatePipeline(args);
-    }
-
-    evaluatePipeline([id, path, ...rest]: unknown[]) {
-        this.assert(rest.length === 0 && typeof id === "number", "Invalid pipeline instruction");
-        this.assert(Array.isArray(path) && path.every((item) => typeof item === "string" || typeof item === "number"), "Invalid path");
-        return this.exporter.import(id);
-    }
-
-    evaluateExport([target, ...rest]: unknown[]) {
-        this.assert(rest.length === 0 && (target instanceof Function || target instanceof RpcTarget), "Invalid export instruction");
-        return this.exporter.export(target);
-    }
-
-    evaluateRemap([id, path, captures, instructions, ...rest]: unknown[]) {
-        this.assert(rest.length === 0 && typeof id === "number" && Array.isArray(path) && Array.isArray(captures) && Array.isArray(instructions), "Invalid remap instruction");
-        return this.exporter.import(id);
-    }
-
-    async evaluateObject(value: Object): Promise<unknown> {
-        let result = <Record<string, unknown>>value;
-        for (let key in result) {
-          if (key in Object.prototype || key === "toJSON") {
-            // Out of an abundance of caution, we will ignore properties that override properties
-            // of Object.prototype. It's especially important that we don't allow `__proto__` as it
-            // may lead to prototype pollution. We also would rather not allow, e.g., `toString()`,
-            // as overriding this could lead to various mischief.
-            //
-            // We also block `toJSON()` for similar reasons -- even though Object.prototype doesn't
-            // actually define it, `JSON.stringify()` treats it specially and we don't want someone
-            // snooping on JSON calls.
-            //
-            // We do still evaluate the inner value so that we can properly release any stubs.
-            this.evaluate(result[key]);
-            delete result[key];
-          } else {
-            result[key] = await this.evaluate(result[key]);
-          }
-        }
-        return result;    
     }
 }
 
