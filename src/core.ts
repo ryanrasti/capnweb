@@ -4,7 +4,6 @@
 
 import type { RpcTargetBranded, __RPC_TARGET_BRAND, GlobalRpcSessionOptions } from "./types.js";
 import { WORKERS_MODULE_SYMBOL } from "./symbols.js"
-import { inspect } from "node:util";
 
 // Polyfill Symbol.dispose for browsers that don't support it yet
 if (!Symbol.dispose) {
@@ -127,7 +126,7 @@ export function typeForRpc(value: unknown): TypeForRpc {
         }
       }
 
-      if (value instanceof RpcTarget || value.prototype instanceof RpcTarget) {
+      if (value instanceof RpcTarget) {
         return "rpc-target";
       }
 
@@ -135,7 +134,6 @@ export function typeForRpc(value: unknown): TypeForRpc {
         return "error";
       }
 
-      console.log('unsupported value -->', value, value instanceof RpcTarget)
       return "unsupported";
   }
 }
@@ -964,13 +962,10 @@ export class RpcPayload {
   // Resolve all promises in this payload and then assign the final value into `parent[property]`.
   private deliverTo(parent: object, property: string | number, promises: Promise<any>[]): void {
     const unwrapRpcTargets = (value: unknown): unknown => {
-       //  console.log('unwrapRpcTargets', value)
       if (value instanceof RpcStub) {
         const {hook, pathIfPromise} = unwrapStubAndPath(value);
         if (pathIfPromise == null && hook instanceof TargetStubHook) {
           const target = hook.getTarget();
-          // hook.dispose();
-          // console.log('unwrapRpcTargets target', target)
           return target;
         }
       }
@@ -985,7 +980,6 @@ export class RpcPayload {
       RpcPayload.deliverRpcPromiseTo(this.value, parent, property, promises);
     } else {
       const unwrapped = unwrapRpcTargets(this.value);
-      // console.log('deliverTo', parent, property, this.value, unwrapped);
       (<any>parent)[property] = unwrapped;
 
       for (let record of this.promises!) {
@@ -1032,7 +1026,6 @@ export class RpcPayload {
   // dispose().
   public async deliverCall(func: Function, thisArg: object | undefined): Promise<RpcPayload> {
     try {
-      // console.log('deliverCall', func, thisArg, this.value)
       let promises: Promise<void>[] = [];
       this.deliverTo(this, "value", promises);
 
@@ -1371,7 +1364,7 @@ function followPath(value: unknown, parent: object | undefined,
 
       case "unsupported": {
         if (i === 0) {
-          throw new TypeError(`RPC stub points at a non-serializable type: ${value} (${value instanceof RpcTarget})`);
+          throw new TypeError(`RPC stub points at a non-serializable type.`);
         } else {
           let prefix = path.slice(0, i).join(".");
           let remainder = path.slice(0, i).join(".");
@@ -1418,7 +1411,7 @@ abstract class ValueStubHook extends StubHook {
 
       // It's a local function.
       if (typeof followResult.value != "function") {
-        throw new TypeError(`${inspect(value)} at '${path.join('.')}' is not a function.`);
+        throw new TypeError(`'${path.join('.')}' is not a function.`);
       }
       let promise = args.deliverCall(followResult.value, followResult.parent);
       return new PromiseStubHook(promise.then(payload => {
