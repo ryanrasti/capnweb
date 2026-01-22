@@ -11,6 +11,25 @@ export type ImportId = number;
 export type ExportId = number;
 
 // =======================================================================================
+// Explicit callback marking
+
+export type ExplicitCallback<T extends Function> = T & {
+  serializationMode?: 'recordReplay' | 'stub';
+};
+
+const isExplicitCallback = <T extends Function>(arg: T): arg is ExplicitCallback<T> => {
+  return typeof arg === 'function' && 'serializationMode' in arg;
+};
+
+export const explicitCallback = <T extends Function>(
+  fn: T,
+  serializationMode: 'recordReplay' | 'stub'
+): ExplicitCallback<T> => {
+  (fn as any).serializationMode = serializationMode;
+  return fn as ExplicitCallback<T>;
+};
+
+// =======================================================================================
 
 export interface Exporter {
   exportStub(hook: StubHook): ExportId;
@@ -221,8 +240,20 @@ export class Devaluator {
 
       case "function":
       case "rpc-target": {
-        // Check if any argument is a function and we're in recordReplayMode 'all'
-        if (getGlobalRpcSessionOptions().recordReplayMode === 'all' && kind === 'function') {
+        // Check if this is an explicit callback with recordReplay mode, or use global setting
+        let shouldRecordReplay = false;
+        if (kind === 'function') {
+          if (isExplicitCallback(value as Function)) {
+            const explicitMode = (value as ExplicitCallback<Function>).serializationMode;
+            shouldRecordReplay = explicitMode === 'recordReplay';
+            // If explicitly set to 'stub', don't use recordReplay even if global option is set
+          } else {
+            // No explicit mode, check global option
+            shouldRecordReplay = getGlobalRpcSessionOptions().recordReplayMode === 'all';
+          }
+        }
+        
+        if (shouldRecordReplay) {
           // recordCallback returns ["callback", captures, instructions]
           // For nested callbacks: captures are already ["import", idx] arrays
           // For top-level: captures are StubHook[] that need serialization

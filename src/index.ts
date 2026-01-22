@@ -3,7 +3,7 @@
 //     https://opensource.org/license/mit
 
 import { RpcTarget as RpcTargetImpl, RpcStub as RpcStubImpl, RpcPromise as RpcPromiseImpl, setGlobalRpcSessionOptions, takeOwnership } from "./core.js";
-import { serialize, deserialize } from "./serialize.js";
+import { serialize, deserialize, explicitCallback } from "./serialize.js";
 import { RpcTransport, RpcSession as RpcSessionImpl, RpcSessionOptions } from "./rpc.js";
 import { RpcTargetBranded, RpcCompatible, Stub, Stubify, __RPC_TARGET_BRAND } from "./types.js";
 import { newWebSocketRpcSession as newWebSocketRpcSessionImpl,
@@ -16,9 +16,10 @@ import { forceInitMap } from "./map.js";
 forceInitMap();
 
 // Re-export public API types.
-export { serialize, deserialize, newWorkersWebSocketRpcResponse, newHttpBatchRpcResponse,
+export { serialize, deserialize, explicitCallback, newWorkersWebSocketRpcResponse, newHttpBatchRpcResponse,
          nodeHttpBatchRpcResponse, setGlobalRpcSessionOptions, takeOwnership };
 export type { RpcTransport, RpcSessionOptions, RpcCompatible };
+export type { ExplicitCallback } from "./serialize.js";
 
 // Hack the type system to make RpcStub's types work nicely!
 /**
