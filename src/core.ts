@@ -1498,7 +1498,7 @@ export class PayloadStubHook extends ValueStubHook {
 
   private payload?: RpcPayload;  // cleared when disposed
 
-  public getPayload(): RpcPayload {
+  private getPayload(): RpcPayload {
     if (this.payload) {
       return this.payload;
     } else {

@@ -521,12 +521,6 @@ export class Evaluator {
           let isPromise = value[0] == "pipeline";
 
           let addStub = (hook: StubHook) => {
-            const unwrapped = maybeUnwrapStubHook(hook);
-            if (unwrapped) {
-              hook.dispose();
-              return unwrapped;
-            }
-            
             if (isPromise) {
               let promise = new RpcPromise(hook, []);
               this.promises.push({promise, parent, property});
@@ -675,20 +669,4 @@ export function deserialize(value: string): unknown {
   let payload = new Evaluator(NULL_IMPORTER).evaluate(JSON.parse(value));
   payload.dispose();  // should be no-op but just in case
   return payload.value;
-}
-
-const maybeUnwrapStubHook = (hook: StubHook): unknown | RpcTarget | Function => {
-  if (!(hook instanceof PayloadStubHook)) {
-    return undefined;
-  }
-  const payload = hook.getPayload();
-  if (payload.value instanceof RpcStub) {
-    const {hook: innerHook, pathIfPromise} = unwrapStubAndPath(payload.value);
-    if (pathIfPromise == null && innerHook instanceof TargetStubHook) {
-      return innerHook.getTarget();
-    } else {
-      return innerHook;
-    }
-  }
-  return undefined;
 }
