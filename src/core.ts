@@ -639,6 +639,12 @@ async function pullPromise(promise: RpcPromise): Promise<unknown> {
   return payload.deliverResolve();
 }
 
+// Matches what `await` would treat as a promise: any object or function with a callable `then`.
+function isThenable(value: unknown): value is PromiseLike<unknown> {
+  return (typeof value === "object" || typeof value === "function") && value !== null &&
+         typeof (<any>value).then === "function";
+}
+
 // =======================================================================================
 // RpcPayload
 
@@ -1177,9 +1183,16 @@ export class RpcPayload {
   // they are awaited and substituted before calling the function. The result of the call is
   // wrapped into another payload.
   //
+  // If nothing needed awaiting -- the args contained no unresolved promises and the function
+  // returned a non-thenable -- the resulting payload is returned synchronously. This allows
+  // fully-local call chains (e.g. record-replay of closures) to complete without ever yielding
+  // to the microtask queue. Otherwise, a promise is returned.
+  //
   // The payload is automatically disposed after the call completes. The caller should not call
   // dispose().
-  public async deliverCall(func: Function, thisArg: object | undefined): Promise<RpcPayload> {
+  public deliverCall(func: Function, thisArg: object | undefined)
+      : RpcPayload | Promise<RpcPayload> {
+    let result: unknown;
     try {
       let promises: Promise<void>[] = [];
       this.deliverTo(this, "value", promises);
@@ -1188,20 +1201,53 @@ export class RpcPayload {
       //   that the function is called immediately and synchronously. Otherwise, we might violate
       //   e-order.
       if (promises.length > 0) {
-        await Promise.all(promises);
+        return this.deliverCallAsync(Promise.all(promises), func, thisArg);
       }
 
       // Call the function.
+      result = Function.prototype.apply.call(func, thisArg, this.value);
+    } catch (err) {
+      this.dispose();
+      throw err;
+    }
+
+    if (result instanceof RpcPromise) {
+      // Special case: If the function immediately returns RpcPromise, we don't want to await it,
+      // since that will actually wait for the promise. Instead we want to construct a payload
+      // around it directly.
+      let payload = RpcPayload.fromAppReturn(result);
+      this.dispose();
+      return payload;
+    } else if (isThenable(result)) {
+      return (async () => {
+        try {
+          return RpcPayload.fromAppReturn(await result);
+        } finally {
+          this.dispose();
+        }
+      })();
+    } else {
+      // The result is a plain value; deliver it synchronously. However, defer disposal of the
+      // args by one microtask, matching the old implementation which `await`ed the (non-promise)
+      // result before disposing. Calls the target initiated during its synchronous execution may
+      // be delivered on a later microtask but still rely on stubs owned by the args -- e.g.
+      // writes into a proxied WritableStream parameter.
+      queueMicrotask(() => this.dispose());
+      return RpcPayload.fromAppReturn(result);
+    }
+  }
+
+  // Slow path of deliverCall(): some args contained promises which must resolve first.
+  private async deliverCallAsync(argsReady: Promise<unknown>, func: Function,
+                                 thisArg: object | undefined): Promise<RpcPayload> {
+    try {
+      await argsReady;
+
       let result = Function.prototype.apply.call(func, thisArg, this.value);
 
       if (result instanceof RpcPromise) {
-        // Special case: If the function immediately returns RpcPromise, we don't want to await it,
-        // since that will actually wait for the promise. Instead we want to construct a payload
-        // around it directly.
         return RpcPayload.fromAppReturn(result);
       } else {
-        // In all other cases, await the result (which may or may not be a promise, but `await`
-        // will just pass through non-promises).
         return RpcPayload.fromAppReturn(await result);
       }
     } finally {
@@ -1209,49 +1255,65 @@ export class RpcPayload {
     }
   }
 
-  // Produce a promise for this payload for return to the application. Any RpcPromises in the
-  // payload are awaited and substituted with their results first.
+  // Produce this payload's value for return to the application. Any RpcPromises in the
+  // payload are awaited and substituted with their results first. If nothing needed awaiting,
+  // the value is returned synchronously; otherwise, a promise for it is returned.
   //
   // The returned object will have a disposer which disposes the payload. The caller should not
   // separately dispose it.
-  public async deliverResolve(): Promise<unknown> {
+  public deliverResolve(): unknown | Promise<unknown> {
     try {
       let promises: Promise<void>[] = [];
       this.deliverTo(this, "value", promises);
 
       if (promises.length > 0) {
-        await Promise.all(promises);
+        return (async () => {
+          try {
+            await Promise.all(promises);
+            return this.finishResolve();
+          } catch (err) {
+            // Automatically dispose since the application will never receive the disposable...
+            this.dispose();
+            throw err;
+          }
+        })();
       }
 
-      let result = this.value;
-
-      // Add disposer to result.
-      if (result instanceof Object) {
-        if (!(Symbol.dispose in result)) {
-          // We want the disposer to be non-enumerable as otherwise it gets in the way of things
-          // like unit tests trying to deep-compare the result to an object.
-          Object.defineProperty(result, Symbol.dispose, {
-            // NOTE: Using `this.dispose.bind(this)` here causes Playwright's build of
-            //   Chromium 140.0.7339.16 to fail when the object is assigned to a `using` variable,
-            //   with the error:
-            //       TypeError: Symbol(Symbol.dispose) is not a function
-            //   I cannot reproduce this problem in Chrome 140.0.7339.127 nor in Node or workerd,
-            //   so maybe it was a short-lived V8 bug or something. To be safe, though, we use
-            //   `() => this.dispose()`, which seems to always work.
-            value: () => this.dispose(),
-            writable: true,
-            enumerable: false,
-            configurable: true,
-          });
-        }
-      }
-
-      return result;
+      return this.finishResolve();
     } catch (err) {
       // Automatically dispose since the application will never receive the disposable...
       this.dispose();
       throw err;
     }
+  }
+
+  // Final step of deliverResolve(), after all promises in the payload have resolved: attach a
+  // disposer to the value and return it.
+  private finishResolve(): unknown {
+    let result = this.value;
+
+    // Add disposer to result.
+    if (result instanceof Object) {
+      if (!(Symbol.dispose in result)) {
+        // We want the disposer to be non-enumerable as otherwise it gets in the way of things
+        // like unit tests trying to deep-compare the result to an object.
+        Object.defineProperty(result, Symbol.dispose, {
+          // NOTE: Using `this.dispose.bind(this)` here causes Playwright's build of
+          //   Chromium 140.0.7339.16 to fail when the object is assigned to a `using` variable,
+          //   with the error:
+          //       TypeError: Symbol(Symbol.dispose) is not a function
+          //   I cannot reproduce this problem in Chrome 140.0.7339.127 nor in Node or workerd,
+          //   so maybe it was a short-lived V8 bug or something. To be safe, though, we use
+          //   `() => this.dispose()`, which seems to always work.
+          value: () => this.dispose(),
+          writable: true,
+          enumerable: false,
+          configurable: true,
+        });
+      }
+    }
+
+    return result;
   }
 
   public dispose() {
@@ -1644,8 +1706,12 @@ abstract class ValueStubHook extends StubHook {
       if (typeof followResult.value != "function") {
         throw new TypeError(`'${path.join('.')}' is not a function.`);
       }
-      let promise = args.deliverCall(followResult.value, followResult.parent);
-      return new PromiseStubHook(promise.then(payload => {
+      let result = args.deliverCall(followResult.value, followResult.parent);
+      if (result instanceof RpcPayload) {
+        // The call completed synchronously; no need to involve a promise at all.
+        return new PayloadStubHook(result);
+      }
+      return new PromiseStubHook(result.then(payload => {
         return new PayloadStubHook(payload);
       }));
     } catch (err) {

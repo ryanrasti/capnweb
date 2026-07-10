@@ -63,7 +63,7 @@ class WritableStreamStubHook extends StubHook {
       }
 
       let func = state.writer[method] as Function;
-      let promise = args.deliverCall(func, state.writer);
+      let promise = Promise.resolve(args.deliverCall(func, state.writer));
       return new PromiseStubHook(promise.then(payload => new PayloadStubHook(payload)));
     } catch (err) {
       return new ErrorStubHook(err);

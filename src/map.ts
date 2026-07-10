@@ -395,7 +395,7 @@ mapImpl.evaluateCaptures = (rawCaptures: unknown[], importer: Importer) => {
   });
 }
 
-mapImpl.evaluateClosure = (captures: StubHook[], instructions: unknown[]): (arg: unknown) => Promise<unknown> => {
+mapImpl.evaluateClosure = (captures: StubHook[], instructions: unknown[]): (arg: unknown) => unknown => {
   let disposed = false;
   const dispose = () => {
     disposed = true;
@@ -404,11 +404,14 @@ mapImpl.evaluateClosure = (captures: StubHook[], instructions: unknown[]): (arg:
     }
   }
 
-  const fn = (arg: unknown): Promise<unknown> => {
+  const fn = (arg: unknown): unknown => {
     if (disposed) {
       throw new Error("Attempted to call a closure after it was disposed.");
     }
     const payload = applyMapToElement(arg, undefined, null, captures, instructions);
+    // deliverResolve() returns synchronously when the replayed instructions never had to
+    // await anything (e.g. every captured stub was local), so fully-synchronous closures
+    // replay as plain synchronous functions.
     return payload.deliverResolve();
   }
 

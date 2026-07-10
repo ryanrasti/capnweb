@@ -1138,6 +1138,84 @@ describe("record-replay closure over RPC", () => {
     await stub.release();
   });
 
+  it("replays a closure synchronously when everything is local", async () => {
+    class Doubler extends RpcTarget {
+      double(x: number) { return x * 2; }
+    }
+
+    class SyncCaller extends RpcTarget {
+      callWithLocal(fn: (arg: unknown) => unknown) {
+        using thing = new RpcStub(new Doubler());
+        let result = fn(thing);
+        if (result instanceof Promise) {
+          throw new Error("expected closure replay to be synchronous");
+        }
+        return result;
+      }
+    }
+
+    await using harness = new TestHarness(new SyncCaller());
+
+    expect(await harness.stub.map(stub => {
+      return stub.callWithLocal((y: any) => y.double(21));
+    })).toBe(42);
+  });
+
+  it("replays a literal-returning closure synchronously", async () => {
+    class SyncCaller extends RpcTarget {
+      call(fn: (arg: unknown) => unknown) {
+        let result = fn(123);
+        if (result instanceof Promise) {
+          throw new Error("expected closure replay to be synchronous");
+        }
+        return result;
+      }
+    }
+
+    await using harness = new TestHarness(new SyncCaller());
+
+    expect(await harness.stub.map(stub => {
+      return stub.call((y: any) => 42);
+    })).toBe(42);
+  });
+
+  it("replays an identity closure synchronously", async () => {
+    class SyncCaller extends RpcTarget {
+      call(fn: (arg: unknown) => unknown) {
+        let result = fn(7);
+        if (result instanceof Promise) {
+          throw new Error("expected closure replay to be synchronous");
+        }
+        return result;
+      }
+    }
+
+    await using harness = new TestHarness(new SyncCaller());
+
+    expect(await harness.stub.map(stub => {
+      return stub.call((y: any) => y);
+    })).toBe(7);
+  });
+
+  it("still returns a promise from replay when the closure calls a remote stub", async () => {
+    class AsyncCaller extends RpcTarget {
+      async call(fn: (arg: unknown) => unknown) {
+        let result = fn(5);
+        if (!(result instanceof Promise)) {
+          throw new Error("expected closure replay involving a remote stub to be asynchronous");
+        }
+        return await result;
+      }
+    }
+
+    await using harness = new TestHarness(new AsyncCaller());
+    let counter = new RpcStub(new Counter(10));
+
+    expect(await harness.stub.map(stub => {
+      return stub.call((y: number) => counter.increment(y));
+    })).toBe(15);
+  });
+
 });
 
 describe("stub disposal over RPC", () => {
