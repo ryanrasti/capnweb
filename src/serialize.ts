@@ -659,8 +659,13 @@ export class Evaluator {
               this.promises.push({promise, parent, property});
               return promise;
             } else {
+              // Per the comment below, a plain "import" asks for the result to be coerced to
+              // RpcStub. Wrapping the hook in RpcPromise here would break delivery when this
+              // reference is the payload root: deliverTo() would try to pull() a hook that
+              // doesn't back a promise (e.g. a TargetStubHook for a round-tripped local
+              // stub), throwing "Tried to resolve a non-promise stub."
               this.hooks.push(hook);
-              return new RpcPromise(hook, []);
+              return new RpcStub(hook);
             }
           };
 
