@@ -4,7 +4,7 @@
 
 import { expect, it, describe, inject } from "vitest"
 import { deserialize, serialize, RpcSession, type RpcSessionOptions, RpcTransport, RpcTarget,
-         RpcStub, newWebSocketRpcSession, newMessagePortRpcSession,
+         RpcStub, getLocalTarget, newWebSocketRpcSession, newMessagePortRpcSession,
          newHttpBatchRpcSession} from "../src/index.js"
 import { Counter, TestTarget } from "./test-util.js";
 
@@ -1228,6 +1228,124 @@ describe("record-replay closure over RPC", () => {
     expect(await harness.stub.map(stub => {
       return stub.call((y: number) => counter.increment(y));
     })).toBe(15);
+  });
+
+});
+
+describe("getLocalTarget()", () => {
+  it("recovers the raw target when a stub is round-tripped back to its owner", async () => {
+    class Thing extends RpcTarget {
+      secret = "hidden";
+    }
+
+    class Api extends RpcTarget {
+      private thing = new Thing();
+
+      getThing() { return this.thing; }
+
+      checkThing(t: unknown) {
+        // The reference arrives as an ordinary stub; getLocalTarget() recovers our own
+        // object so instanceof checks and non-exposed field access work.
+        let raw = getLocalTarget(t);
+        return t instanceof RpcStub &&
+               raw === this.thing && raw instanceof Thing && (<Thing>raw).secret === "hidden";
+      }
+    }
+
+    await using harness = new TestHarness(new Api());
+
+    using thingStub = await harness.stub.getThing();
+    expect(await harness.stub.checkThing(thingStub)).toBe(true);
+  });
+
+  it("recovers the main target", async () => {
+    class Api extends RpcTarget {
+      isSelf(x: unknown) { return getLocalTarget(x) === this; }
+    }
+
+    await using harness = new TestHarness(new Api());
+
+    expect(await harness.stub.isSelf(harness.stub)).toBe(true);
+  });
+
+  it("recovers a locally-created target from an echoed stub", async () => {
+    class Echo extends RpcTarget {
+      // Params stubs are borrowed, so dup() to return one.
+      echo(x: unknown) { return (<RpcStub>x).dup(); }
+    }
+
+    await using harness = new TestHarness(new Echo());
+
+    let counter = new Counter(3);
+    using stub = new RpcStub(counter);
+
+    using echoed = await harness.stub.echo(stub);
+    expect(getLocalTarget(echoed)).toBe(counter);
+  });
+
+  it("returns undefined for stubs the receiver does not own", async () => {
+    class Inspector extends RpcTarget {
+      inspect(x: unknown) {
+        // The stub belongs to the client, not us; there is no local target to recover.
+        return { isStub: x instanceof RpcStub, local: getLocalTarget(x) !== undefined };
+      }
+    }
+
+    await using harness = new TestHarness(new Inspector());
+
+    using counterStub = new RpcStub(new Counter(0));
+    expect(await harness.stub.inspect(counterStub)).toStrictEqual(
+        { isStub: true, local: false });
+
+    // Client side: the main stub is remote from our perspective.
+    expect(getLocalTarget(harness.stub)).toBeUndefined();
+  });
+
+  it("recovers targets from pipelined property references", async () => {
+    class Thing extends RpcTarget {}
+
+    class Api extends RpcTarget {
+      private thing = new Thing();
+
+      getBox() { return { thing: this.thing }; }
+
+      isSameThing(t: unknown) {
+        return getLocalTarget(t) === this.thing;
+      }
+    }
+
+    await using harness = new TestHarness(new Api());
+
+    // Passing `box.thing` pipelines a property of an unresolved promise back to the server;
+    // the substituted stub still recovers the raw object.
+    let box = harness.stub.getBox();
+    expect(await harness.stub.isSameThing(box.thing)).toBe(true);
+    (await box)[Symbol.dispose]();
+  });
+
+  it("recovers a target from a synchronously-replayed closure result", async () => {
+    class Row extends RpcTarget {
+      getId() { return 7; }
+    }
+
+    class Table extends RpcTarget {
+      private row = new Row();
+
+      query(fn: (arg: unknown) => unknown) {
+        using rowStub = new RpcStub(this.row);
+        let result = fn(rowStub);
+        if (result instanceof Promise) {
+          throw new Error("expected closure replay to be synchronous");
+        }
+        return getLocalTarget(result) === this.row;
+      }
+    }
+
+    await using harness = new TestHarness(new Table());
+
+    expect(await harness.stub.map(stub => {
+      return stub.query((row: any) => row);
+    })).toBe(true);
   });
 
 });

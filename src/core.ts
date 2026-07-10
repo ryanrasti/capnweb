@@ -308,6 +308,15 @@ export abstract class StubHook {
   abstract dispose(): void;
 
   abstract onBroken(callback: (error: any) => void): void;
+
+  // If this hook directly wraps an object living in this process's memory -- an RpcTarget or
+  // plain function that local code originally created -- returns that object. Otherwise,
+  // returns undefined.
+  //
+  // This is the mechanism behind the public getLocalTarget() helper; see its doc comment.
+  getLocalTarget(): RpcTarget | Function | undefined {
+    return undefined;
+  }
 }
 
 export class ErrorStubHook extends StubHook {
@@ -1853,6 +1862,42 @@ export class PayloadStubHook extends ValueStubHook {
       // TODO: Should native stubs be able to implement onRpcBroken?
     }
   }
+
+  getLocalTarget(): RpcTarget | Function | undefined {
+    // A PayloadStubHook backs an export when a promise resolved to a local value, e.g. a
+    // method returned an RpcTarget. If the payload's root is that target (or a stub wrapping
+    // a local target), unwrap it so the owner can be recovered from round-tripped references.
+    if (!this.payload) {
+      return undefined;
+    }
+    let value = this.payload.value;
+    if (value instanceof RpcStub) {
+      let hook = unwrapStubNoProperties(value);
+      return hook?.getLocalTarget();
+    }
+    if (value instanceof RpcTarget || typeof value === "function") {
+      return <RpcTarget | Function>value;
+    }
+    return undefined;
+  }
+}
+
+// Given a stub received over RPC, if it points at an object living in this process's memory --
+// i.e. the peer passed one of our own capabilities back to us -- returns the original object.
+// Returns undefined for genuinely remote stubs, unresolved promise stubs, promise-property
+// stubs, and non-stub values.
+//
+// This is the explicit way to recover your own object (to check its type, access private
+// state, etc.) when a stub round-trips back to its owner -- analogous to Cap'n Proto's
+// CapabilityServerSet. The stub itself is unaffected: it remains owned by whoever owns it
+// (usually the payload it arrived in), and the returned object is a borrowed reference with
+// no disposal obligation.
+export function getLocalTarget(value: unknown): RpcTarget | Function | undefined {
+  if (value instanceof RpcStub) {
+    let hook = unwrapStubNoProperties(value);
+    return hook?.getLocalTarget();
+  }
+  return undefined;
 }
 
 function disposeRpcTarget(target: RpcTarget | Function) {
@@ -1964,6 +2009,11 @@ class TargetStubHook extends ValueStubHook {
 
   onBroken(callback: (error: any) => void): void {
     // TODO: Should RpcTargets be able to implement onRpcBroken?
+  }
+
+  getLocalTarget(): RpcTarget | Function | undefined {
+    // Note: intentionally does not throw if disposed; recovery is best-effort.
+    return this.target;
   }
 }
 

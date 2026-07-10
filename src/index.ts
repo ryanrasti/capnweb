@@ -2,7 +2,8 @@
 // Licensed under the MIT license found in the LICENSE.txt file or at:
 //     https://opensource.org/license/mit
 
-import { RpcTarget as RpcTargetImpl, RpcStub as RpcStubImpl, RpcPromise as RpcPromiseImpl } from "./core.js";
+import { RpcTarget as RpcTargetImpl, RpcStub as RpcStubImpl, RpcPromise as RpcPromiseImpl,
+         getLocalTarget as getLocalTargetImpl } from "./core.js";
 import { serialize, deserialize } from "./serialize.js";
 import { RpcTransport, RpcSession as RpcSessionImpl, RpcSessionOptions } from "./rpc.js";
 import { RpcTargetBranded, RpcCompatible, Stub, Stubify, __RPC_TARGET_BRAND } from "./types.js";
@@ -93,6 +94,20 @@ export interface RpcTarget extends RpcTargetBranded {};
 export const RpcTarget: {
   new(): RpcTarget;
 } = RpcTargetImpl;
+
+/**
+ * Given a stub received over RPC, if it points at an object living in this process's memory --
+ * i.e. the peer passed one of your own capabilities back to you -- returns the original object.
+ * Returns `undefined` for genuinely remote stubs, unresolved promises, and non-stub values.
+ *
+ * This lets a capability's owner recover the underlying object from a round-tripped stub in
+ * order to check its type, access private state, etc. -- analogous to Cap'n Proto's
+ * `CapabilityServerSet`. The stub itself is unaffected (dispose it, or not, exactly as you
+ * would have otherwise); the returned object is a borrowed reference with no disposal
+ * obligation.
+ */
+export let getLocalTarget: (value: unknown) => object | Function | undefined =
+    <any>getLocalTargetImpl;
 
 /**
  * Empty interface used as default type parameter for sessions where the other side doesn't
