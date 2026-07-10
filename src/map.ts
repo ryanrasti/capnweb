@@ -161,8 +161,8 @@ class MapBuilder implements Exporter {
 };
 
 mapImpl.serializeClosure = (func: (promise: RpcPromise) => unknown): unknown[] => {
-  if (func.length !== 1) {
-    throw new Error("Only single-argument functions can be serialized as closures.");
+  if (func.length > 1) {
+    throw new Error("Only functions taking at most one argument can be serialized as closures.");
   }
   if (Object.getPrototypeOf(func) === AsyncFunction.prototype) {
     throw new Error("RPC closures cannot be async functions.");

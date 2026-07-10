@@ -1197,6 +1197,20 @@ describe("record-replay closure over RPC", () => {
     })).toBe(7);
   });
 
+  it("supports zero-argument closures", async () => {
+    class SyncCaller extends RpcTarget {
+      call(fn: () => unknown) {
+        return fn();
+      }
+    }
+
+    await using harness = new TestHarness(new SyncCaller());
+
+    expect(await harness.stub.map(stub => {
+      return stub.call(() => 42);
+    })).toBe(42);
+  });
+
   it("still returns a promise from replay when the closure calls a remote stub", async () => {
     class AsyncCaller extends RpcTarget {
       async call(fn: (arg: unknown) => unknown) {
