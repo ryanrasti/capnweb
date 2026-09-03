@@ -978,13 +978,15 @@ impl RpcStub {
         Arc::clone(&self.hook)
     }
 
-    pub(crate) fn property(&self, property: PropertyKey) -> RpcPromise {
+    #[doc(hidden)]
+    pub fn property(&self, property: PropertyKey) -> RpcPromise {
         let mut path = self.path_if_promise.clone().unwrap_or_default();
         path.push(property);
         RpcPromise::from_hook(self.current_hook(), path)
     }
 
-    pub(crate) fn call_path(&self, args: RpcPayload) -> Result<RpcPromise> {
+    #[doc(hidden)]
+    pub fn call_path(&self, args: RpcPayload) -> Result<RpcPromise> {
         let hook = do_call(
             self.current_hook(),
             self.path_if_promise.clone().unwrap_or_default(),
@@ -1623,6 +1625,13 @@ impl RpcPayload {
     // JS:       throw new Error("owned payload shouldn't contain raw RpcTargets");
     // JS:     }
     // JS:   }
+    pub(crate) fn get_hook_for_rpc_target(
+        &self,
+        target: Arc<dyn RpcTargetInner>,
+        callable: bool,
+    ) -> StubHook {
+        TargetStubHook::create(target, callable)
+    }
     // JS:
     // JS:   // Get the StubHook representing the given WritableStream found inside this payload.
     // JS:   public getHookForWritableStream(stream: WritableStream, parent: object | undefined,
@@ -1658,6 +1667,7 @@ impl RpcPayload {
     // JS:       throw new Error("owned payload shouldn't contain raw WritableStreams");
     // JS:     }
     // JS:   }
+    // RUST-DEFERRED(JS built-in: WritableStream): writable hooks are not represented.
     // JS:
     // JS:   // Get the StubHook representing the given ReadableStream found inside this payload.
     // JS:   public getHookForReadableStream(stream: ReadableStream, parent: object | undefined,
@@ -1689,6 +1699,7 @@ impl RpcPayload {
     // JS:       throw new Error("owned payload shouldn't contain raw ReadableStreams");
     // JS:     }
     // JS:   }
+    // RUST-DEFERRED(JS built-in: ReadableStream): readable hooks are not represented.
     // JS:
     // JS:   private deepCopy(
     // JS:       value: unknown, oldParent: object | undefined, property: string | number, parent: object,
@@ -1840,6 +1851,9 @@ impl RpcPayload {
     // JS:         throw new Error("unreachable");
     // JS:     }
     // JS:   }
+    fn deep_copy(value: &CapnwebValue) -> CapnwebValue {
+        value.clone()
+    }
     // JS:
     // JS:   // Ensures that if the value originally came from an unowned source, we have replaced it with a
     // JS:   // deep copy.
@@ -1872,6 +1886,9 @@ impl RpcPayload {
     // JS:       this.rpcTargets = undefined;
     // JS:     }
     // JS:   }
+    fn ensure_deep_copied(&mut self) {
+        // RUST-DIFF(local refcount): application values are moved into an owned tree at construction.
+    }
     // JS:
     // JS:   // Resolve all promises in this payload and then assign the final value into `parent[property]`.
     // JS:   private deliverTo(parent: object, property: string | number, promises: Promise<any>[]): void {
@@ -1953,6 +1970,8 @@ impl RpcPayload {
     // JS:       this.dispose();
     // JS:     }
     // JS:   }
+    // RUST-DIFF(JS Proxy): generated target dispatch eagerly polls `deliver_resolve()` before
+    // invoking the corresponding typed Rust method and wraps its result in a payload hook.
     // JS:
     // JS:   // Deliver this payload as the argument list to `WritableStreamDefaultWriter.write(chunk)`.
     // JS:   //
@@ -2008,6 +2027,7 @@ impl RpcPayload {
     // JS:       throw err;
     // JS:     }
     // JS:   }
+    // RUST-DEFERRED(JS built-in: WritableStream): stream-write delivery is not represented.
     // JS:
     // JS:   // Produce a promise for this payload for return to the application. Any RpcPromises in the
     // JS:   // payload are awaited and substituted with their results first.
@@ -2053,6 +2073,10 @@ impl RpcPayload {
     // JS:       throw err;
     // JS:     }
     // JS:   }
+    #[doc(hidden)]
+    pub async fn deliver_resolve(self) -> Result<CapnwebValue> {
+        Self::resolve_value(self.value).await
+    }
     // JS:
     // JS:   public dispose() {
     // JS:     if (this.source === "owned") {
@@ -2075,6 +2099,7 @@ impl RpcPayload {
     // JS:     this.hooks = [];
     // JS:     this.promises = [];
     // JS:   }
+    // RUST-DIFF(local refcount): recursive ownership and `Drop` replace payload disposal.
     // JS:
     // JS:   // Recursive dispose, called only when `source` is "return".
     // JS:   private disposeImpl(value: unknown, parent: object | undefined) {
@@ -2299,10 +2324,6 @@ impl RpcPayload {
                 value => Ok(value),
             }
         })
-    }
-
-    async fn deliver_resolve(self) -> Result<CapnwebValue> {
-        Self::resolve_value(self.value).await
     }
 
     fn ignore_unhandled_rejections(&self) {
@@ -3309,7 +3330,8 @@ impl PromiseStubHook {
         }
     }
 
-    pub(crate) fn from_future(
+    #[doc(hidden)]
+    pub fn from_future(
         future: impl Future<Output = Result<StubHook>> + Send + 'static,
     ) -> StubHook {
         let result = Self::pending();
