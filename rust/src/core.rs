@@ -35,8 +35,10 @@ pub type Result<T> = std::result::Result<T, Error>;
 /// An owned dynamic value accepted by the Rust RPC boundary.
 #[derive(Clone)]
 pub enum CapnwebValue {
-    /// JavaScript `null` or `undefined`.
+    /// JavaScript `null`.
     Null,
+    /// JavaScript `undefined`, including typed Rust `()` after dynamic erasure.
+    Undefined,
     /// A boolean.
     Bool(bool),
     /// A JavaScript number.
@@ -67,6 +69,7 @@ impl std::fmt::Debug for CapnwebValue {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Null => formatter.write_str("Null"),
+            Self::Undefined => formatter.write_str("Undefined"),
             Self::Bool(value) => formatter.debug_tuple("Bool").field(value).finish(),
             Self::Number(value) => formatter.debug_tuple("Number").field(value).finish(),
             Self::String(value) => formatter.debug_tuple("String").field(value).finish(),
@@ -79,6 +82,23 @@ impl std::fmt::Debug for CapnwebValue {
             Self::RpcPromise(_) => formatter.write_str("RpcPromise(..)"),
             Self::Target(_) => formatter.write_str("Target(..)"),
             Self::Error(value) => formatter.debug_tuple("Error").field(value).finish(),
+        }
+    }
+}
+
+impl From<()> for CapnwebValue {
+    fn from((): ()) -> Self {
+        Self::Undefined
+    }
+}
+
+impl TryFrom<CapnwebValue> for () {
+    type Error = Error;
+
+    fn try_from(value: CapnwebValue) -> Result<Self> {
+        match value {
+            CapnwebValue::Undefined => Ok(()),
+            _ => Err(Error::Type("expected undefined".to_owned())),
         }
     }
 }
@@ -226,7 +246,7 @@ pub(crate) fn type_for_rpc(value: &CapnwebValue) -> TypeForRpc {
 
         // JS:     case "undefined":
         // JS:       return "undefined";
-        // Rust aliases `undefined` to `Null`, which is classified with the other primitive values below.
+        CapnwebValue::Undefined => TypeForRpc::Undefined,
         // JS:
 
         // JS:     case "object":
@@ -2408,7 +2428,7 @@ fn follow_path(
             // JS:       // properties on a stub will resolve to the local prototype property, not making an RPC at
             // JS:       // all.
             // JS:       value = undefined;
-            value = CapnwebValue::Null;
+            value = CapnwebValue::Undefined;
             // JS:       continue;
             continue;
             // JS:     }
@@ -2428,8 +2448,8 @@ fn follow_path(
             // JS:         }
             // JS:         break;
             CapnwebValue::Object(mut object) => match part {
-                PropertyKey::String(name) => object.remove(name).unwrap_or(CapnwebValue::Null),
-                PropertyKey::Number(_) => CapnwebValue::Null,
+                PropertyKey::String(name) => object.remove(name).unwrap_or(CapnwebValue::Undefined),
+                PropertyKey::Number(_) => CapnwebValue::Undefined,
             },
             // JS:
             // JS:       case "array":
@@ -2451,9 +2471,9 @@ fn follow_path(
                     array
                         .into_iter()
                         .nth(*number as usize)
-                        .unwrap_or(CapnwebValue::Null)
+                        .unwrap_or(CapnwebValue::Undefined)
                 }
-                _ => CapnwebValue::Null,
+                _ => CapnwebValue::Undefined,
             },
             // JS:
             // JS:       case "rpc-target":
@@ -2552,12 +2572,21 @@ fn follow_path(
             | CapnwebValue::String(_)
             | CapnwebValue::BigInt(_)
             | CapnwebValue::Bytes(_)
-            | CapnwebValue::Error(_) => CapnwebValue::Null,
+            | CapnwebValue::Error(_) => CapnwebValue::Undefined,
             // JS:
             // JS:       case "undefined":
             // JS:         // Intentionally produce TypeError.
             // JS:         value = (value as any)[part];
-            // JS:         break;
+            CapnwebValue::Undefined => {
+                let part = match part {
+                    PropertyKey::String(part) => part.clone(),
+                    PropertyKey::Number(part) => part.to_string(),
+                };
+                return Err(Error::Type(format!(
+                    "Cannot read properties of undefined (reading '{part}')"
+                )));
+                // JS:         break;
+            }
             // JS:
             // JS:       case "unsupported": {
             // JS:         if (i === 0) {
@@ -2574,6 +2603,8 @@ fn follow_path(
             // JS:       default:
             // JS:         kind satisfies never;
             // JS:         throw new TypeError("unreachable");
+            #[allow(unreachable_patterns)]
+            _ => return Err(Error::Type("unreachable dynamic value kind".to_owned())),
             // JS:     }
         };
         // JS:   }

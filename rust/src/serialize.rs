@@ -802,7 +802,7 @@ impl<'a> Devaluator<'a> {
             // JS:           return undefined;
             // JS:         }
             // JS:         return ["undefined"];
-            // Rust aliases undefined to the `CapnwebValue::Null` arm above and emits JSON null.
+            CapnwebValue::Undefined => Ok(wire_tag("undefined", Vec::new())),
             // JS:
             // JS:       case "stub":
             // JS:       case "rpc-promise": {
@@ -901,6 +901,8 @@ impl<'a> Devaluator<'a> {
             // JS:       default:
             // JS:         kind satisfies never;
             // JS:         throw new Error("unreachable");
+            #[allow(unreachable_patterns)]
+            _ => Err(Error::Message("unreachable dynamic value kind".to_owned())),
             // JS:     }
         }
         // JS:   }
@@ -1375,7 +1377,7 @@ impl<'a> Evaluator<'a> {
                     // JS:             return undefined;
                     // JS:           }
                     // JS:           break;
-                    "undefined" if expression.len() == 1 => Ok(CapnwebValue::Null),
+                    "undefined" if expression.len() == 1 => Ok(CapnwebValue::Undefined),
                     // JS:         case "inf":
                     // JS:           return Infinity;
                     "inf" if expression.len() == 1 => Ok(CapnwebValue::Number(f64::INFINITY)),

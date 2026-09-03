@@ -24,7 +24,7 @@ that cannot be mapped unambiguously either become `CapnwebValue` or produce a cl
 5. Hide promise materialization and wire errors from local target implementation signatures.
 6. Generate enums only for unions that can be decoded unambiguously.
 7. Fall back to `CapnwebValue` for genuinely dynamic values.
-8. Treat `undefined` as `null` in v0 and document that this is lossy.
+8. Preserve `undefined` as `CapnwebValue::Undefined`; map typed `void` and exact `undefined` to `()`.
 9. Do not expose Rust implementation fields merely because they are public.
 
 ## Source discovery
@@ -55,8 +55,8 @@ unnecessary. The same semantic frontend can read exported declarations directly 
 | `number`         | `f64`                            | Includes NaN and infinities              |
 | `bigint`         | `BigInt`                         | Narrower mappings require annotations    |
 | `null`           | `None` in a nullable type        |                                          |
-| `undefined`      | `None` / `CapnwebValue::Null` v0 | Deliberately conflated with null         |
-| `void`           | `()`                             | Encoded with Cap'n Web void semantics    |
+| `undefined`      | `()` / `CapnwebValue::Undefined` | Depends on typed vs. dynamic context     |
+| `void`           | `()`                             | Encodes as Cap'n Web `undefined`         |
 | string literal   | generated unit enum variant      | Usually part of a literal union          |
 | boolean literal  | `bool`                           | Validation may enforce the literal       |
 | number literal   | `f64`                            | Validation may enforce the literal       |
@@ -66,20 +66,18 @@ numbers or explicit codegen annotations may add `i32`, `u64`, and similar mappin
 
 ## Nullability and optional values
 
-For v0, all of these map to `Option<T>`:
+A single nullish alternative maps to `Option<T>`, with generated encoding determined by the source
+declaration:
 
 ```ts
-value: T | null;
-value: T | undefined;
-value?: T;
+value: T | null;       // None encodes as null
+value: T | undefined;  // None encodes as undefined
+value?: T;             // an absent value encodes as undefined
 ```
 
-This intentionally loses the distinction between a missing property, explicit `undefined`, and
-`null`. The wire decoder accepts both JSON `null` and `['undefined']`; the Rust encoder may
-canonicalize `None` to `null`, except where a method's `void` return requires undefined semantics.
-
-A future version can introduce explicit `UndefinedOr<T>` or `Optional<T>` wrappers if an application
-needs all three states. That distinction should not complicate v0.
+Dynamic decoding preserves the distinction as `CapnwebValue::Null` and
+`CapnwebValue::Undefined`. A declaration such as `T | null | undefined` needs a generated enum or
+other explicit wrapper capable of representing all three states; plain `Option<T>` is insufficient.
 
 ## Arrays, tuples, and string-keyed objects
 

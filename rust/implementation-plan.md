@@ -35,7 +35,7 @@ The first interoperable version supports:
 
 Initially excluded or deliberately simplified:
 
-- `undefined` is accepted from the wire but exposed as `null`;
+- `undefined` is preserved as `CapnwebValue::Undefined`, distinct from `null`;
 - `T | null` maps to `Option<T>`;
 - discriminated unions and ordinary object declarations map to dynamic objects;
 - unions other than `T | null` map to `CapnwebValue`;

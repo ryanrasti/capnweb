@@ -94,23 +94,21 @@ integers, byte strings, errors, capabilities, promises, limits, and malformed-wi
 
 ### `undefined`, `null`, and `()`
 
-At a typed Rust API boundary, TypeScript `void` and `undefined` map to Rust `()`. A nullable `T` maps
-to `Option<T>`. Dynamic nullish values use `CapnwebValue::Null`.
-
-The wire and dynamic representations intentionally make no distinction between JavaScript
-`undefined` and `null`:
+At a typed Rust API boundary, TypeScript `void` and the exact type `undefined` map to Rust `()`.
+A nullable `T` maps to `Option<T>`. Dynamic values preserve the nullish distinction explicitly:
 
 - JSON `null` decodes as `CapnwebValue::Null`;
-- the wire expression `["undefined"]` also decodes as `CapnwebValue::Null`;
-- `CapnwebValue::Null` always encodes as JSON `null`;
-- converting `()` into a dynamic value produces `CapnwebValue::Null`;
-- converting `CapnwebValue::Null` to `()` succeeds;
-- `Option::None` also encodes as JSON `null`;
-- there is no internal `Undefined` or `Unit` dynamic variant.
+- the wire expression `["undefined"]` decodes as `CapnwebValue::Undefined`;
+- `CapnwebValue::Null` encodes as JSON `null`;
+- `CapnwebValue::Undefined` encodes as `["undefined"]`;
+- converting `()` into a dynamic value produces `CapnwebValue::Undefined`;
+- converting `CapnwebValue::Undefined` to `()` succeeds;
+- nullable `Option::None` encodes as JSON `null`.
 
-The original nullish representation cannot be recovered after decoding. This unconditional,
-intentionally lossy alias is an explicit language mapping rather than a deferred JavaScript
-built-in.
+Generated encoding retains the declaration's nullish semantics: `Option<T>` for `T | null` uses
+`null`, while `Option<T>` for `T | undefined` and optional properties uses `undefined`. A type that
+can contain both `null` and `undefined` requires a generated representation capable of retaining all
+three states.
 
 ### 2. Local JavaScript reference counting
 
