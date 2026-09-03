@@ -7,9 +7,91 @@
 // JS:
 
 // JS: import type { RpcTargetBranded, __RPC_TARGET_BRAND } from "./types.js";
+use std::collections::BTreeMap;
+use std::future::Future;
+use std::pin::Pin;
 use std::sync::Arc;
 
 use num_bigint::BigInt;
+use thiserror::Error as ThisError;
+
+/// An error raised at an RPC boundary.
+#[derive(Clone, Debug, ThisError)]
+pub enum Error {
+    /// A generic application or protocol error.
+    #[error("{0}")]
+    Message(String),
+    /// A value did not have the required type.
+    #[error("{0}")]
+    Type(String),
+    /// A deliberately deferred JavaScript built-in was requested.
+    #[error("JavaScript built-in `{0}` is not supported by the Rust runtime")]
+    UnsupportedBuiltin(&'static str),
+    /// An operation used a disposed RPC reference.
+    #[error("Attempted to use RPC stub after it has been disposed.")]
+    Disposed,
+}
+
+/// The result type used by the RPC runtime.
+pub type Result<T> = std::result::Result<T, Error>;
+
+/// An owned dynamic value accepted by the Rust RPC boundary.
+pub enum CapnwebValue {
+    /// JavaScript `null` or `undefined`.
+    Null,
+    /// A boolean.
+    Bool(bool),
+    /// A JavaScript number.
+    Number(f64),
+    /// A string.
+    String(String),
+    /// An arbitrary-size integer.
+    BigInt(BigInt),
+    /// A byte string.
+    Bytes(Vec<u8>),
+    /// An array.
+    Array(Vec<Self>),
+    /// A plain string-keyed object.
+    Object(BTreeMap<String, Self>),
+    /// A serializable function capability.
+    Function(Arc<dyn RpcTarget>),
+    /// An RPC stub.
+    Stub(RpcStub),
+    /// An unresolved RPC value.
+    RpcPromise(RpcPromise),
+    /// A local RPC target.
+    Target(Arc<dyn RpcTarget>),
+    /// A serialized application error.
+    Error(Error),
+}
+
+impl std::fmt::Debug for CapnwebValue {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Null => formatter.write_str("Null"),
+            Self::Bool(value) => formatter.debug_tuple("Bool").field(value).finish(),
+            Self::Number(value) => formatter.debug_tuple("Number").field(value).finish(),
+            Self::String(value) => formatter.debug_tuple("String").field(value).finish(),
+            Self::BigInt(value) => formatter.debug_tuple("BigInt").field(value).finish(),
+            Self::Bytes(value) => formatter.debug_tuple("Bytes").field(value).finish(),
+            Self::Array(value) => formatter.debug_tuple("Array").field(value).finish(),
+            Self::Object(value) => formatter.debug_tuple("Object").field(value).finish(),
+            Self::Function(_) => formatter.write_str("Function(..)"),
+            Self::Stub(_) => formatter.write_str("Stub(..)"),
+            Self::RpcPromise(_) => formatter.write_str("RpcPromise(..)"),
+            Self::Target(_) => formatter.write_str("Target(..)"),
+            Self::Error(value) => formatter.debug_tuple("Error").field(value).finish(),
+        }
+    }
+}
+
+/// A value that is either available synchronously or will become available asynchronously.
+pub enum MaybePromise<T> {
+    /// The synchronous fast path.
+    Immediate(T),
+    /// An eagerly-started asynchronous operation.
+    Pending(Pin<Box<dyn Future<Output = Result<T>> + Send + 'static>>),
+}
 // JS: import { WORKERS_MODULE_SYMBOL } from "./symbols.js"
 // RUST-DEFERRED(JS built-in: workers module Symbol): no Rust global-symbol lookup is performed.
 // JS:
@@ -298,30 +380,78 @@ pub(crate) fn type_for_rpc(value: &CapnwebValue) -> TypeForRpc {
 }
 // JS:
 // JS: function mapNotLoaded(): never {
-// JS:   throw new Error("RPC map() implementation was not loaded.");
-// JS: }
+fn map_not_loaded<T>() -> Result<T> {
+    // JS:   throw new Error("RPC map() implementation was not loaded.");
+    Err(Error::Message(
+        "RPC map() implementation was not loaded.".to_owned(),
+    ))
+    // JS: }
+}
 // JS:
+
 // JS: // map() is implemented in `map.ts`. We can't import it here because it would create an import
+// map() is implemented in `map.ts`. We can't import it here because it would create an import
 // JS: // cycle, so instead we define two hook functions that map.ts will overwrite when it is imported.
+// cycle, so instead we define two hook functions that map.ts will install when it is initialized.
 // JS: export let mapImpl: MapImpl = { applyMap: mapNotLoaded, sendMap: mapNotLoaded };
+static MAP_IMPL: std::sync::OnceLock<Arc<dyn MapImpl>> = std::sync::OnceLock::new();
+
+pub(crate) fn install_map_impl(implementation: Arc<dyn MapImpl>) -> Result<()> {
+    MAP_IMPL
+        .set(implementation)
+        .map_err(|_| Error::Message("RPC map() implementation was already loaded.".to_owned()))
+}
+
+fn loaded_map_impl() -> Result<&'static dyn MapImpl> {
+    MAP_IMPL
+        .get()
+        .map(Arc::as_ref)
+        .ok_or_else(|| Error::Message("RPC map() implementation was not loaded.".to_owned()))
+}
 // JS:
+
 // JS: type MapImpl = {
-// JS:   // Applies a map function to an input value (usually an array).
-// JS:   //
-// JS:   // Takes ownership of `captures`, including when it throws synchronously, per the contract of
-// JS:   // StubHook.map().
-// JS:   applyMap(input: unknown, parent: object | undefined, owner: RpcPayload | null,
-// JS:            captures: StubHook[], instructions: unknown[])
-// JS:           : StubHook;
-// JS:
-// JS:   // Implements the .map() method of RpcStub.
-// JS:   sendMap(hook: StubHook, path: PropertyPath, func: (value: RpcPromise) => unknown)
-// JS:          : RpcPromise;
-// JS: }
+pub(crate) trait MapImpl: Send + Sync {
+    // JS:   // Applies a map function to an input value (usually an array).
+    // Applies a map function to an input value (usually an array).
+    // JS:   //
+    //
+    // JS:   // Takes ownership of `captures`, including when it throws synchronously, per the contract of
+    // Takes ownership of `captures`, including when it throws synchronously, per the contract of
+    // JS:   // StubHook.map().
+    // StubHook.map().
+    // JS:   applyMap(input: unknown, parent: object | undefined, owner: RpcPayload | null,
+    // JS:            captures: StubHook[], instructions: unknown[])
+    // JS:           : StubHook;
+    fn apply_map(
+        &self,
+        input: CapnwebValue,
+        parent: Option<&CapnwebValue>,
+        owner: Option<&RpcPayload>,
+        captures: Vec<StubHook>,
+        instructions: Vec<CapnwebValue>,
+    ) -> Result<StubHook>;
+    // JS:
+
+    // JS:   // Implements the .map() method of RpcStub.
+    // Implements the .map() method of RpcStub.
+    // JS:   sendMap(hook: StubHook, path: PropertyPath, func: (value: RpcPromise) => unknown)
+    // JS:          : RpcPromise;
+    fn send_map(
+        &self,
+        hook: StubHook,
+        path: PropertyPath,
+        function: Box<dyn FnOnce(RpcPromise) -> Result<CapnwebValue> + Send>,
+    ) -> Result<RpcPromise>;
+    // JS: }
+}
 // JS:
 // JS: function streamNotLoaded(): never {
 // JS:   throw new Error("Stream implementation was not loaded.");
 // JS: }
+fn stream_not_loaded<T>() -> Result<T> {
+    Err(Error::UnsupportedBuiltin("ReadableStream/WritableStream"))
+}
 // JS:
 // JS: // Stream support is implemented in `streams.ts`. We can't import it here because it would create
 // JS: // an import cycle, so instead we define hook functions that streams.ts will overwrite.
@@ -343,6 +473,7 @@ pub(crate) fn type_for_rpc(value: &CapnwebValue) -> TypeForRpc {
 // JS:   // The hook's dispose() will cancel the stream.
 // JS:   createReadableStreamHook(stream: ReadableStream): StubHook;
 // JS: }
+// RUST-DEFERRED(JS built-in: ReadableStream/WritableStream): no StreamImpl trait is exposed yet.
 // JS:
 // JS: // Inner interface backing an RpcStub or RpcPromise.
 // JS: //
@@ -352,165 +483,315 @@ pub(crate) fn type_for_rpc(value: &CapnwebValue) -> TypeForRpc {
 // JS: //
 // JS: // This is conceptually similar to the Cap'n Proto C++ class `ClientHook`.
 // JS: export abstract class StubHook {
-// JS:   // Call a function at the given property path with the given arguments. Returns a hook for the
-// JS:   // promise for the result.
-// JS:   //
-// JS:   // call() takes ownership of `args`, including when it throws synchronously. Every
-// JS:   // implementation must arrange for `args` to be disposed on all failure paths as well as on
-// JS:   // success. Correspondingly, callers must never dispose `args` after invoking call(), even if
-// JS:   // it threw. Note that RpcPayload.dispose() is idempotent, so an implementation that delegates
-// JS:   // to another hook's call() may still dispose `args` defensively in its own catch block.
-// JS:   abstract call(path: PropertyPath, args: RpcPayload): StubHook;
-// JS:
-// JS:   // Like call(), but designed for streaming calls (e.g. WritableStream writes). Returns:
-// JS:   // - promise: A Promise<void> for the completion of the call.
-// JS:   // - size: If the call was remote, the byte size of the serialized message. For local calls,
-// JS:   //   undefined is returned, indicating the caller should await the promise to serialize writes
-// JS:   //   (no overlapping).
-// JS:   //
-// JS:   // stream() takes ownership of `args` under the same rules as call().
-// JS:   stream(path: PropertyPath, args: RpcPayload): {promise: Promise<void>, size?: number} {
-// JS:     // Default implementation: delegate to call() + pull(). No size is returned, so the caller
-// JS:     // knows this is a local call and should await the promise directly.
-// JS:     let hook = this.call(path, args);
-// JS:     let pulled: RpcPayload | Promise<RpcPayload>;
-// JS:     try {
-// JS:       pulled = hook.pull();
-// JS:     } catch (err) {
-// JS:       hook.dispose();
-// JS:       throw err;
-// JS:     }
-// JS:     let promise: Promise<void>;
-// JS:     if (pulled instanceof Promise) {
-// JS:       promise = pulled.then(p => { p.dispose(); });
-// JS:     } else {
-// JS:       pulled.dispose();
-// JS:       promise = Promise.resolve();
-// JS:     }
-// JS:     return { promise };
-// JS:   }
-// JS:
-// JS:   // Apply a map operation.
-// JS:   //
-// JS:   // `captures` is a list of external stubs which are used as part of the mapper function.
-// JS:   // NOTE: The callee takes ownership of `captures`, including when map() throws synchronously;
-// JS:   // callers must not dispose them afterwards. StubHook.dispose() is safe to call multiple times,
-// JS:   // so an implementation that delegates to another hook's map() may still dispose the captures
-// JS:   // defensively.
-// JS:   //
-// JS:   // `instructions` is a JSON-serializable value describing the mapper function as a series of
-// JS:   // steps. Each step is an expression to evaluate, in the usual RPC expression format. The last
-// JS:   // instruction is the return value.
-// JS:   //
-// JS:   // Each instruction can refer to the results of any of the instructions before it, as well as to
-// JS:   // the captures, as if they were imports on the import table. In particular:
-// JS:   // * The value 0 is the input to the mapper function (e.g. one element of the array being mapped).
-// JS:   // * Positive values are 1-based indexes into the instruction table, representing the results of
-// JS:   //   previous instructions.
-// JS:   // * Negative values are -1-based indexes into the capture list.
-// JS:   abstract map(path: PropertyPath, captures: StubHook[], instructions: unknown[]): StubHook;
-// JS:
-// JS:   // Read the property at the given path. Returns a StubHook representing a promise for that
-// JS:   // property. This behaves very similarly to call(), except that no actual function is invoked
-// JS:   // on the remote end, the property is simply returned. (Well, if the property has a getter, then
-// JS:   // that will be invoked...)
-// JS:   //
-// JS:   // (In the case that this stub is a promise with a resolution payload, get() implies cloning
-// JS:   // a branch of the payload, making a deep copy of any pass-by-value content.)
-// JS:   abstract get(path: PropertyPath): StubHook;
-// JS:
-// JS:   // Create a clone of this StubHook, which can be disposed independently.
-// JS:   //
-// JS:   // The returned hook is NOT considered a promise, so will not resolve to a payload (you can use
-// JS:   // `get([])` to get a promise for a cloned payload).
-// JS:   abstract dup(): StubHook;
-// JS:
-// JS:   // Requests resolution of a StubHook that represents a promise, and eventually produces the
-// JS:   // payload.
-// JS:   //
-// JS:   // pull() should not be called on capabilities that aren't promises. It may never resolve or it
-// JS:   // may throw an exception.
-// JS:   //
-// JS:   // If pull() is never called (on a remote promise), the RPC system will not transmit the
-// JS:   // resolution at all. This allows a promise to be used strictly for pipelining.
-// JS:   //
-// JS:   // If the payload is already available, pull() returns it immediately, instead of returning a
-// JS:   // promise. This allows the caller to skip the microtask queue which is sometimes necessary to
-// JS:   // maintain e-order guarantees.
-// JS:   //
-// JS:   // The returned RpcPayload is the same one backing the StubHook itself. If the caller delivers
-// JS:   // or disposes the payload directly, then it should not call dispose() on the hook. If the caller
-// JS:   // does not intend to consume the StubHook, the caller must take responsibility for cloning the
-// JS:   // payload.
-// JS:   //
-// JS:   // You can call pull() multiple times, but it will return the same RpcPayload every time, and
-// JS:   // that payload should only be disposed once.
-// JS:   //
-// JS:   // If pull() returns a promise which rejects, the StubHook does not need to be disposed.
-// JS:   abstract pull(): RpcPayload | Promise<RpcPayload>;
-// JS:
-// JS:   // Called to prevent this stub from generating unhandled rejection events if it throws without
-// JS:   // having been pulled. Without this, if a client "push"es a call that immediately throws before
-// JS:   // the client manages to "pull" it or use it in a pipeline, this may be treated by the system as
-// JS:   // an unhandled rejection. Unfortunately, this unhandled rejection would be reported in the
-// JS:   // callee rather than the caller, possibly causing the callee to crash or log spurious errors,
-// JS:   // even though it's really up to the caller to deal with the exception!
-// JS:   abstract ignoreUnhandledRejections(): void;
-// JS:
-// JS:   // Attempts to cancel any outstanding promise backing this hook, and disposes the payload that
-// JS:   // pull() would return (if any). If a pull() promise is outstanding, it may still resolve (with
-// JS:   // a disposed payload) or it may reject. It's safe to call dispose() multiple times.
-// JS:   abstract dispose(): void;
-// JS:
-// JS:   abstract onBroken(callback: (error: any) => void): void;
-// JS: }
+/// A shared reference to the hook backing an [`RpcStub`] or [`RpcPromise`].
+pub type StubHook = Arc<dyn StubHookInner>;
+
+/// Completion and serialized-size information for a streaming call.
+pub struct StreamCall {
+    /// Resolves when the call completes.
+    pub promise: Pin<Box<dyn Future<Output = Result<()>> + Send + 'static>>,
+    /// Serialized request size for a remote call, or `None` for a local call.
+    pub size: Option<usize>,
+}
+
+/// Inner interface backing an [`RpcStub`] or [`RpcPromise`].
+pub trait StubHookInner: Send + Sync {
+    // JS:   // Call a function at the given property path with the given arguments. Returns a hook for the
+    // JS:   // promise for the result.
+    // JS:   //
+    // JS:   // call() takes ownership of `args`, including when it throws synchronously. Every
+    // JS:   // implementation must arrange for `args` to be disposed on all failure paths as well as on
+    // JS:   // success. Correspondingly, callers must never dispose `args` after invoking call(), even if
+    // JS:   // it threw. Note that RpcPayload.dispose() is idempotent, so an implementation that delegates
+    // JS:   // to another hook's call() may still dispose `args` defensively in its own catch block.
+    // JS:   abstract call(path: PropertyPath, args: RpcPayload): StubHook;
+    /// Calls a function at `path`, taking ownership of `args` even on failure.
+    fn call(&self, path: PropertyPath, args: RpcPayload) -> Result<StubHook>;
+    // JS:
+    // JS:   // Like call(), but designed for streaming calls (e.g. WritableStream writes). Returns:
+    // JS:   // - promise: A Promise<void> for the completion of the call.
+    // JS:   // - size: If the call was remote, the byte size of the serialized message. For local calls,
+    // JS:   //   undefined is returned, indicating the caller should await the promise to serialize writes
+    // JS:   //   (no overlapping).
+    // JS:   //
+    // JS:   // stream() takes ownership of `args` under the same rules as call().
+    // JS:   stream(path: PropertyPath, args: RpcPayload): {promise: Promise<void>, size?: number} {
+    // JS:     // Default implementation: delegate to call() + pull(). No size is returned, so the caller
+    // JS:     // knows this is a local call and should await the promise directly.
+    // JS:     let hook = this.call(path, args);
+    // JS:     let pulled: RpcPayload | Promise<RpcPayload>;
+    // JS:     try {
+    // JS:       pulled = hook.pull();
+    // JS:     } catch (err) {
+    // JS:       hook.dispose();
+    // JS:       throw err;
+    // JS:     }
+    // JS:     let promise: Promise<void>;
+    // JS:     if (pulled instanceof Promise) {
+    // JS:       promise = pulled.then(p => { p.dispose(); });
+    // JS:     } else {
+    // JS:       pulled.dispose();
+    // JS:       promise = Promise.resolve();
+    // JS:     }
+    // JS:     return { promise };
+    // JS:   }
+    fn stream(&self, path: PropertyPath, args: RpcPayload) -> Result<StreamCall> {
+        let hook = self.call(path, args)?;
+        let pulled = match hook.pull() {
+            Ok(pulled) => pulled,
+            Err(error) => {
+                hook.dispose();
+                return Err(error);
+            }
+        };
+
+        let promise: Pin<Box<dyn Future<Output = Result<()>> + Send + 'static>> = match pulled {
+            MaybePromise::Pending(pending) => Box::pin(async move {
+                let payload = pending.await?;
+                payload.dispose();
+                Ok(())
+            }),
+            MaybePromise::Immediate(payload) => {
+                payload.dispose();
+                Box::pin(async { Ok(()) })
+            }
+        };
+
+        Ok(StreamCall {
+            promise,
+            size: None,
+        })
+    }
+    // JS:
+    // JS:   // Apply a map operation.
+    // JS:   //
+    // JS:   // `captures` is a list of external stubs which are used as part of the mapper function.
+    // JS:   // NOTE: The callee takes ownership of `captures`, including when map() throws synchronously;
+    // JS:   // callers must not dispose them afterwards. StubHook.dispose() is safe to call multiple times,
+    // JS:   // so an implementation that delegates to another hook's map() may still dispose the captures
+    // JS:   // defensively.
+    // JS:   //
+    // JS:   // `instructions` is a JSON-serializable value describing the mapper function as a series of
+    // JS:   // steps. Each step is an expression to evaluate, in the usual RPC expression format. The last
+    // JS:   // instruction is the return value.
+    // JS:   //
+    // JS:   // Each instruction can refer to the results of any of the instructions before it, as well as to
+    // JS:   // the captures, as if they were imports on the import table. In particular:
+    // JS:   // * The value 0 is the input to the mapper function (e.g. one element of the array being mapped).
+    // JS:   // * Positive values are 1-based indexes into the instruction table, representing the results of
+    // JS:   //   previous instructions.
+    // JS:   // * Negative values are -1-based indexes into the capture list.
+    // JS:   abstract map(path: PropertyPath, captures: StubHook[], instructions: unknown[]): StubHook;
+    /// Applies wire-level map instructions, taking ownership of every capture.
+    fn map(
+        &self,
+        path: PropertyPath,
+        captures: Vec<StubHook>,
+        instructions: Vec<CapnwebValue>,
+    ) -> Result<StubHook>;
+    // JS:
+    // JS:   // Read the property at the given path. Returns a StubHook representing a promise for that
+    // JS:   // property. This behaves very similarly to call(), except that no actual function is invoked
+    // JS:   // on the remote end, the property is simply returned. (Well, if the property has a getter, then
+    // JS:   // that will be invoked...)
+    // JS:   //
+    // JS:   // (In the case that this stub is a promise with a resolution payload, get() implies cloning
+    // JS:   // a branch of the payload, making a deep copy of any pass-by-value content.)
+    // JS:   abstract get(path: PropertyPath): StubHook;
+    /// Reads the value at `path`.
+    fn get(&self, path: PropertyPath) -> Result<StubHook>;
+    // JS:
+    // JS:   // Create a clone of this StubHook, which can be disposed independently.
+    // JS:   //
+    // JS:   // The returned hook is NOT considered a promise, so will not resolve to a payload (you can use
+    // JS:   // `get([])` to get a promise for a cloned payload).
+    // JS:   abstract dup(): StubHook;
+    /// Creates an independently disposable logical RPC reference.
+    fn dup(&self) -> StubHook;
+    // JS:
+    // JS:   // Requests resolution of a StubHook that represents a promise, and eventually produces the
+    // JS:   // payload.
+    // JS:   //
+    // JS:   // pull() should not be called on capabilities that aren't promises. It may never resolve or it
+    // JS:   // may throw an exception.
+    // JS:   //
+    // JS:   // If pull() is never called (on a remote promise), the RPC system will not transmit the
+    // JS:   // resolution at all. This allows a promise to be used strictly for pipelining.
+    // JS:   //
+    // JS:   // If the payload is already available, pull() returns it immediately, instead of returning a
+    // JS:   // promise. This allows the caller to skip the microtask queue which is sometimes necessary to
+    // JS:   // maintain e-order guarantees.
+    // JS:   //
+    // JS:   // The returned RpcPayload is the same one backing the StubHook itself. If the caller delivers
+    // JS:   // or disposes the payload directly, then it should not call dispose() on the hook. If the caller
+    // JS:   // does not intend to consume the StubHook, the caller must take responsibility for cloning the
+    // JS:   // payload.
+    // JS:   //
+    // JS:   // You can call pull() multiple times, but it will return the same RpcPayload every time, and
+    // JS:   // that payload should only be disposed once.
+    // JS:   //
+    // JS:   // If pull() returns a promise which rejects, the StubHook does not need to be disposed.
+    // JS:   abstract pull(): RpcPayload | Promise<RpcPayload>;
+    /// Requests this promise hook's resolution while preserving the synchronous fast path.
+    fn pull(&self) -> Result<MaybePromise<RpcPayload>>;
+    // JS:
+    // JS:   // Called to prevent this stub from generating unhandled rejection events if it throws without
+    // JS:   // having been pulled. Without this, if a client "push"es a call that immediately throws before
+    // JS:   // the client manages to "pull" it or use it in a pipeline, this may be treated by the system as
+    // JS:   // an unhandled rejection. Unfortunately, this unhandled rejection would be reported in the
+    // JS:   // callee rather than the caller, possibly causing the callee to crash or log spurious errors,
+    // JS:   // even though it's really up to the caller to deal with the exception!
+    // JS:   abstract ignoreUnhandledRejections(): void;
+    /// Suppresses reporting of a rejection that the remote caller is responsible for observing.
+    fn ignore_unhandled_rejections(&self);
+    // JS:
+    // JS:   // Attempts to cancel any outstanding promise backing this hook, and disposes the payload that
+    // JS:   // pull() would return (if any). If a pull() promise is outstanding, it may still resolve (with
+    // JS:   // a disposed payload) or it may reject. It's safe to call dispose() multiple times.
+    // JS:   abstract dispose(): void;
+    /// Cancels outstanding work and releases this logical reference idempotently.
+    fn dispose(&self);
+    // JS:
+    // JS:   abstract onBroken(callback: (error: any) => void): void;
+    /// Invokes `callback` when this hook becomes permanently broken.
+    fn on_broken(&self, callback: Box<dyn FnOnce(Error) + Send + 'static>);
+    // JS: }
+}
 // JS:
 // JS: export class ErrorStubHook extends StubHook {
+/// A permanently broken hook which forwards the same error through every operation.
+#[derive(Clone, Debug)]
+pub struct ErrorStubHook {
+    error: Error,
+}
 // JS:   constructor(private error: any) { super(); }
+impl ErrorStubHook {
+    /// Creates a permanently broken hook.
+    pub fn new(error: Error) -> Self {
+        Self { error }
+    }
+
+    fn new_hook(&self) -> StubHook {
+        Arc::new(self.clone())
+    }
+}
 // JS:
 // JS:   // Per the StubHook contract, call() and map() take ownership of `args` / `captures` even on
 // JS:   // failure. No callee sits behind this hook to consume them, so dispose them immediately.
-// JS:   call(path: PropertyPath, args: RpcPayload): StubHook { args.dispose(); return this; }
-// JS:   map(path: PropertyPath, captures: StubHook[], instructions: unknown[]): StubHook {
-// JS:     for (let cap of captures) {
-// JS:       cap.dispose();
-// JS:     }
-// JS:     return this;
-// JS:   }
-// JS:   get(path: PropertyPath): StubHook { return this; }
-// JS:   dup(): StubHook { return this; }
-// JS:   pull(): RpcPayload | Promise<RpcPayload> { return Promise.reject(this.error); }
-// JS:   ignoreUnhandledRejections(): void {}
-// JS:   dispose(): void {}
-// JS:   onBroken(callback: (error: any) => void): void {
-// JS:     try {
-// JS:       callback(this.error);
-// JS:     } catch (err) {
-// JS:       // Don't throw back into the RPC system. Treat this as an unhandled rejection.
-// JS:       Promise.resolve(err);
-// JS:     }
-// JS:   }
-// JS: };
+impl StubHookInner for ErrorStubHook {
+    // JS:   call(path: PropertyPath, args: RpcPayload): StubHook { args.dispose(); return this; }
+    fn call(&self, _path: PropertyPath, args: RpcPayload) -> Result<StubHook> {
+        args.dispose();
+        Ok(self.new_hook())
+    }
+    // JS:   map(path: PropertyPath, captures: StubHook[], instructions: unknown[]): StubHook {
+    fn map(
+        &self,
+        _path: PropertyPath,
+        captures: Vec<StubHook>,
+        _instructions: Vec<CapnwebValue>,
+    ) -> Result<StubHook> {
+        // JS:     for (let cap of captures) {
+        for capture in captures {
+            // JS:       cap.dispose();
+            capture.dispose();
+            // JS:     }
+        }
+        // JS:     return this;
+        Ok(self.new_hook())
+        // JS:   }
+    }
+    // JS:   get(path: PropertyPath): StubHook { return this; }
+    fn get(&self, _path: PropertyPath) -> Result<StubHook> {
+        Ok(self.new_hook())
+    }
+    // JS:   dup(): StubHook { return this; }
+    fn dup(&self) -> StubHook {
+        self.new_hook()
+    }
+    // JS:   pull(): RpcPayload | Promise<RpcPayload> { return Promise.reject(this.error); }
+    fn pull(&self) -> Result<MaybePromise<RpcPayload>> {
+        let error = self.error.clone();
+        Ok(MaybePromise::Pending(Box::pin(async move { Err(error) })))
+    }
+    // JS:   ignoreUnhandledRejections(): void {}
+    fn ignore_unhandled_rejections(&self) {}
+    // JS:   dispose(): void {}
+    fn dispose(&self) {}
+    // JS:   onBroken(callback: (error: any) => void): void {
+    fn on_broken(&self, callback: Box<dyn FnOnce(Error) + Send + 'static>) {
+        // JS:     try {
+        let error = self.error.clone();
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            // JS:       callback(this.error);
+            callback(error);
+            // JS:     } catch (err) {
+        }));
+        // JS:       // Don't throw back into the RPC system. Treat this as an unhandled rejection.
+        // Don't unwind back into the RPC system.
+        // JS:       Promise.resolve(err);
+        // A caught callback panic is intentionally discarded like the squelched rejected promise.
+        // JS:     }
+        // JS:   }
+    }
+    // JS: };
+}
 // JS:
 // JS: const DISPOSED_HOOK: StubHook = new ErrorStubHook(
 // JS:     new Error("Attempted to use RPC stub after it has been disposed."));
+static DISPOSED_HOOK: std::sync::LazyLock<StubHook> =
+    std::sync::LazyLock::new(|| Arc::new(ErrorStubHook::new(Error::Disposed)));
 // JS:
 // JS: // A call interceptor can be used to intercept all RPC stub invocations within some synchronous
 // JS: // scope. This is used to implement record/replay
 // JS: type CallInterceptor = (hook: StubHook, path: PropertyPath, params: RpcPayload) => StubHook;
+type CallInterceptor =
+    Arc<dyn Fn(StubHook, PropertyPath, RpcPayload) -> Result<StubHook> + Send + Sync + 'static>;
 // JS: let doCall: CallInterceptor = (hook: StubHook, path: PropertyPath, params: RpcPayload) => {
+std::thread_local! {
+    static DO_CALL: std::cell::RefCell<CallInterceptor> = std::cell::RefCell::new(
+        Arc::new(|hook, path, params| hook.call(path, params))
+    );
+}
+
+fn do_call(hook: StubHook, path: PropertyPath, params: RpcPayload) -> Result<StubHook> {
+    DO_CALL.with(|interceptor| interceptor.borrow()(hook, path, params))
+}
 // JS:   return hook.call(path, params);
+// The default closure above delegates directly to `StubHookInner::call`.
 // JS: }
 // JS:
 // JS: export function withCallInterceptor<T>(interceptor: CallInterceptor, callback: () => T): T {
-// JS:   let oldValue = doCall;
-// JS:   doCall = interceptor;
-// JS:   try {
-// JS:     return callback();
-// JS:   } finally {
-// JS:     doCall = oldValue;
-// JS:   }
-// JS: }
+pub(crate) fn with_call_interceptor<T>(
+    interceptor: CallInterceptor,
+    callback: impl FnOnce() -> T,
+) -> T {
+    // JS:   let oldValue = doCall;
+    let old_value = DO_CALL.with(|slot| slot.replace(interceptor));
+    // JS:   doCall = interceptor;
+    struct RestoreInterceptor(Option<CallInterceptor>);
+
+    impl Drop for RestoreInterceptor {
+        fn drop(&mut self) {
+            if let Some(old_value) = self.0.take() {
+                DO_CALL.with(|slot| {
+                    slot.replace(old_value);
+                });
+            }
+        }
+    }
+
+    let restore = RestoreInterceptor(Some(old_value));
+    // JS:   try {
+    // JS:     return callback();
+    let result = callback();
+    // JS:   } finally {
+    // JS:     doCall = oldValue;
+    drop(restore);
+    // JS:   }
+    // JS: }
+    result
+}
 // JS:
 // JS: // Private symbol which may be used to unwrap the real stub through the Proxy.
 // JS: let RAW_STUB = Symbol("realStub");
