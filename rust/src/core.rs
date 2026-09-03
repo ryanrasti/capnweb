@@ -7,10 +7,10 @@
 // JS:
 
 // JS: import type { RpcTargetBranded, __RPC_TARGET_BRAND } from "./types.js";
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, VecDeque};
 use std::future::Future;
 use std::pin::Pin;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use num_bigint::BigInt;
 use thiserror::Error as ThisError;
@@ -1012,25 +1012,27 @@ impl RpcStub {
 // RUST-DIFF(local refcount): `RpcStub::clone()` retains the same typed path and shares its hook.
 // JS:
 // JS:   onRpcBroken(callback: (error: any) => void) {
-/// Registers a callback for permanent capability failure.
-pub fn on_rpc_broken(&self, callback: impl FnOnce(Error) + Send + 'static) {
-    // JS:     this[RAW_STUB].hook.onBroken(callback);
-    self.hook.on_broken(Box::new(callback));
-    // JS:   }
-}
-// JS:
-// JS:   map(func: (value: RpcPromise) => unknown): RpcPromise {
-/// Builds and sends a wire-level map operation without first pulling this value.
-pub fn map(
-    &self,
-    function: impl FnOnce(RpcPromise) -> Result<CapnwebValue> + Send + 'static,
-) -> Result<RpcPromise> {
-    // JS:     let {hook, pathIfPromise} = this[RAW_STUB];
-    let hook = self.current_hook();
-    let path = self.path_if_promise.clone().unwrap_or_default();
-    // JS:     return mapImpl.sendMap(hook, pathIfPromise || [], func);
-    loaded_map_impl()?.send_map(hook, path, Box::new(function))
-    // JS:   }
+impl RpcStub {
+    /// Registers a callback for permanent capability failure.
+    pub fn on_rpc_broken(&self, callback: impl FnOnce(Error) + Send + 'static) {
+        // JS:     this[RAW_STUB].hook.onBroken(callback);
+        self.hook.on_broken(Box::new(callback));
+        // JS:   }
+    }
+    // JS:
+    // JS:   map(func: (value: RpcPromise) => unknown): RpcPromise {
+    /// Builds and sends a wire-level map operation without first pulling this value.
+    pub fn map(
+        &self,
+        function: impl FnOnce(RpcPromise) -> Result<CapnwebValue> + Send + 'static,
+    ) -> Result<RpcPromise> {
+        // JS:     let {hook, pathIfPromise} = this[RAW_STUB];
+        let hook = self.current_hook();
+        let path = self.path_if_promise.clone().unwrap_or_default();
+        // JS:     return mapImpl.sendMap(hook, pathIfPromise || [], func);
+        loaded_map_impl()?.send_map(hook, path, Box::new(function))
+        // JS:   }
+    }
 }
 // JS:
 // JS:   toString() {
@@ -1047,14 +1049,14 @@ impl std::fmt::Display for RpcStub {
 /// A lazy, pipeline-capable RPC result.
 pub struct RpcPromise {
     stub: RpcStub,
-    resolution: Option<Pin<Box<dyn Future<Output = Result<CapnwebValue>> + Send + 'static>>>,
+    resolution: Mutex<Option<Pin<Box<dyn Future<Output = Result<CapnwebValue>> + Send + 'static>>>>,
 }
 
 impl Clone for RpcPromise {
     fn clone(&self) -> Self {
         Self {
             stub: self.stub.clone(),
-            resolution: None,
+            resolution: Mutex::new(None),
         }
     }
 }
@@ -1120,7 +1122,7 @@ impl RpcPromise {
     pub(crate) fn from_hook(hook: StubHook, path: PropertyPath) -> Self {
         Self {
             stub: RpcStub::from_hook(hook, Some(path)),
-            resolution: None,
+            resolution: Mutex::new(None),
         }
     }
 
@@ -1179,18 +1181,22 @@ impl Future for RpcPromise {
     type Output = Result<CapnwebValue>;
 
     fn poll(
-        mut self: Pin<&mut Self>,
+        self: Pin<&mut Self>,
         context: &mut std::task::Context<'_>,
     ) -> std::task::Poll<Self::Output> {
-        if self.resolution.is_none() {
+        let mut resolution = self
+            .resolution
+            .lock()
+            .expect("promise resolution mutex poisoned");
+        if resolution.is_none() {
             let promise = Self {
                 stub: self.stub.clone(),
-                resolution: None,
+                resolution: Mutex::new(None),
             };
-            self.resolution = Some(Box::pin(pull_promise(promise)));
+            *resolution = Some(Box::pin(pull_promise(promise)));
         }
 
-        self.resolution
+        resolution
             .as_mut()
             .expect("resolution future initialized")
             .as_mut()
@@ -3195,3 +3201,268 @@ impl StubHookInner for TargetStubHook {
 // JS:     }
 // JS:   }
 // JS: }
+type PromiseOperation = Box<dyn FnOnce(Result<StubHook>) + Send + 'static>;
+
+#[derive(Clone)]
+pub struct PromiseStubHook {
+    shared: Arc<PromiseShared>,
+}
+
+struct PromiseShared {
+    state: Mutex<PromiseState>,
+}
+
+struct PromiseState {
+    resolution: Option<Result<StubHook>>,
+    operations: VecDeque<PromiseOperation>,
+    drain_scheduled: bool,
+}
+
+impl PromiseShared {
+    fn pending() -> Arc<Self> {
+        Arc::new(Self {
+            state: Mutex::new(PromiseState {
+                resolution: None,
+                operations: VecDeque::new(),
+                drain_scheduled: false,
+            }),
+        })
+    }
+
+    fn resolution(&self) -> Option<Result<StubHook>> {
+        self.state
+            .lock()
+            .expect("promise state mutex poisoned")
+            .resolution
+            .clone()
+    }
+
+    fn resolve(self: &Arc<Self>, resolution: Result<StubHook>) {
+        {
+            let mut state = self.state.lock().expect("promise state mutex poisoned");
+            if state.resolution.is_some() {
+                return;
+            }
+            state.resolution = Some(resolution);
+        }
+        Self::schedule_drain(self);
+    }
+
+    fn enqueue(self: &Arc<Self>, operation: PromiseOperation) {
+        self.state
+            .lock()
+            .expect("promise state mutex poisoned")
+            .operations
+            .push_back(operation);
+        Self::schedule_drain(self);
+    }
+
+    fn schedule_drain(shared: &Arc<Self>) {
+        {
+            let mut state = shared.state.lock().expect("promise state mutex poisoned");
+            if state.resolution.is_none() || state.operations.is_empty() || state.drain_scheduled {
+                return;
+            }
+            state.drain_scheduled = true;
+        }
+
+        let Ok(runtime) = tokio::runtime::Handle::try_current() else {
+            let operations = {
+                let mut state = shared.state.lock().expect("promise state mutex poisoned");
+                state.drain_scheduled = false;
+                std::mem::take(&mut state.operations)
+            };
+            let error = Error::Message(
+                "pending RPC promise operation requires an active Tokio runtime".to_owned(),
+            );
+            for operation in operations {
+                operation(Err(error.clone()));
+            }
+            return;
+        };
+
+        let shared = Arc::clone(shared);
+        runtime.spawn(async move {
+            loop {
+                let next = {
+                    let mut state = shared.state.lock().expect("promise state mutex poisoned");
+                    let Some(operation) = state.operations.pop_front() else {
+                        state.drain_scheduled = false;
+                        return;
+                    };
+                    let resolution = state
+                        .resolution
+                        .clone()
+                        .expect("drain starts only after resolution");
+                    (operation, resolution)
+                };
+                next.0(next.1);
+            }
+        });
+    }
+}
+
+impl PromiseStubHook {
+    fn pending() -> Self {
+        Self {
+            shared: PromiseShared::pending(),
+        }
+    }
+
+    pub(crate) fn from_future(
+        future: impl Future<Output = Result<StubHook>> + Send + 'static,
+    ) -> StubHook {
+        let result = Self::pending();
+        let shared = Arc::clone(&result.shared);
+        let mut future: Pin<Box<dyn Future<Output = Result<StubHook>> + Send + 'static>> =
+            Box::pin(future);
+        let first_poll = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let mut context = std::task::Context::from_waker(futures::task::noop_waker_ref());
+            future.as_mut().poll(&mut context)
+        }));
+
+        match first_poll {
+            Ok(std::task::Poll::Ready(resolution)) => shared.resolve(resolution),
+            Ok(std::task::Poll::Pending) => match tokio::runtime::Handle::try_current() {
+                Ok(runtime) => {
+                    runtime.spawn(async move {
+                        shared.resolve(future.await);
+                    });
+                }
+                Err(_) => shared.resolve(Err(Error::Message(
+                    "pending RPC promise requires an active Tokio runtime".to_owned(),
+                ))),
+            },
+            Err(_) => shared.resolve(Err(Error::Message(
+                "RPC promise future panicked during its first poll".to_owned(),
+            ))),
+        }
+
+        Arc::new(result)
+    }
+
+    fn chain(
+        &self,
+        operation: impl FnOnce(StubHook) -> Result<StubHook> + Send + 'static,
+    ) -> StubHook {
+        let child = Self::pending();
+        let child_shared = Arc::clone(&child.shared);
+        self.shared.enqueue(Box::new(move |resolution| {
+            child_shared.resolve(resolution.and_then(operation));
+        }));
+        Arc::new(child)
+    }
+}
+
+impl StubHookInner for PromiseStubHook {
+    fn call(&self, path: PropertyPath, args: RpcPayload) -> Result<StubHook> {
+        Ok(self.chain(move |hook| hook.call(path, args)))
+    }
+
+    fn stream(&self, path: PropertyPath, args: RpcPayload) -> Result<StreamCall> {
+        let (sender, receiver) = tokio::sync::oneshot::channel();
+        self.shared.enqueue(Box::new(move |resolution| {
+            let stream = resolution.and_then(|hook| hook.stream(path, args));
+            match stream {
+                Ok(stream) => match tokio::runtime::Handle::try_current() {
+                    Ok(runtime) => {
+                        runtime.spawn(async move {
+                            let _ = sender.send(stream.promise.await);
+                        });
+                    }
+                    Err(_) => {
+                        let _ = sender.send(Err(Error::Message(
+                            "pending stream call requires an active Tokio runtime".to_owned(),
+                        )));
+                    }
+                },
+                Err(error) => {
+                    let _ = sender.send(Err(error));
+                }
+            }
+        }));
+        Ok(StreamCall {
+            promise: Box::pin(async move {
+                receiver.await.map_err(|_| {
+                    Error::Message("pending stream operation was canceled".to_owned())
+                })?
+            }),
+            size: None,
+        })
+    }
+
+    fn map(
+        &self,
+        path: PropertyPath,
+        captures: Vec<StubHook>,
+        instructions: Vec<CapnwebValue>,
+    ) -> Result<StubHook> {
+        Ok(self.chain(move |hook| hook.map(path, captures, instructions)))
+    }
+
+    fn get(&self, path: PropertyPath) -> Result<StubHook> {
+        Ok(self.chain(move |hook| hook.get(path)))
+    }
+
+    fn pull(&self) -> Result<MaybePromise<RpcPayload>> {
+        if let Some(resolution) = self.shared.resolution() {
+            return resolution?.pull();
+        }
+
+        let (sender, receiver) = tokio::sync::oneshot::channel();
+        self.shared.enqueue(Box::new(move |resolution| {
+            let pulled = resolution.and_then(|hook| hook.pull());
+            match pulled {
+                Ok(MaybePromise::Immediate(payload)) => {
+                    let _ = sender.send(Ok(payload));
+                }
+                Ok(MaybePromise::Pending(payload)) => {
+                    if let Ok(runtime) = tokio::runtime::Handle::try_current() {
+                        runtime.spawn(async move {
+                            let _ = sender.send(payload.await);
+                        });
+                    } else {
+                        let _ = sender.send(Err(Error::Message(
+                            "pending pull requires an active Tokio runtime".to_owned(),
+                        )));
+                    }
+                }
+                Err(error) => {
+                    let _ = sender.send(Err(error));
+                }
+            }
+        }));
+        Ok(MaybePromise::Pending(Box::pin(async move {
+            receiver
+                .await
+                .map_err(|_| Error::Message("pending pull was canceled".to_owned()))?
+        })))
+    }
+
+    fn ignore_unhandled_rejections(&self) {
+        if let Some(Ok(hook)) = self.shared.resolution() {
+            hook.ignore_unhandled_rejections();
+        } else {
+            self.shared.enqueue(Box::new(|resolution| {
+                if let Ok(hook) = resolution {
+                    hook.ignore_unhandled_rejections();
+                }
+            }));
+        }
+    }
+
+    fn on_broken(&self, callback: Box<dyn FnOnce(Error) + Send + 'static>) {
+        if let Some(resolution) = self.shared.resolution() {
+            match resolution {
+                Ok(hook) => hook.on_broken(callback),
+                Err(error) => callback(error),
+            }
+        } else {
+            self.shared
+                .enqueue(Box::new(move |resolution| match resolution {
+                    Ok(hook) => hook.on_broken(callback),
+                    Err(error) => callback(error),
+                }));
+        }
+    }
+}
