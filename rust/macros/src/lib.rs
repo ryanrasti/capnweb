@@ -21,6 +21,7 @@ pub fn rpc_interface(_attribute: TokenStream, item: TokenStream) -> TokenStream 
     let interface_name = &interface.ident;
     let stub_name = syn::Ident::new(&format!("{interface_name}Stub"), interface_name.span());
     let mut methods = Vec::new();
+    let mut wire_names = Vec::new();
 
     for item in &interface.items {
         let TraitItem::Fn(method) = item else {
@@ -28,6 +29,7 @@ pub fn rpc_interface(_attribute: TokenStream, item: TokenStream) -> TokenStream 
         };
         let method_name = &method.sig.ident;
         let wire_name = snake_to_lower_camel(&method_name.to_string());
+        wire_names.push(wire_name.clone());
         let mut parameters = Vec::new();
         let mut arguments = Vec::new();
         for input in &method.sig.inputs {
@@ -63,6 +65,12 @@ pub fn rpc_interface(_attribute: TokenStream, item: TokenStream) -> TokenStream 
     quote! {
         #visibility enum #interface_name {}
 
+        impl ::capnweb::RpcInterfaceDescriptor for #interface_name {
+            fn has_member(wire_name: &str) -> bool {
+                false #( || wire_name == #wire_names)*
+            }
+        }
+
         #[derive(Clone)]
         #visibility struct #stub_name {
             inner: ::capnweb::RpcStub,
@@ -84,7 +92,12 @@ pub fn rpc_interface(_attribute: TokenStream, item: TokenStream) -> TokenStream 
 /// Difference from JS: this macro performs the member lookup that
 /// `TargetStubHook.call()` performs through prototype reflection in JavaScript.
 #[proc_macro_attribute]
-pub fn rpc_target(_attribute: TokenStream, item: TokenStream) -> TokenStream {
+pub fn rpc_target(attribute: TokenStream, item: TokenStream) -> TokenStream {
+    let interface = if attribute.is_empty() {
+        None
+    } else {
+        Some(parse_macro_input!(attribute as Type))
+    };
     let implementation = parse_macro_input!(item as ItemImpl);
     if implementation.trait_.is_some() {
         return compile_error(
@@ -175,6 +188,16 @@ pub fn rpc_target(_attribute: TokenStream, item: TokenStream) -> TokenStream {
         }
     }
 
+    let interface_guard = interface.map(|interface| {
+        quote! {
+            if !<#interface as ::capnweb::RpcInterfaceDescriptor>::has_member(&method) {
+                return ::capnweb::ErrorStubHook::create(
+                    ::capnweb::Error::NoSuchMethod(method)
+                );
+            }
+        }
+    });
+
     quote! {
         #implementation
 
@@ -184,6 +207,7 @@ pub fn rpc_target(_attribute: TokenStream, item: TokenStream) -> TokenStream {
                 method: String,
                 args: ::capnweb::RpcPayload,
             ) -> ::capnweb::StubHook {
+                #interface_guard
                 match method.as_str() {
                     #(#arms,)*
                     _ => ::capnweb::ErrorStubHook::create(

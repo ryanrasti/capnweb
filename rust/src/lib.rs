@@ -41,6 +41,12 @@ pub use serialize::{
     DEFAULT_MAX_DEPTH, RpcLimits, deserialize, deserialize_with_limits, serialize,
 };
 
+/// Exact remotely-visible member set generated for an RPC interface.
+pub trait RpcInterfaceDescriptor {
+    /// Returns whether `wire_name` is declared by this interface.
+    fn has_member(wire_name: &str) -> bool;
+}
+
 /// Runtime result type used behind the generated application boundary.
 pub type Result<T> = std::result::Result<T, Error>;
 

@@ -1,0 +1,41 @@
+{
+  "name": "capnweb-rust-codegen",
+  "version": "0.0.0",
+  "description": "Generate Rust bindings from TypeScript Cap'n Web contracts.",
+  "license": "MIT",
+  "type": "module",
+  "main": "dist/index.mjs",
+  "types": "dist/index.d.mts",
+  "files": [
+    "dist"
+  ],
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.mts",
+      "import": "./dist/index.mjs"
+    }
+  },
+  "bin": {
+    "capnweb-rust-codegen": "./dist/cli.mjs"
+  },
+  "scripts": {
+    "build": "tsdown",
+    "test": "vitest run --root ../.. --project node packages/capnweb-rust-codegen/__tests__",
+    "typecheck": "tsc -p tsconfig.json"
+  },
+  "dependencies": {
+    "typescript": ">=5.7.0 <7"
+  },
+  "devDependencies": {
+    "@typescript/vfs": "^1.6.4",
+    "tsdown": "^0.22.0"
+  },
+  "publishConfig": {
+    "access": "public"
+  },
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/cloudflare/capnweb"
+  },
+  "private": true
+}

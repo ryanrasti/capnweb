@@ -7,7 +7,8 @@ dispatch macros, import/export tables, promise pipelining, and in-memory, newlin
 WebSocket transports. It is deliberately incomplete and not ready for production use.
 
 See [JS-PARITY.md](JS-PARITY.md) for the exact translated surface and documented Rust differences,
-[rust-port.md](rust-port.md) for the original design proposal, and
+[rust-port.md](rust-port.md) for the original design proposal,
+[rust-types.md](rust-types.md) for the TypeScript-to-Rust mapping proposal, and
 [implementation-plan.md](implementation-plan.md) for the staged implementation plan. The
 [kitchen-sink design fixture](examples/kitchen-sink/) pairs a broad TypeScript contract with the
 intended hand-written Rust equivalent.
