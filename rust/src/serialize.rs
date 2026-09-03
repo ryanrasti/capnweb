@@ -7,7 +7,14 @@
 // JS:
 
 // JS: import { StubHook, RpcPayload, typeForRpc, RpcStub, RpcPromise, LocatedPromise, RpcTarget, unwrapStubAndPath, streamImpl, PromiseStubHook, PayloadStubHook } from "./core.js";
-use crate::core::{Error, Result, StubHook};
+use std::sync::Arc;
+
+use base64::Engine as _;
+use serde_json::{Number, Value as WireValue};
+
+use crate::core::{
+    CapnwebValue, Error, PropertyKey, Result, RpcPayload, StubHook, unwrap_stub_and_path,
+};
 // JS:
 // JS: export type ImportId = number;
 /// A peer-assigned import-table identifier.
@@ -317,470 +324,645 @@ const NULL_EXPORTER: NullExporter = NullExporter;
 // JS: // actually converting to a string. (The name is meant to be the opposite of "Evaluator", which
 // JS: // implements the opposite direction.)
 // JS: export class Devaluator {
-// JS:   private constructor(
-// JS:     private exporter: Exporter,
-// JS:     private source: RpcPayload | undefined,
-// JS:     private encodingLevel: EncodingLevel
-// JS:   ) {}
-// JS:
-// JS:   // Devaluate the given value.
-// JS:   // * value: The value to devaluate.
-// JS:   // * parent: The value's parent object, which would be used as `this` if the value were called
-// JS:   //     as a function.
-// JS:   // * exporter: Callbacks to the RPC session for exporting capabilities found in this message.
-// JS:   // * source: The RpcPayload which contains the value, and therefore owns stubs within.
-// JS:   // * encodingLevel: How much encoding to apply (default "string").
-// JS:   //
-// JS:   // Returns: The devaluated value, ready to be JSON-serialized (or passed to transport directly
-// JS:   // for non-string levels).
-// JS:   public static devaluate(
-// JS:       value: unknown, parent?: object, exporter: Exporter = NULL_EXPORTER, source?: RpcPayload,
-// JS:       encodingLevel: EncodingLevel = "string")
-// JS:       : unknown {
-// JS:     let devaluator = new Devaluator(exporter, source, encodingLevel);
-// JS:     try {
-// JS:       return devaluator.devaluateImpl(value, parent, 0);
-// JS:     } catch (err) {
-// JS:       if (devaluator.exports) {
-// JS:         try {
-// JS:           exporter.unexport(devaluator.exports);
-// JS:         } catch (err) {
-// JS:           // probably a side effect of the original error, ignore it
-// JS:         }
-// JS:       }
-// JS:       // TODO: This rollback only releases exports. Pipes created via `createPipe` (for
-// JS:       // ReadableStreams, Blobs, and the Firefox request-body fallback) have already sent a
-// JS:       // ["pipe"] frame and started pumping.
-// JS:       throw err;
-// JS:     }
-// JS:   }
-// JS:
-// JS:   private exports?: Array<ExportId>;
-// JS:
-// JS:   private devaluateImpl(value: unknown, parent: object | undefined, depth: number): unknown {
-// JS:     if (depth >= DEFAULT_MAX_DEPTH) {
-// JS:       throw new Error(
-// JS:           "Serialization exceeded maximum allowed depth. (Does the message contain cycles?)");
-// JS:     }
-// JS:
-// JS:     let kind = typeForRpc(value);
-// JS:     switch (kind) {
-// JS:       case "unsupported": {
-// JS:         let msg;
-// JS:         try {
-// JS:           msg = `Cannot serialize value: ${value}`;
-// JS:         } catch (err) {
-// JS:           msg = "Cannot serialize value: (couldn't stringify value)";
-// JS:         }
-// JS:         throw new TypeError(msg);
-// JS:       }
-// JS:
-// JS:       case "primitive":
-// JS:         if (typeof value === "number" && !isFinite(value)) {
-// JS:           // At structuredClonable level, keep Infinity/NaN as native values
-// JS:           if (this.encodingLevel === "structuredClonable") {
-// JS:             return value;
-// JS:           }
-// JS:           if (value === Infinity) {
-// JS:             return ["inf"];
-// JS:           } else if (value === -Infinity) {
-// JS:             return ["-inf"];
-// JS:           } else {
-// JS:             return ["nan"];
-// JS:           }
-// JS:         } else {
-// JS:           // Supported directly by JSON.
-// JS:           return value;
-// JS:         }
-// JS:
-// JS:       case "object": {
-// JS:         let object = <Record<string, unknown>>value;
-// JS:         let result: Record<string, unknown> = {};
-// JS:         for (let key in object) {
-// JS:           result[key] = this.devaluateImpl(object[key], object, depth + 1);
-// JS:         }
-// JS:         return result;
-// JS:       }
-// JS:
-// JS:       case "array": {
-// JS:         let array = <Array<unknown>>value;
-// JS:         let len = array.length;
-// JS:         let result = new Array(len);
-// JS:         for (let i = 0; i < len; i++) {
-// JS:           result[i] = this.devaluateImpl(array[i], array, depth + 1);
-// JS:         }
-// JS:         // Wrap literal arrays in an outer one-element array, to "escape" them.
-// JS:         return [result];
-// JS:       }
-// JS:
-// JS:       case "bigint":
-// JS:         // At structuredClonable level, keep BigInt as native value
-// JS:         if (this.encodingLevel === "structuredClonable") {
-// JS:           return value;
-// JS:         }
-// JS:         return ["bigint", (<bigint>value).toString()];
-// JS:
-// JS:       case "date": {
-// JS:         // At structuredClonable level, keep Date as native value
-// JS:         if (this.encodingLevel === "structuredClonable") {
-// JS:           return value;
-// JS:         }
-// JS:         const time = (<Date>value).getTime();
-// JS:         return ["date", Number.isNaN(time) ? null : time];
-// JS:       }
-// JS:
-// JS:       case "bytes": {
-// JS:         let alternateTypeName = BYTE_CONTAINER_TYPE_BY_PROTOTYPE.get(Object.getPrototypeOf(value));
-// JS:         let bytes: Uint8Array;
-// JS:         if (alternateTypeName === "ArrayBuffer") {
-// JS:           bytes = new Uint8Array(value as ArrayBuffer);
-// JS:         } else if (alternateTypeName === undefined) {
-// JS:           bytes = value as Uint8Array;
-// JS:         } else {
-// JS:           let view = value as ArrayBufferView;
-// JS:           bytes = new Uint8Array(view.buffer, view.byteOffset, view.byteLength);
-// JS:           let elementSize = TYPED_ARRAY_ELEMENT_SIZE[alternateTypeName];
-// JS:           if (!NATIVE_LITTLE_ENDIAN && elementSize) {
-// JS:             bytes = bytes.slice();
-// JS:             swapByteOrder(bytes, elementSize);
-// JS:           }
-// JS:         }
-// JS:
-// JS:         // At structuredClonable or jsonCompatibleWithBytes level, keep the bytes raw.
-// JS:         if (this.encodingLevel === "structuredClonable" ||
-// JS:             this.encodingLevel === "jsonCompatibleWithBytes") {
-// JS:           return alternateTypeName === undefined
-// JS:               ? ["bytes", bytes] : ["bytes", bytes, alternateTypeName];
-// JS:         }
-// JS:
-// JS:         let b64: string;
-// JS:         if (bytes.toBase64) {
-// JS:           b64 = bytes.toBase64({omitPadding: true});
-// JS:         } else if (typeof Buffer !== "undefined") {
-// JS:           let buf = bytes instanceof Buffer ? bytes
-// JS:               : Buffer.from(bytes.buffer, bytes.byteOffset, bytes.byteLength);
-// JS:           b64 = buf.toString("base64");
-// JS:         } else {
-// JS:           let binary = "";
-// JS:           for (let i = 0; i < bytes.length; i++) {
-// JS:             binary += String.fromCharCode(bytes[i]);
-// JS:           }
-// JS:           b64 = btoa(binary);
-// JS:         }
-// JS:         b64 = b64.replace(/=+$/, "");
-// JS:         return alternateTypeName === undefined ? ["bytes", b64] : ["bytes", b64, alternateTypeName];
-// JS:       }
-// JS:
-// JS:       case "url":
-// JS:         // Always tuple-encode URLs; structured-clone support for URL isn't universal.
-// JS:         return ["url", (value as URL).href];
-// JS:
-// JS:       case "headers":
-// JS:         // The `Headers` TS type apparently doesn't declare itself as being
-// JS:         // Iterable<[string, string]>, but it is.
-// JS:         return ["headers", [...<Iterable<[string, string]>>value]];
-// JS:
-// JS:       case "request": {
-// JS:         let req = <Request>value;
-// JS:         let init: Record<string, unknown> = {};
-// JS:
-// JS:         // For many properties below, the official Fetch spec says they must always be present,
-// JS:         // but some platforms don't support them. So, we check both whether the property exists,
-// JS:         // and whether it is equal to the default, before bothering to add it to `init`.
-// JS:
-// JS:         if (req.method !== "GET") init.method = req.method;
-// JS:
-// JS:         let headers = [...<Iterable<[string, string]>><any>req.headers];
-// JS:         if (headers.length > 0) {
-// JS:           // Note that we don't need to serialize this as ["headers", headers] because we are only
-// JS:           // trying to create a valid RequestInit object.
-// JS:           init.headers = headers;
-// JS:         }
-// JS:
-// JS:         if (req.body) {
-// JS:           init.body = this.devaluateImpl(req.body, req, depth + 1);
-// JS:
-// JS:           // Apparently the fetch spec technically requires that `duplex` be specified when a
-// JS:           // body is specified, and Chrome in fact requires this, and requires the value is "half".
-// JS:           // Workers hasn't implemented this (and actually supports full duplex by default, lol).
-// JS:           // The TS types for Request currently don't define this property, but it is there (on
-// JS:           // Chrome at least).
-// JS:           init.duplex = (<any>req).duplex || "half";
-// JS:         } else if (req.body === undefined &&
-// JS:             !["GET", "HEAD", "OPTIONS", "TRACE", "DELETE"].includes(req.method)) {
-// JS:           // If the body is undefined rather than null, most likely we're on a platform that
-// JS:           // doesn't support request body streams (*cough*Firefox*cough*). We'll need to hack
-// JS:           // around this by using `req.arrayBuffer()` to get the body. Unfortunately this is async,
-// JS:           // so we can't just embed the resulting body into the message we are constructing. We
-// JS:           // will actually have to construct a ReadableStream. Ugh!
-// JS:
-// JS:           let bodyPromise = req.arrayBuffer();
-// JS:
-// JS:           let readable = new ReadableStream<Uint8Array>({
-// JS:             async start(controller) {
-// JS:               try {
-// JS:                 // `as Uint8Array` is needed here to work around some sort of weird bug in the TS
-// JS:                 // types where `new Uint8Array` somehow doesn't return a `Uint8Array`. Instead it
-// JS:                 // somehow returns `Uint8Array<ArrayBuffer>` -- but `Uint8Array` is not a generic
-// JS:                 // type! WTF?
-// JS:                 // TODO(cleanup): This is apparently fixed in TS 6.
-// JS:                 controller.enqueue(new Uint8Array(await bodyPromise) as Uint8Array);
-// JS:                 controller.close();
-// JS:               } catch (err) {
-// JS:                 controller.error(err);
-// JS:               }
-// JS:             }
-// JS:           });
-// JS:
-// JS:           // We can't recurse to devaluateImpl() to serialize the body because it'll call
-// JS:           // source.getHookForReadableStream(), adding a hook on the payload which isn't actually
-// JS:           // reachable by walking the payload, which will cause trouble later. So we have to
-// JS:           // inline it a bit here...
-// JS:           let hook = streamImpl.createReadableStreamHook(readable);
-// JS:           let importId = this.exporter.createPipe(readable, hook);
-// JS:           init.body = ["readable", importId];
-// JS:           init.duplex = (<any>req).duplex || "half";
-// JS:         }
-// JS:
-// JS:         if (req.cache && req.cache !== "default") init.cache = req.cache;
-// JS:         if (req.redirect !== "follow") init.redirect = req.redirect;
-// JS:         if (req.integrity) init.integrity = req.integrity;
-// JS:
-// JS:         // These properties are only meaningful in browsers and not supported by most WinterCG
-// JS:         // (server-side) platforms.
-// JS:         if (req.mode && req.mode !== "cors") init.mode = req.mode;
-// JS:         if (req.credentials && req.credentials !== "same-origin") {
-// JS:           init.credentials = req.credentials;
-// JS:         }
-// JS:         if (req.referrer && req.referrer !== "about:client") init.referrer = req.referrer;
-// JS:         if (req.referrerPolicy) init.referrerPolicy = req.referrerPolicy;
-// JS:         if (req.keepalive) init.keepalive = req.keepalive;
-// JS:
-// JS:         // These properties are specific to Cloudflare Workers. Cast the request to `any` to
-// JS:         // silence type errors on other platforms.
-// JS:         let cfReq = req as any;
-// JS:         if (cfReq.cf) init.cf = cfReq.cf;
-// JS:         if (cfReq.encodeResponseBody && cfReq.encodeResponseBody !== "automatic") {
-// JS:           init.encodeResponseBody = cfReq.encodeResponseBody;
-// JS:         }
-// JS:
-// JS:         // TODO: Support request.signal. Annoyingly, all `Request`s have a `signal` property even
-// JS:         //   if none was passed to the constructor, and there's no way to tell if it's a real
-// JS:         //   signal. So for now, since we don't support AbortSignal yet, all we can do is ignore
-// JS:         //   it; we can't throw an error if it's present.
-// JS:
-// JS:         return ["request", req.url, init];
-// JS:       }
-// JS:
-// JS:       case "response": {
-// JS:         let resp = <Response>value;
-// JS:         let body = this.devaluateImpl(resp.body, resp, depth + 1);
-// JS:         let init: Record<string, unknown> = {};
-// JS:
-// JS:         if (resp.status !== 200) init.status = resp.status;
-// JS:         if (resp.statusText) init.statusText = resp.statusText;
-// JS:
-// JS:         let headers = [...<Iterable<[string, string]>><any>resp.headers];
-// JS:         if (headers.length > 0) {
-// JS:           // Note that we don't need to serialize this as ["headers", headers] because we are only
-// JS:           // trying to create a valid ResponseInit object.
-// JS:           init.headers = headers;
-// JS:         }
-// JS:
-// JS:         // These properties are specific to Cloudflare Workers. Cast the request to `any` to
-// JS:         // silence type errors on other platforms.
-// JS:         let cfResp = resp as any;
-// JS:         if (cfResp.cf) init.cf = cfResp.cf;
-// JS:         if (cfResp.encodeBody && cfResp.encodeBody !== "automatic") {
-// JS:           init.encodeBody = cfResp.encodeBody;
-// JS:         }
-// JS:         if (cfResp.webSocket) {
-// JS:           // As of this writing, we don't support WebSocket, but we might someday.
-// JS:           throw new TypeError("Can't serialize a Response containing a webSocket.");
-// JS:         }
-// JS:
-// JS:         return ["response", body, init];
-// JS:       }
-// JS:
-// JS:       case "blob": {
-// JS:         // Blobs are streamed through a pipe. This allows very large blobs to be sent without
-// JS:         // causing excessively large individual messages nor blocking other messages in the
-// JS:         // meantime.
-// JS:         //
-// JS:         // Ideally, small Blobs would be inlined. But, there is no way to read a blob
-// JS:         // synchronously, and we MUST serialize the message synchronously. Hence, we have no choice
-// JS:         // but to use streaming even for small blobs.
-// JS:         let blob = value as Blob;
-// JS:         let readable = blob.stream();
-// JS:         let hook = streamImpl.createReadableStreamHook(readable);
-// JS:         let importId = this.exporter.createPipe(readable, hook);
-// JS:         return ["blob", blob.type, ["readable", importId]];
-// JS:       }
-// JS:
-// JS:       case "error": {
-// JS:         let e = <Error>value;
-// JS:
-// JS:         // TODO:
-// JS:         // - Determine type by checking prototype rather than `name`, which can be overridden?
-// JS:
-// JS:         let rewritten = this.exporter.onSendError(e);
-// JS:         if (rewritten) {
-// JS:           e = rewritten;
-// JS:         }
-// JS:
-// JS:         // Capture own enumerable properties plus the standard non-enumerable slots `cause`
-// JS:         // and (for AggregateError) `errors`. Each value is run through devaluateImpl so any
-// JS:         // supported type round-trips. If a property's value can't be serialized, drop the
-// JS:         // property: the error itself must always make it through. Use `onSendError` to scrub
-// JS:         // heavy or sensitive fields explicitly.
-// JS:         //
-// JS:         // On per-property failure we roll back any exports the partial walk produced by
-// JS:         // splicing them off `this.exports` and unexporting them.
-// JS:         //
-// JS:         // TODO: this can't roll back pipes created by `createPipe` (ReadableStream, Blob,
-// JS:         // Firefox request-body); the `["pipe"]` frame and pump have already started, with
-// JS:         // no inverse on the `Exporter` interface, so they leak until session shutdown.
-// JS:         // Same caveat as the rollback in the static `devaluate` method above.
-// JS:         let anyE = <any>e;
-// JS:         let props: Record<string, unknown> | undefined;
-// JS:         let captureProp = (key: string, val: unknown) => {
-// JS:           let exportsBefore = this.exports?.length ?? 0;
-// JS:           try {
-// JS:             let encoded = this.devaluateImpl(val, e, depth + 1);
-// JS:             if (!props) props = {};
-// JS:             props[key] = encoded;
-// JS:           } catch (err) {
-// JS:             // Drop this property; the error itself still propagates. Roll back any exports
-// JS:             // the partial walk produced.
-// JS:             if (this.exports && this.exports.length > exportsBefore) {
-// JS:               let tail = this.exports.splice(exportsBefore);
-// JS:               try {
-// JS:                 this.exporter.unexport(tail);
-// JS:               } catch (err2) {
-// JS:                 // probably a side effect of the original error, ignore it
-// JS:               }
-// JS:             }
-// JS:           }
-// JS:         };
-// JS:         for (let key of Object.keys(e)) {
-// JS:           if (key === "name" || key === "message" || key === "stack") continue;
-// JS:           captureProp(key, anyE[key]);
-// JS:         }
-// JS:         // `cause` is normally non-enumerable, so Object.keys() misses it.
-// JS:         if ("cause" in e) {
-// JS:           captureProp("cause", anyE.cause);
-// JS:         }
-// JS:         if (e instanceof AggregateError) {
-// JS:           captureProp("errors", e.errors);
-// JS:         }
-// JS:
-// JS:         // Backwards-compat: only emit the new tail elements when there's something to add.
-// JS:         // Errors with no extras serialize to the legacy 3- or 4-element form, byte-identical
-// JS:         // to what previous versions produced.
-// JS:         let result: unknown[] = ["error", e.name, e.message];
-// JS:         if (props) {
-// JS:           // Normalize the stack slot to null so `props` is always at index 4.
-// JS:           result.push(rewritten && rewritten.stack ? rewritten.stack : null);
-// JS:           result.push(props);
-// JS:         } else if (rewritten && rewritten.stack) {
-// JS:           result.push(rewritten.stack);
-// JS:         }
-// JS:         return result;
-// JS:       }
-// JS:
-// JS:       case "undefined":
-// JS:         // At structuredClonable level, keep undefined as native value
-// JS:         if (this.encodingLevel === "structuredClonable") {
-// JS:           return undefined;
-// JS:         }
-// JS:         return ["undefined"];
-// JS:
-// JS:       case "stub":
-// JS:       case "rpc-promise": {
-// JS:         if (!this.source) {
-// JS:           throw new Error("Can't serialize RPC stubs in this context.");
-// JS:         }
-// JS:
-// JS:         let {hook, pathIfPromise} = unwrapStubAndPath(<RpcStub>value);
-// JS:         let importId = this.exporter.getImport(hook);
-// JS:         if (importId !== undefined) {
-// JS:           if (pathIfPromise) {
-// JS:             // It's a promise pointing back to the peer, so we are doing pipelining here.
-// JS:             if (pathIfPromise.length > 0) {
-// JS:               return ["pipeline", importId, pathIfPromise];
-// JS:             } else {
-// JS:               return ["pipeline", importId];
-// JS:             }
-// JS:           } else {
-// JS:             return ["import", importId];
-// JS:           }
-// JS:         }
-// JS:
-// JS:         if (pathIfPromise) {
-// JS:           hook = hook.get(pathIfPromise);
-// JS:         } else {
-// JS:           hook = hook.dup();
-// JS:         }
-// JS:
-// JS:         return this.devaluateHook(pathIfPromise ? "promise" : "export", hook);
-// JS:       }
-// JS:
-// JS:       case "function":
-// JS:       case "rpc-target": {
-// JS:         if (!this.source) {
-// JS:           throw new Error("Can't serialize RPC stubs in this context.");
-// JS:         }
-// JS:
-// JS:         let hook = this.source.getHookForRpcTarget(<RpcTarget|Function>value, parent);
-// JS:         return this.devaluateHook("export", hook);
-// JS:       }
-// JS:
-// JS:       case "rpc-thenable": {
-// JS:         if (!this.source) {
-// JS:           throw new Error("Can't serialize RPC stubs in this context.");
-// JS:         }
-// JS:
-// JS:         let hook = this.source.getHookForRpcTarget(<RpcTarget>value, parent);
-// JS:         return this.devaluateHook("promise", hook);
-// JS:       }
-// JS:
-// JS:       case "writable": {
-// JS:         if (!this.source) {
-// JS:           throw new Error("Can't serialize WritableStream in this context.");
-// JS:         }
-// JS:
-// JS:         let hook = this.source.getHookForWritableStream(<WritableStream>value, parent);
-// JS:         return this.devaluateHook("writable", hook);
-// JS:       }
-// JS:
-// JS:       case "readable": {
-// JS:         if (!this.source) {
-// JS:           throw new Error("Can't serialize ReadableStream in this context.");
-// JS:         }
-// JS:
-// JS:         let ws = <ReadableStream>value;
-// JS:         let hook = this.source.getHookForReadableStream(ws, parent);
-// JS:
-// JS:         // Create a pipe and start pumping the ReadableStream into it.
-// JS:         let importId = this.exporter.createPipe(ws, hook);
-// JS:
-// JS:         return ["readable", importId];
-// JS:       }
-// JS:
-// JS:       default:
-// JS:         kind satisfies never;
-// JS:         throw new Error("unreachable");
-// JS:     }
-// JS:   }
-// JS:
-// JS:   private devaluateHook(type: "export" | "promise" | "writable", hook: StubHook): unknown {
-// JS:     if (!this.exports) this.exports = [];
-// JS:     let exportId = type === "promise" ? this.exporter.exportPromise(hook)
-// JS:                                       : this.exporter.exportStub(hook);
-// JS:     this.exports.push(exportId);
-// JS:     return [type, exportId];
-// JS:   }
-// JS: }
+/// Converts dynamic RPC values to their wire expression tree.
+pub struct Devaluator<'a> {
+    exporter: &'a mut dyn Exporter,
+    source: Option<&'a RpcPayload>,
+    encoding_level: EncodingLevel,
+    exports: Vec<ExportId>,
+}
+
+impl<'a> Devaluator<'a> {
+    // JS:   private constructor(
+    // JS:     private exporter: Exporter,
+    // JS:     private source: RpcPayload | undefined,
+    // JS:     private encodingLevel: EncodingLevel
+    // JS:   ) {}
+    // JS:
+    // JS:   // Devaluate the given value.
+    // JS:   // * value: The value to devaluate.
+    // JS:   // * parent: The value's parent object, which would be used as `this` if the value were called
+    // JS:   //     as a function.
+    // JS:   // * exporter: Callbacks to the RPC session for exporting capabilities found in this message.
+    // JS:   // * source: The RpcPayload which contains the value, and therefore owns stubs within.
+    // JS:   // * encodingLevel: How much encoding to apply (default "string").
+    // JS:   //
+    // JS:   // Returns: The devaluated value, ready to be JSON-serialized (or passed to transport directly
+    // JS:   // for non-string levels).
+    // JS:   public static devaluate(
+    // JS:       value: unknown, parent?: object, exporter: Exporter = NULL_EXPORTER, source?: RpcPayload,
+    // JS:       encodingLevel: EncodingLevel = "string")
+    // JS:       : unknown {
+    // JS:     let devaluator = new Devaluator(exporter, source, encodingLevel);
+    // JS:     try {
+    // JS:       return devaluator.devaluateImpl(value, parent, 0);
+    // JS:     } catch (err) {
+    // JS:       if (devaluator.exports) {
+    // JS:         try {
+    // JS:           exporter.unexport(devaluator.exports);
+    // JS:         } catch (err) {
+    // JS:           // probably a side effect of the original error, ignore it
+    // JS:         }
+    // JS:       }
+    // JS:       // TODO: This rollback only releases exports. Pipes created via `createPipe` (for
+    // JS:       // ReadableStreams, Blobs, and the Firefox request-body fallback) have already sent a
+    // JS:       // ["pipe"] frame and started pumping.
+    // JS:       throw err;
+    // JS:     }
+    // JS:   }
+    /// Devaluates one value and rolls back capabilities if any later branch fails.
+    pub fn devaluate(
+        value: &CapnwebValue,
+        exporter: &'a mut dyn Exporter,
+        source: Option<&'a RpcPayload>,
+        encoding_level: EncodingLevel,
+    ) -> Result<WireValue> {
+        let mut devaluator = Self {
+            exporter,
+            source,
+            encoding_level,
+            exports: Vec::new(),
+        };
+        match devaluator.devaluate_impl(value, 0) {
+            Ok(value) => Ok(value),
+            Err(error) => {
+                let exports = std::mem::take(&mut devaluator.exports);
+                let _ = devaluator.exporter.unexport(exports);
+                Err(error)
+            }
+        }
+    }
+    // JS:
+    // JS:   private exports?: Array<ExportId>;
+    // `exports` is the rollback list stored on the Rust struct above.
+    // JS:
+    // JS:   private devaluateImpl(value: unknown, parent: object | undefined, depth: number): unknown {
+    // JS:     if (depth >= DEFAULT_MAX_DEPTH) {
+    // JS:       throw new Error(
+    // JS:           "Serialization exceeded maximum allowed depth. (Does the message contain cycles?)");
+    // JS:     }
+    // JS:
+    // JS:     let kind = typeForRpc(value);
+    // JS:     switch (kind) {
+    // JS:       case "unsupported": {
+    // JS:         let msg;
+    // JS:         try {
+    // JS:           msg = `Cannot serialize value: ${value}`;
+    // JS:         } catch (err) {
+    // JS:           msg = "Cannot serialize value: (couldn't stringify value)";
+    // JS:         }
+    // JS:         throw new TypeError(msg);
+    // JS:       }
+    // JS:
+    // JS:       case "primitive":
+    // JS:         if (typeof value === "number" && !isFinite(value)) {
+    // JS:           // At structuredClonable level, keep Infinity/NaN as native values
+    // JS:           if (this.encodingLevel === "structuredClonable") {
+    // JS:             return value;
+    // JS:           }
+    // JS:           if (value === Infinity) {
+    // JS:             return ["inf"];
+    // JS:           } else if (value === -Infinity) {
+    // JS:             return ["-inf"];
+    // JS:           } else {
+    // JS:             return ["nan"];
+    // JS:           }
+    // JS:         } else {
+    // JS:           // Supported directly by JSON.
+    // JS:           return value;
+    // JS:         }
+    // JS:
+    // JS:       case "object": {
+    // JS:         let object = <Record<string, unknown>>value;
+    // JS:         let result: Record<string, unknown> = {};
+    // JS:         for (let key in object) {
+    // JS:           result[key] = this.devaluateImpl(object[key], object, depth + 1);
+    // JS:         }
+    // JS:         return result;
+    // JS:       }
+    // JS:
+    // JS:       case "array": {
+    // JS:         let array = <Array<unknown>>value;
+    // JS:         let len = array.length;
+    // JS:         let result = new Array(len);
+    // JS:         for (let i = 0; i < len; i++) {
+    // JS:           result[i] = this.devaluateImpl(array[i], array, depth + 1);
+    // JS:         }
+    // JS:         // Wrap literal arrays in an outer one-element array, to "escape" them.
+    // JS:         return [result];
+    // JS:       }
+    // JS:
+    // JS:       case "bigint":
+    // JS:         // At structuredClonable level, keep BigInt as native value
+    // JS:         if (this.encodingLevel === "structuredClonable") {
+    // JS:           return value;
+    // JS:         }
+    // JS:         return ["bigint", (<bigint>value).toString()];
+    // JS:
+    // JS:       case "date": {
+    // JS:         // At structuredClonable level, keep Date as native value
+    // JS:         if (this.encodingLevel === "structuredClonable") {
+    // JS:           return value;
+    // JS:         }
+    // JS:         const time = (<Date>value).getTime();
+    // JS:         return ["date", Number.isNaN(time) ? null : time];
+    // JS:       }
+    // JS:
+    // JS:       case "bytes": {
+    // JS:         let alternateTypeName = BYTE_CONTAINER_TYPE_BY_PROTOTYPE.get(Object.getPrototypeOf(value));
+    // JS:         let bytes: Uint8Array;
+    // JS:         if (alternateTypeName === "ArrayBuffer") {
+    // JS:           bytes = new Uint8Array(value as ArrayBuffer);
+    // JS:         } else if (alternateTypeName === undefined) {
+    // JS:           bytes = value as Uint8Array;
+    // JS:         } else {
+    // JS:           let view = value as ArrayBufferView;
+    // JS:           bytes = new Uint8Array(view.buffer, view.byteOffset, view.byteLength);
+    // JS:           let elementSize = TYPED_ARRAY_ELEMENT_SIZE[alternateTypeName];
+    // JS:           if (!NATIVE_LITTLE_ENDIAN && elementSize) {
+    // JS:             bytes = bytes.slice();
+    // JS:             swapByteOrder(bytes, elementSize);
+    // JS:           }
+    // JS:         }
+    // JS:
+    // JS:         // At structuredClonable or jsonCompatibleWithBytes level, keep the bytes raw.
+    // JS:         if (this.encodingLevel === "structuredClonable" ||
+    // JS:             this.encodingLevel === "jsonCompatibleWithBytes") {
+    // JS:           return alternateTypeName === undefined
+    // JS:               ? ["bytes", bytes] : ["bytes", bytes, alternateTypeName];
+    // JS:         }
+    // JS:
+    // JS:         let b64: string;
+    // JS:         if (bytes.toBase64) {
+    // JS:           b64 = bytes.toBase64({omitPadding: true});
+    // JS:         } else if (typeof Buffer !== "undefined") {
+    // JS:           let buf = bytes instanceof Buffer ? bytes
+    // JS:               : Buffer.from(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+    // JS:           b64 = buf.toString("base64");
+    // JS:         } else {
+    // JS:           let binary = "";
+    // JS:           for (let i = 0; i < bytes.length; i++) {
+    // JS:             binary += String.fromCharCode(bytes[i]);
+    // JS:           }
+    // JS:           b64 = btoa(binary);
+    // JS:         }
+    // JS:         b64 = b64.replace(/=+$/, "");
+    // JS:         return alternateTypeName === undefined ? ["bytes", b64] : ["bytes", b64, alternateTypeName];
+    // JS:       }
+    // JS:
+    // JS:       case "url":
+    // JS:         // Always tuple-encode URLs; structured-clone support for URL isn't universal.
+    // JS:         return ["url", (value as URL).href];
+    // JS:
+    // JS:       case "headers":
+    // JS:         // The `Headers` TS type apparently doesn't declare itself as being
+    // JS:         // Iterable<[string, string]>, but it is.
+    // JS:         return ["headers", [...<Iterable<[string, string]>>value]];
+    // JS:
+    // JS:       case "request": {
+    // JS:         let req = <Request>value;
+    // JS:         let init: Record<string, unknown> = {};
+    // JS:
+    // JS:         // For many properties below, the official Fetch spec says they must always be present,
+    // JS:         // but some platforms don't support them. So, we check both whether the property exists,
+    // JS:         // and whether it is equal to the default, before bothering to add it to `init`.
+    // JS:
+    // JS:         if (req.method !== "GET") init.method = req.method;
+    // JS:
+    // JS:         let headers = [...<Iterable<[string, string]>><any>req.headers];
+    // JS:         if (headers.length > 0) {
+    // JS:           // Note that we don't need to serialize this as ["headers", headers] because we are only
+    // JS:           // trying to create a valid RequestInit object.
+    // JS:           init.headers = headers;
+    // JS:         }
+    // JS:
+    // JS:         if (req.body) {
+    // JS:           init.body = this.devaluateImpl(req.body, req, depth + 1);
+    // JS:
+    // JS:           // Apparently the fetch spec technically requires that `duplex` be specified when a
+    // JS:           // body is specified, and Chrome in fact requires this, and requires the value is "half".
+    // JS:           // Workers hasn't implemented this (and actually supports full duplex by default, lol).
+    // JS:           // The TS types for Request currently don't define this property, but it is there (on
+    // JS:           // Chrome at least).
+    // JS:           init.duplex = (<any>req).duplex || "half";
+    // JS:         } else if (req.body === undefined &&
+    // JS:             !["GET", "HEAD", "OPTIONS", "TRACE", "DELETE"].includes(req.method)) {
+    // JS:           // If the body is undefined rather than null, most likely we're on a platform that
+    // JS:           // doesn't support request body streams (*cough*Firefox*cough*). We'll need to hack
+    // JS:           // around this by using `req.arrayBuffer()` to get the body. Unfortunately this is async,
+    // JS:           // so we can't just embed the resulting body into the message we are constructing. We
+    // JS:           // will actually have to construct a ReadableStream. Ugh!
+    // JS:
+    // JS:           let bodyPromise = req.arrayBuffer();
+    // JS:
+    // JS:           let readable = new ReadableStream<Uint8Array>({
+    // JS:             async start(controller) {
+    // JS:               try {
+    // JS:                 // `as Uint8Array` is needed here to work around some sort of weird bug in the TS
+    // JS:                 // types where `new Uint8Array` somehow doesn't return a `Uint8Array`. Instead it
+    // JS:                 // somehow returns `Uint8Array<ArrayBuffer>` -- but `Uint8Array` is not a generic
+    // JS:                 // type! WTF?
+    // JS:                 // TODO(cleanup): This is apparently fixed in TS 6.
+    // JS:                 controller.enqueue(new Uint8Array(await bodyPromise) as Uint8Array);
+    // JS:                 controller.close();
+    // JS:               } catch (err) {
+    // JS:                 controller.error(err);
+    // JS:               }
+    // JS:             }
+    // JS:           });
+    // JS:
+    // JS:           // We can't recurse to devaluateImpl() to serialize the body because it'll call
+    // JS:           // source.getHookForReadableStream(), adding a hook on the payload which isn't actually
+    // JS:           // reachable by walking the payload, which will cause trouble later. So we have to
+    // JS:           // inline it a bit here...
+    // JS:           let hook = streamImpl.createReadableStreamHook(readable);
+    // JS:           let importId = this.exporter.createPipe(readable, hook);
+    // JS:           init.body = ["readable", importId];
+    // JS:           init.duplex = (<any>req).duplex || "half";
+    // JS:         }
+    // JS:
+    // JS:         if (req.cache && req.cache !== "default") init.cache = req.cache;
+    // JS:         if (req.redirect !== "follow") init.redirect = req.redirect;
+    // JS:         if (req.integrity) init.integrity = req.integrity;
+    // JS:
+    // JS:         // These properties are only meaningful in browsers and not supported by most WinterCG
+    // JS:         // (server-side) platforms.
+    // JS:         if (req.mode && req.mode !== "cors") init.mode = req.mode;
+    // JS:         if (req.credentials && req.credentials !== "same-origin") {
+    // JS:           init.credentials = req.credentials;
+    // JS:         }
+    // JS:         if (req.referrer && req.referrer !== "about:client") init.referrer = req.referrer;
+    // JS:         if (req.referrerPolicy) init.referrerPolicy = req.referrerPolicy;
+    // JS:         if (req.keepalive) init.keepalive = req.keepalive;
+    // JS:
+    // JS:         // These properties are specific to Cloudflare Workers. Cast the request to `any` to
+    // JS:         // silence type errors on other platforms.
+    // JS:         let cfReq = req as any;
+    // JS:         if (cfReq.cf) init.cf = cfReq.cf;
+    // JS:         if (cfReq.encodeResponseBody && cfReq.encodeResponseBody !== "automatic") {
+    // JS:           init.encodeResponseBody = cfReq.encodeResponseBody;
+    // JS:         }
+    // JS:
+    // JS:         // TODO: Support request.signal. Annoyingly, all `Request`s have a `signal` property even
+    // JS:         //   if none was passed to the constructor, and there's no way to tell if it's a real
+    // JS:         //   signal. So for now, since we don't support AbortSignal yet, all we can do is ignore
+    // JS:         //   it; we can't throw an error if it's present.
+    // JS:
+    // JS:         return ["request", req.url, init];
+    // JS:       }
+    // JS:
+    // JS:       case "response": {
+    // JS:         let resp = <Response>value;
+    // JS:         let body = this.devaluateImpl(resp.body, resp, depth + 1);
+    // JS:         let init: Record<string, unknown> = {};
+    // JS:
+    // JS:         if (resp.status !== 200) init.status = resp.status;
+    // JS:         if (resp.statusText) init.statusText = resp.statusText;
+    // JS:
+    // JS:         let headers = [...<Iterable<[string, string]>><any>resp.headers];
+    // JS:         if (headers.length > 0) {
+    // JS:           // Note that we don't need to serialize this as ["headers", headers] because we are only
+    // JS:           // trying to create a valid ResponseInit object.
+    // JS:           init.headers = headers;
+    // JS:         }
+    // JS:
+    // JS:         // These properties are specific to Cloudflare Workers. Cast the request to `any` to
+    // JS:         // silence type errors on other platforms.
+    // JS:         let cfResp = resp as any;
+    // JS:         if (cfResp.cf) init.cf = cfResp.cf;
+    // JS:         if (cfResp.encodeBody && cfResp.encodeBody !== "automatic") {
+    // JS:           init.encodeBody = cfResp.encodeBody;
+    // JS:         }
+    // JS:         if (cfResp.webSocket) {
+    // JS:           // As of this writing, we don't support WebSocket, but we might someday.
+    // JS:           throw new TypeError("Can't serialize a Response containing a webSocket.");
+    // JS:         }
+    // JS:
+    // JS:         return ["response", body, init];
+    // JS:       }
+    // JS:
+    // JS:       case "blob": {
+    // JS:         // Blobs are streamed through a pipe. This allows very large blobs to be sent without
+    // JS:         // causing excessively large individual messages nor blocking other messages in the
+    // JS:         // meantime.
+    // JS:         //
+    // JS:         // Ideally, small Blobs would be inlined. But, there is no way to read a blob
+    // JS:         // synchronously, and we MUST serialize the message synchronously. Hence, we have no choice
+    // JS:         // but to use streaming even for small blobs.
+    // JS:         let blob = value as Blob;
+    // JS:         let readable = blob.stream();
+    // JS:         let hook = streamImpl.createReadableStreamHook(readable);
+    // JS:         let importId = this.exporter.createPipe(readable, hook);
+    // JS:         return ["blob", blob.type, ["readable", importId]];
+    // JS:       }
+    // JS:
+    // JS:       case "error": {
+    // JS:         let e = <Error>value;
+    // JS:
+    // JS:         // TODO:
+    // JS:         // - Determine type by checking prototype rather than `name`, which can be overridden?
+    // JS:
+    // JS:         let rewritten = this.exporter.onSendError(e);
+    // JS:         if (rewritten) {
+    // JS:           e = rewritten;
+    // JS:         }
+    // JS:
+    // JS:         // Capture own enumerable properties plus the standard non-enumerable slots `cause`
+    // JS:         // and (for AggregateError) `errors`. Each value is run through devaluateImpl so any
+    // JS:         // supported type round-trips. If a property's value can't be serialized, drop the
+    // JS:         // property: the error itself must always make it through. Use `onSendError` to scrub
+    // JS:         // heavy or sensitive fields explicitly.
+    // JS:         //
+    // JS:         // On per-property failure we roll back any exports the partial walk produced by
+    // JS:         // splicing them off `this.exports` and unexporting them.
+    // JS:         //
+    // JS:         // TODO: this can't roll back pipes created by `createPipe` (ReadableStream, Blob,
+    // JS:         // Firefox request-body); the `["pipe"]` frame and pump have already started, with
+    // JS:         // no inverse on the `Exporter` interface, so they leak until session shutdown.
+    // JS:         // Same caveat as the rollback in the static `devaluate` method above.
+    // JS:         let anyE = <any>e;
+    // JS:         let props: Record<string, unknown> | undefined;
+    // JS:         let captureProp = (key: string, val: unknown) => {
+    // JS:           let exportsBefore = this.exports?.length ?? 0;
+    // JS:           try {
+    // JS:             let encoded = this.devaluateImpl(val, e, depth + 1);
+    // JS:             if (!props) props = {};
+    // JS:             props[key] = encoded;
+    // JS:           } catch (err) {
+    // JS:             // Drop this property; the error itself still propagates. Roll back any exports
+    // JS:             // the partial walk produced.
+    // JS:             if (this.exports && this.exports.length > exportsBefore) {
+    // JS:               let tail = this.exports.splice(exportsBefore);
+    // JS:               try {
+    // JS:                 this.exporter.unexport(tail);
+    // JS:               } catch (err2) {
+    // JS:                 // probably a side effect of the original error, ignore it
+    // JS:               }
+    // JS:             }
+    // JS:           }
+    // JS:         };
+    // JS:         for (let key of Object.keys(e)) {
+    // JS:           if (key === "name" || key === "message" || key === "stack") continue;
+    // JS:           captureProp(key, anyE[key]);
+    // JS:         }
+    // JS:         // `cause` is normally non-enumerable, so Object.keys() misses it.
+    // JS:         if ("cause" in e) {
+    // JS:           captureProp("cause", anyE.cause);
+    // JS:         }
+    // JS:         if (e instanceof AggregateError) {
+    // JS:           captureProp("errors", e.errors);
+    // JS:         }
+    // JS:
+    // JS:         // Backwards-compat: only emit the new tail elements when there's something to add.
+    // JS:         // Errors with no extras serialize to the legacy 3- or 4-element form, byte-identical
+    // JS:         // to what previous versions produced.
+    // JS:         let result: unknown[] = ["error", e.name, e.message];
+    // JS:         if (props) {
+    // JS:           // Normalize the stack slot to null so `props` is always at index 4.
+    // JS:           result.push(rewritten && rewritten.stack ? rewritten.stack : null);
+    // JS:           result.push(props);
+    // JS:         } else if (rewritten && rewritten.stack) {
+    // JS:           result.push(rewritten.stack);
+    // JS:         }
+    // JS:         return result;
+    // JS:       }
+    // JS:
+    // JS:       case "undefined":
+    // JS:         // At structuredClonable level, keep undefined as native value
+    // JS:         if (this.encodingLevel === "structuredClonable") {
+    // JS:           return undefined;
+    // JS:         }
+    // JS:         return ["undefined"];
+    // JS:
+    // JS:       case "stub":
+    // JS:       case "rpc-promise": {
+    // JS:         if (!this.source) {
+    // JS:           throw new Error("Can't serialize RPC stubs in this context.");
+    // JS:         }
+    // JS:
+    // JS:         let {hook, pathIfPromise} = unwrapStubAndPath(<RpcStub>value);
+    // JS:         let importId = this.exporter.getImport(hook);
+    // JS:         if (importId !== undefined) {
+    // JS:           if (pathIfPromise) {
+    // JS:             // It's a promise pointing back to the peer, so we are doing pipelining here.
+    // JS:             if (pathIfPromise.length > 0) {
+    // JS:               return ["pipeline", importId, pathIfPromise];
+    // JS:             } else {
+    // JS:               return ["pipeline", importId];
+    // JS:             }
+    // JS:           } else {
+    // JS:             return ["import", importId];
+    // JS:           }
+    // JS:         }
+    // JS:
+    // JS:         if (pathIfPromise) {
+    // JS:           hook = hook.get(pathIfPromise);
+    // JS:         } else {
+    // JS:           hook = hook.dup();
+    // JS:         }
+    // JS:
+    // JS:         return this.devaluateHook(pathIfPromise ? "promise" : "export", hook);
+    // JS:       }
+    // JS:
+    // JS:       case "function":
+    // JS:       case "rpc-target": {
+    // JS:         if (!this.source) {
+    // JS:           throw new Error("Can't serialize RPC stubs in this context.");
+    // JS:         }
+    // JS:
+    // JS:         let hook = this.source.getHookForRpcTarget(<RpcTarget|Function>value, parent);
+    // JS:         return this.devaluateHook("export", hook);
+    // JS:       }
+    // JS:
+    // JS:       case "rpc-thenable": {
+    // JS:         if (!this.source) {
+    // JS:           throw new Error("Can't serialize RPC stubs in this context.");
+    // JS:         }
+    // JS:
+    // JS:         let hook = this.source.getHookForRpcTarget(<RpcTarget>value, parent);
+    // JS:         return this.devaluateHook("promise", hook);
+    // JS:       }
+    // JS:
+    // JS:       case "writable": {
+    // JS:         if (!this.source) {
+    // JS:           throw new Error("Can't serialize WritableStream in this context.");
+    // JS:         }
+    // JS:
+    // JS:         let hook = this.source.getHookForWritableStream(<WritableStream>value, parent);
+    // JS:         return this.devaluateHook("writable", hook);
+    // JS:       }
+    // JS:
+    // JS:       case "readable": {
+    // JS:         if (!this.source) {
+    // JS:           throw new Error("Can't serialize ReadableStream in this context.");
+    // JS:         }
+    // JS:
+    // JS:         let ws = <ReadableStream>value;
+    // JS:         let hook = this.source.getHookForReadableStream(ws, parent);
+    // JS:
+    // JS:         // Create a pipe and start pumping the ReadableStream into it.
+    // JS:         let importId = this.exporter.createPipe(ws, hook);
+    // JS:
+    // JS:         return ["readable", importId];
+    // JS:       }
+    // JS:
+    // JS:       default:
+    // JS:         kind satisfies never;
+    // JS:         throw new Error("unreachable");
+    // JS:     }
+    // JS:   }
+    fn devaluate_impl(&mut self, value: &CapnwebValue, depth: usize) -> Result<WireValue> {
+        let _encoding_level = self.encoding_level;
+        if depth >= DEFAULT_MAX_DEPTH {
+            return Err(Error::Message(
+                "Serialization exceeded maximum allowed depth. (Does the message contain cycles?)"
+                    .to_owned(),
+            ));
+        }
+
+        match value {
+            CapnwebValue::Null => Ok(WireValue::Null),
+            CapnwebValue::Bool(value) => Ok(WireValue::Bool(*value)),
+            CapnwebValue::Number(value) if value.is_finite() => Number::from_f64(*value)
+                .map(WireValue::Number)
+                .ok_or_else(|| Error::Type("invalid finite number".to_owned())),
+            CapnwebValue::Number(value) if value.is_nan() => Ok(wire_tag("nan", Vec::new())),
+            CapnwebValue::Number(value) if value.is_sign_positive() => {
+                Ok(wire_tag("inf", Vec::new()))
+            }
+            CapnwebValue::Number(_) => Ok(wire_tag("-inf", Vec::new())),
+            CapnwebValue::String(value) => Ok(WireValue::String(value.clone())),
+            CapnwebValue::BigInt(value) => Ok(wire_tag(
+                "bigint",
+                vec![WireValue::String(value.to_string())],
+            )),
+            CapnwebValue::Bytes(value) => Ok(wire_tag(
+                "bytes",
+                vec![WireValue::String(
+                    base64::engine::general_purpose::STANDARD_NO_PAD.encode(value),
+                )],
+            )),
+            CapnwebValue::Array(values) => {
+                let values = values
+                    .iter()
+                    .map(|value| self.devaluate_impl(value, depth + 1))
+                    .collect::<Result<Vec<_>>>()?;
+                Ok(WireValue::Array(vec![WireValue::Array(values)]))
+            }
+            CapnwebValue::Object(values) => {
+                let values = values
+                    .iter()
+                    .map(|(key, value)| Ok((key.clone(), self.devaluate_impl(value, depth + 1)?)))
+                    .collect::<Result<serde_json::Map<_, _>>>()?;
+                Ok(WireValue::Object(values))
+            }
+            CapnwebValue::Error(error) => {
+                let error = self
+                    .exporter
+                    .on_send_error(error.clone())
+                    .unwrap_or_else(|| error.clone());
+                Ok(wire_tag(
+                    "error",
+                    vec![
+                        WireValue::String("Error".to_owned()),
+                        WireValue::String(error.to_string()),
+                    ],
+                ))
+            }
+            CapnwebValue::Stub(stub) => self.devaluate_stub(stub, false),
+            CapnwebValue::RpcPromise(promise) => self.devaluate_stub(promise.as_stub(), true),
+            CapnwebValue::Target(target) => {
+                let source = self.source.ok_or_else(|| {
+                    Error::Message("Can't serialize RPC targets in this context.".to_owned())
+                })?;
+                self.devaluate_hook(
+                    "export",
+                    source.get_hook_for_rpc_target(Arc::clone(target), false),
+                )
+            }
+            CapnwebValue::Function(target) => {
+                let source = self.source.ok_or_else(|| {
+                    Error::Message("Can't serialize RPC functions in this context.".to_owned())
+                })?;
+                self.devaluate_hook(
+                    "export",
+                    source.get_hook_for_rpc_target(Arc::clone(target), true),
+                )
+            }
+        }
+    }
+
+    fn devaluate_stub(&mut self, stub: &crate::core::RpcStub, promise: bool) -> Result<WireValue> {
+        if self.source.is_none() {
+            return Err(Error::Message(
+                "Can't serialize RPC stubs in this context.".to_owned(),
+            ));
+        }
+
+        let (hook, path) = unwrap_stub_and_path(stub);
+        if let Some(import_id) = self.exporter.get_import(&hook) {
+            if let Some(path) = path {
+                let mut expression = vec![
+                    WireValue::String("pipeline".to_owned()),
+                    WireValue::Number(import_id.into()),
+                ];
+                if !path.is_empty() {
+                    expression.push(property_path_to_wire(path)?);
+                }
+                return Ok(WireValue::Array(expression));
+            }
+            return Ok(wire_tag(
+                "import",
+                vec![WireValue::Number(import_id.into())],
+            ));
+        }
+
+        let hook = match path {
+            Some(path) => hook.get(path)?,
+            None => hook,
+        };
+        self.devaluate_hook(if promise { "promise" } else { "export" }, hook)
+    }
+    // JS:
+    // JS:   private devaluateHook(type: "export" | "promise" | "writable", hook: StubHook): unknown {
+    // JS:     if (!this.exports) this.exports = [];
+    // JS:     let exportId = type === "promise" ? this.exporter.exportPromise(hook)
+    // JS:                                       : this.exporter.exportStub(hook);
+    // JS:     this.exports.push(exportId);
+    // JS:     return [type, exportId];
+    // JS:   }
+    fn devaluate_hook(&mut self, kind: &'static str, hook: StubHook) -> Result<WireValue> {
+        let export_id = if kind == "promise" {
+            self.exporter.export_promise(hook)?
+        } else {
+            self.exporter.export_stub(hook)?
+        };
+        self.exports.push(export_id);
+        Ok(wire_tag(kind, vec![WireValue::Number(export_id.into())]))
+    }
+    // JS: }
+}
+
+fn wire_tag(tag: &str, tail: Vec<WireValue>) -> WireValue {
+    let mut expression = Vec::with_capacity(tail.len() + 1);
+    expression.push(WireValue::String(tag.to_owned()));
+    expression.extend(tail);
+    WireValue::Array(expression)
+}
+
+fn property_path_to_wire(path: Vec<PropertyKey>) -> Result<WireValue> {
+    path.into_iter()
+        .map(|part| match part {
+            PropertyKey::String(value) => Ok(WireValue::String(value)),
+            PropertyKey::Number(value) => Number::from_f64(value)
+                .map(WireValue::Number)
+                .ok_or_else(|| {
+                    Error::Type("property path contains a non-finite number".to_owned())
+                }),
+        })
+        .collect::<Result<Vec<_>>>()
+        .map(WireValue::Array)
+}
 // JS:
 // JS: /**
 // JS:  * Serialize a value, using Cap'n Web's underlying serialization. This won't be able to serialize
@@ -789,6 +971,13 @@ const NULL_EXPORTER: NullExporter = NullExporter;
 // JS: export function serialize(value: unknown): string {
 // JS:   return JSON.stringify(Devaluator.devaluate(value));
 // JS: }
+/// Serializes a standalone pass-by-value value as Cap'n Web JSON.
+pub fn serialize(value: &CapnwebValue) -> Result<String> {
+    let mut exporter = NULL_EXPORTER;
+    let wire = Devaluator::devaluate(value, &mut exporter, None, EncodingLevel::String)?;
+    serde_json::to_string(&wire)
+        .map_err(|error| Error::Message(format!("failed to encode JSON: {error}")))
+}
 // JS:
 // JS: // =======================================================================================
 // JS:

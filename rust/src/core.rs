@@ -1152,6 +1152,10 @@ impl RpcPromise {
         Self::from_hook(hook, Vec::new())
     }
 
+    pub(crate) fn as_stub(&self) -> &RpcStub {
+        &self.stub
+    }
+
     /// Resolves and consumes this promise handle.
     pub async fn resolve(self) -> Result<CapnwebValue> {
         pull_promise(self).await
