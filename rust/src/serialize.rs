@@ -11,10 +11,6 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use base64::Engine as _;
-use serde_json::Number;
-
-/// A JSON-compatible wire-expression tree.
-pub type WireValue = serde_json::Value;
 
 use crate::core::{
     CapnwebValue, Error, PropertyKey, Result, RpcPayload, StubHook, unwrap_stub_and_path,
@@ -364,7 +360,7 @@ impl<'a> Devaluator<'a> {
         exporter: &'a mut dyn Exporter,
         source: Option<&'a RpcPayload>,
         encoding_level: EncodingLevel,
-    ) -> Result<WireValue> {
+    ) -> Result<CapnwebValue> {
         // JS:     let devaluator = new Devaluator(exporter, source, encodingLevel);
         let mut devaluator = Self {
             exporter,
@@ -405,7 +401,7 @@ impl<'a> Devaluator<'a> {
     // `exports` is the rollback list stored on the Rust struct above.
     // JS:
     // JS:   private devaluateImpl(value: unknown, parent: object | undefined, depth: number): unknown {
-    fn devaluate_impl(&mut self, value: &CapnwebValue, depth: usize) -> Result<WireValue> {
+    fn devaluate_impl(&mut self, value: &CapnwebValue, depth: usize) -> Result<CapnwebValue> {
         let _encoding_level = self.encoding_level;
         // JS:     if (depth >= DEFAULT_MAX_DEPTH) {
         if depth >= DEFAULT_MAX_DEPTH {
@@ -449,12 +445,15 @@ impl<'a> Devaluator<'a> {
             // JS:           // Supported directly by JSON.
             // JS:           return value;
             // JS:         }
-            CapnwebValue::Null => Ok(WireValue::Null),
-            CapnwebValue::Bool(value) => Ok(WireValue::Bool(*value)),
-            CapnwebValue::String(value) => Ok(WireValue::String(value.clone())),
-            CapnwebValue::Number(value) if value.is_finite() => Number::from_f64(*value)
-                .map(WireValue::Number)
-                .ok_or_else(|| Error::Type("invalid finite number".to_owned())),
+            CapnwebValue::Null => Ok(CapnwebValue::Null),
+            CapnwebValue::Bool(value) => Ok(CapnwebValue::Bool(*value)),
+            CapnwebValue::String(value) => Ok(CapnwebValue::String(value.clone())),
+            CapnwebValue::Number(value) if value.is_finite() => Ok(CapnwebValue::Number(*value)),
+            CapnwebValue::Number(value)
+                if self.encoding_level == EncodingLevel::StructuredClonable =>
+            {
+                Ok(CapnwebValue::Number(*value))
+            }
             CapnwebValue::Number(value) if value.is_nan() => Ok(wire_tag("nan", Vec::new())),
             CapnwebValue::Number(value) if value.is_sign_positive() => {
                 Ok(wire_tag("inf", Vec::new()))
@@ -471,8 +470,8 @@ impl<'a> Devaluator<'a> {
             CapnwebValue::Object(values) => values
                 .iter()
                 .map(|(key, value)| Ok((key.clone(), self.devaluate_impl(value, depth + 1)?)))
-                .collect::<Result<serde_json::Map<_, _>>>()
-                .map(WireValue::Object),
+                .collect::<Result<BTreeMap<_, _>>>()
+                .map(CapnwebValue::Object),
             // JS:       }
             // JS:
             // JS:       case "array": {
@@ -489,7 +488,7 @@ impl<'a> Devaluator<'a> {
                     .iter()
                     .map(|value| self.devaluate_impl(value, depth + 1))
                     .collect::<Result<Vec<_>>>()?;
-                Ok(WireValue::Array(vec![WireValue::Array(values)]))
+                Ok(CapnwebValue::Array(vec![CapnwebValue::Array(values)]))
             }
             // JS:       }
             // JS:
@@ -499,9 +498,14 @@ impl<'a> Devaluator<'a> {
             // JS:           return value;
             // JS:         }
             // JS:         return ["bigint", (<bigint>value).toString()];
+            CapnwebValue::BigInt(value)
+                if self.encoding_level == EncodingLevel::StructuredClonable =>
+            {
+                Ok(CapnwebValue::BigInt(value.clone()))
+            }
             CapnwebValue::BigInt(value) => Ok(wire_tag(
                 "bigint",
-                vec![WireValue::String(value.to_string())],
+                vec![CapnwebValue::String(value.to_string())],
             )),
             // JS:
             // JS:       case "date": {
@@ -554,9 +558,17 @@ impl<'a> Devaluator<'a> {
             // JS:         }
             // JS:         b64 = b64.replace(/=+$/, "");
             // JS:         return alternateTypeName === undefined ? ["bytes", b64] : ["bytes", b64, alternateTypeName];
+            CapnwebValue::Bytes(value)
+                if matches!(
+                    self.encoding_level,
+                    EncodingLevel::StructuredClonable | EncodingLevel::JsonCompatibleWithBytes
+                ) =>
+            {
+                Ok(wire_tag("bytes", vec![CapnwebValue::Bytes(value.clone())]))
+            }
             CapnwebValue::Bytes(value) => Ok(wire_tag(
                 "bytes",
-                vec![WireValue::String(
+                vec![CapnwebValue::String(
                     base64::engine::general_purpose::STANDARD_NO_PAD.encode(value),
                 )],
             )),
@@ -789,8 +801,8 @@ impl<'a> Devaluator<'a> {
                 Ok(wire_tag(
                     "error",
                     vec![
-                        WireValue::String("Error".to_owned()),
-                        WireValue::String(error.to_string()),
+                        CapnwebValue::String("Error".to_owned()),
+                        CapnwebValue::String(error.to_string()),
                     ],
                 ))
             }
@@ -802,6 +814,9 @@ impl<'a> Devaluator<'a> {
             // JS:           return undefined;
             // JS:         }
             // JS:         return ["undefined"];
+            CapnwebValue::Undefined if self.encoding_level == EncodingLevel::StructuredClonable => {
+                Ok(CapnwebValue::Undefined)
+            }
             CapnwebValue::Undefined => Ok(wire_tag("undefined", Vec::new())),
             // JS:
             // JS:       case "stub":
@@ -907,7 +922,11 @@ impl<'a> Devaluator<'a> {
         }
         // JS:   }
     }
-    fn devaluate_stub(&mut self, stub: &crate::core::RpcStub, promise: bool) -> Result<WireValue> {
+    fn devaluate_stub(
+        &mut self,
+        stub: &crate::core::RpcStub,
+        promise: bool,
+    ) -> Result<CapnwebValue> {
         if self.source.is_none() {
             return Err(Error::Message(
                 "Can't serialize RPC stubs in this context.".to_owned(),
@@ -918,17 +937,17 @@ impl<'a> Devaluator<'a> {
         if let Some(import_id) = self.exporter.get_import(&hook) {
             if let Some(path) = path {
                 let mut expression = vec![
-                    WireValue::String("pipeline".to_owned()),
-                    WireValue::Number(import_id.into()),
+                    CapnwebValue::String("pipeline".to_owned()),
+                    CapnwebValue::Number(import_id as f64),
                 ];
                 if !path.is_empty() {
                     expression.push(property_path_to_wire(path)?);
                 }
-                return Ok(WireValue::Array(expression));
+                return Ok(CapnwebValue::Array(expression));
             }
             return Ok(wire_tag(
                 "import",
-                vec![WireValue::Number(import_id.into())],
+                vec![CapnwebValue::Number(import_id as f64)],
             ));
         }
 
@@ -940,7 +959,7 @@ impl<'a> Devaluator<'a> {
     }
     // JS:
     // JS:   private devaluateHook(type: "export" | "promise" | "writable", hook: StubHook): unknown {
-    fn devaluate_hook(&mut self, kind: &'static str, hook: StubHook) -> Result<WireValue> {
+    fn devaluate_hook(&mut self, kind: &'static str, hook: StubHook) -> Result<CapnwebValue> {
         // JS:     if (!this.exports) this.exports = [];
         // `exports` is initialized with the Rust devaluator.
         // JS:     let exportId = type === "promise" ? this.exporter.exportPromise(hook)
@@ -953,31 +972,84 @@ impl<'a> Devaluator<'a> {
         // JS:     this.exports.push(exportId);
         self.exports.push(export_id);
         // JS:     return [type, exportId];
-        Ok(wire_tag(kind, vec![WireValue::Number(export_id.into())]))
+        Ok(wire_tag(kind, vec![CapnwebValue::Number(export_id as f64)]))
         // JS:   }
     }
     // JS: }
 }
 
-fn wire_tag(tag: &str, tail: Vec<WireValue>) -> WireValue {
+fn wire_tag(tag: &str, tail: Vec<CapnwebValue>) -> CapnwebValue {
     let mut expression = Vec::with_capacity(tail.len() + 1);
-    expression.push(WireValue::String(tag.to_owned()));
+    expression.push(CapnwebValue::String(tag.to_owned()));
     expression.extend(tail);
-    WireValue::Array(expression)
+    CapnwebValue::Array(expression)
 }
 
-fn property_path_to_wire(path: Vec<PropertyKey>) -> Result<WireValue> {
+fn property_path_to_wire(path: Vec<PropertyKey>) -> Result<CapnwebValue> {
     path.into_iter()
         .map(|part| match part {
-            PropertyKey::String(value) => Ok(WireValue::String(value)),
-            PropertyKey::Number(value) => Number::from_f64(value)
-                .map(WireValue::Number)
-                .ok_or_else(|| {
-                    Error::Type("property path contains a non-finite number".to_owned())
-                }),
+            PropertyKey::String(value) => Ok(CapnwebValue::String(value)),
+            PropertyKey::Number(value) if value.is_finite() => Ok(CapnwebValue::Number(value)),
+            PropertyKey::Number(_) => Err(Error::Type(
+                "property path contains a non-finite number".to_owned(),
+            )),
         })
         .collect::<Result<Vec<_>>>()
-        .map(WireValue::Array)
+        .map(CapnwebValue::Array)
+}
+
+fn json_to_capnweb(value: serde_json::Value) -> Result<CapnwebValue> {
+    match value {
+        serde_json::Value::Null => Ok(CapnwebValue::Null),
+        serde_json::Value::Bool(value) => Ok(CapnwebValue::Bool(value)),
+        serde_json::Value::Number(value) => value
+            .as_f64()
+            .map(CapnwebValue::Number)
+            .ok_or_else(|| Error::Type("JSON number cannot be represented as f64".to_owned())),
+        serde_json::Value::String(value) => Ok(CapnwebValue::String(value)),
+        serde_json::Value::Array(values) => values
+            .into_iter()
+            .map(json_to_capnweb)
+            .collect::<Result<Vec<_>>>()
+            .map(CapnwebValue::Array),
+        serde_json::Value::Object(values) => values
+            .into_iter()
+            .map(|(key, value)| Ok((key, json_to_capnweb(value)?)))
+            .collect::<Result<BTreeMap<_, _>>>()
+            .map(CapnwebValue::Object),
+    }
+}
+
+fn capnweb_to_json(value: &CapnwebValue) -> Result<serde_json::Value> {
+    match value {
+        CapnwebValue::Null => Ok(serde_json::Value::Null),
+        CapnwebValue::Bool(value) => Ok(serde_json::Value::Bool(*value)),
+        CapnwebValue::Number(value) if value.is_finite() => serde_json::Number::from_f64(*value)
+            .map(serde_json::Value::Number)
+            .ok_or_else(|| Error::Type("invalid finite number".to_owned())),
+        CapnwebValue::String(value) => Ok(serde_json::Value::String(value.clone())),
+        CapnwebValue::Array(values) => values
+            .iter()
+            .map(capnweb_to_json)
+            .collect::<Result<Vec<_>>>()
+            .map(serde_json::Value::Array),
+        CapnwebValue::Object(values) => values
+            .iter()
+            .map(|(key, value)| Ok((key.clone(), capnweb_to_json(value)?)))
+            .collect::<Result<serde_json::Map<_, _>>>()
+            .map(serde_json::Value::Object),
+        CapnwebValue::Undefined
+        | CapnwebValue::Number(_)
+        | CapnwebValue::BigInt(_)
+        | CapnwebValue::Bytes(_)
+        | CapnwebValue::Function(_)
+        | CapnwebValue::Stub(_)
+        | CapnwebValue::RpcPromise(_)
+        | CapnwebValue::Target(_)
+        | CapnwebValue::Error(_) => Err(Error::Type(
+            "devalued string-level tree contains a non-JSON value".to_owned(),
+        )),
+    }
 }
 // JS:
 // JS: /**
@@ -991,7 +1063,8 @@ fn property_path_to_wire(path: Vec<PropertyKey>) -> Result<WireValue> {
 pub fn serialize(value: &CapnwebValue) -> Result<String> {
     let mut exporter = NULL_EXPORTER;
     let wire = Devaluator::devaluate(value, &mut exporter, None, EncodingLevel::String)?;
-    serde_json::to_string(&wire)
+    let json = capnweb_to_json(&wire)?;
+    serde_json::to_string(&json)
         .map_err(|error| Error::Message(format!("failed to encode JSON: {error}")))
 }
 // JS:
@@ -1132,14 +1205,14 @@ impl<'a> Evaluator<'a> {
     // JS:
     // JS:   public evaluate(value: unknown): RpcPayload {
     /// Evaluates a complete wire expression.
-    pub fn evaluate(&mut self, value: WireValue) -> Result<RpcPayload> {
+    pub fn evaluate(&mut self, value: CapnwebValue) -> Result<RpcPayload> {
         // JS:     return this.evaluateWithDepth(value, 0);
         self.evaluate_with_depth(value, 0)
         // JS:   }
     }
     // JS:
     // JS:   private evaluateWithDepth(value: unknown, depth: number): RpcPayload {
-    fn evaluate_with_depth(&mut self, value: WireValue, depth: usize) -> Result<RpcPayload> {
+    fn evaluate_with_depth(&mut self, value: CapnwebValue, depth: usize) -> Result<RpcPayload> {
         // JS:     let payload = RpcPayload.forEvaluate(this.hooks, this.promises);
         // Rust constructs the owned payload after successfully evaluating its value.
         // JS:     try {
@@ -1160,7 +1233,7 @@ impl<'a> Evaluator<'a> {
     // Evaluate the value without destroying it.
     // JS:   public evaluateCopy(value: unknown): RpcPayload {
     /// Evaluates a cloned wire expression without mutating the caller's tree.
-    pub fn evaluate_copy(&mut self, value: &WireValue) -> Result<RpcPayload> {
+    pub fn evaluate_copy(&mut self, value: &CapnwebValue) -> Result<RpcPayload> {
         // JS:     return this.evaluate(structuredClone(value));
         self.evaluate(value.clone())
         // JS:   }
@@ -1168,7 +1241,7 @@ impl<'a> Evaluator<'a> {
     // JS:
     // JS:   private evaluateImpl(
     // JS:       value: unknown, parent: object, property: string | number, depth: number): unknown {
-    fn evaluate_impl(&mut self, value: WireValue, depth: usize) -> Result<CapnwebValue> {
+    fn evaluate_impl(&mut self, value: CapnwebValue, depth: usize) -> Result<CapnwebValue> {
         // JS:     let maxDepth = this.limits.maxDepth;
         let max_depth = self.limits.max_depth;
         // JS:     if (depth >= maxDepth) {
@@ -1187,19 +1260,24 @@ impl<'a> Evaluator<'a> {
         // JS:     // and `Error` values are intentionally *not* accepted here.
         // JS:     if (this.encodingLevel === "structuredClonable") {
         // JS:       if (value instanceof Date || typeof value === "bigint") {
-        // JS:         return value;
-        // JS:       }
+        if self.encoding_level == EncodingLevel::StructuredClonable
+            && matches!(&value, CapnwebValue::BigInt(_))
+        {
+            // JS:         return value;
+            return Ok(value);
+            // JS:       }
+        }
         // JS:     }
-        // RUST-DEFERRED(JS built-in: structured clone): native Date and BigInt objects are not input.
+        // RUST-DEFERRED(JS built-in: structured clone Date): no dynamic Date variant exists.
         // JS:
         // JS:     if (value instanceof Array) {
         match value {
-            WireValue::Array(mut expression) => {
+            CapnwebValue::Array(mut expression) => {
                 // JS:       if (value.length == 1 && value[0] instanceof Array) {
-                if expression.len() == 1 && expression.first().is_some_and(WireValue::is_array) {
+                if expression.len() == 1 && expression.first().is_some_and(CapnwebValue::is_array) {
                     // JS:         // Escaped array. Evaluate the contents.
                     // JS:         let result = value[0];
-                    let WireValue::Array(result) = expression.remove(0) else {
+                    let CapnwebValue::Array(result) = expression.remove(0) else {
                         unreachable!();
                     };
                     // JS:         for (let i = 0; i < result.length; i++) {
@@ -1217,7 +1295,7 @@ impl<'a> Evaluator<'a> {
                 }
                 let tag = expression
                     .first()
-                    .and_then(WireValue::as_str)
+                    .and_then(CapnwebValue::as_str)
                     .ok_or_else(|| unknown_special(&expression))?
                     .to_owned();
                 match tag.as_str() {
@@ -1322,13 +1400,20 @@ impl<'a> Evaluator<'a> {
                     // JS:           }
                     // JS:         }
                     "bytes" if expression.len() == 2 || expression.len() == 3 => {
-                        let encoded = expression[1]
-                            .as_str()
-                            .ok_or_else(|| unknown_special(&expression))?;
-                        let bytes = base64::engine::general_purpose::STANDARD_NO_PAD
-                            .decode(encoded)
-                            .or_else(|_| base64::engine::general_purpose::STANDARD.decode(encoded))
-                            .map_err(|_| Error::Type("invalid base64 byte string".to_owned()))?;
+                        let bytes = match &expression[1] {
+                            CapnwebValue::Bytes(bytes) => bytes.clone(),
+                            CapnwebValue::String(encoded) => {
+                                base64::engine::general_purpose::STANDARD_NO_PAD
+                                    .decode(encoded)
+                                    .or_else(|_| {
+                                        base64::engine::general_purpose::STANDARD.decode(encoded)
+                                    })
+                                    .map_err(|_| {
+                                        Error::Type("invalid base64 byte string".to_owned())
+                                    })?
+                            }
+                            _ => return Err(unknown_special(&expression)),
+                        };
                         if let Some(marker) = expression.get(2) {
                             validate_byte_marker(marker, bytes.len())?;
                         }
@@ -1612,7 +1697,8 @@ impl<'a> Evaluator<'a> {
                         // JS:           let subEval = new Evaluator(this.importer);
                         // The same evaluator can recurse because Rust borrows it exclusively.
                         // JS:           args = subEval.evaluateWithDepth([args], depth);
-                        let args = self.evaluate_with_depth(WireValue::Array(vec![args]), depth)?;
+                        let args =
+                            self.evaluate_with_depth(CapnwebValue::Array(vec![args]), depth)?;
                         // JS:
                         // JS:           return addStub(hook.call(path, args));
                         Ok(add_stub(hook.call(path, args)?))
@@ -1663,7 +1749,7 @@ impl<'a> Evaluator<'a> {
                                     .as_array()
                                     .filter(|capture| capture.len() == 2)
                                     .ok_or_else(|| {
-                                        Error::Type(format!("unknown map capture: {capture}"))
+                                        Error::Type(format!("unknown map capture: {capture:?}"))
                                     })?;
                                 let id = wire_id(&capture[1])?;
                                 // JS:               throw new TypeError(`unknown map capture: ${JSON.stringify(cap)}`);
@@ -1784,7 +1870,7 @@ impl<'a> Evaluator<'a> {
                 // Unknown tags take the error arm above.
                 // JS:     } else if (value instanceof Object) {
             }
-            WireValue::Object(values) => {
+            CapnwebValue::Object(values) => {
                 // JS:       let result = <Record<string, unknown>>value;
                 let mut result = BTreeMap::new();
                 // JS:       for (let key in result) {
@@ -1821,13 +1907,20 @@ impl<'a> Evaluator<'a> {
             // JS:       // Other JSON types just pass through.
             // Other JSON types pass through as the corresponding dynamic primitive.
             // JS:       return value;
-            WireValue::Null => Ok(CapnwebValue::Null),
-            WireValue::Bool(value) => Ok(CapnwebValue::Bool(value)),
-            WireValue::Number(value) => value
-                .as_f64()
-                .map(CapnwebValue::Number)
-                .ok_or_else(|| Error::Type("JSON number cannot be represented as f64".to_owned())),
-            WireValue::String(value) => Ok(CapnwebValue::String(value)),
+            CapnwebValue::Null => Ok(CapnwebValue::Null),
+            CapnwebValue::Bool(value) => Ok(CapnwebValue::Bool(value)),
+            CapnwebValue::Number(value) => Ok(CapnwebValue::Number(value)),
+            CapnwebValue::String(value) => Ok(CapnwebValue::String(value)),
+            CapnwebValue::Undefined => Ok(CapnwebValue::Undefined),
+            CapnwebValue::BigInt(_)
+            | CapnwebValue::Bytes(_)
+            | CapnwebValue::Function(_)
+            | CapnwebValue::Stub(_)
+            | CapnwebValue::RpcPromise(_)
+            | CapnwebValue::Target(_)
+            | CapnwebValue::Error(_) => Err(Error::Type(
+                "encoded input contains an unsupported native value".to_owned(),
+            )),
             // JS:     }
         }
         // JS:   }
@@ -1835,23 +1928,20 @@ impl<'a> Evaluator<'a> {
     // JS: }
 }
 
-fn wire_id(value: &WireValue) -> Result<i64> {
+fn wire_id(value: &CapnwebValue) -> Result<i64> {
     value
         .as_i64()
         .ok_or_else(|| Error::Type("RPC table ID must be an integer".to_owned()))
 }
 
-fn property_path_from_wire(value: &WireValue) -> Result<Vec<PropertyKey>> {
+fn property_path_from_wire(value: &CapnwebValue) -> Result<Vec<PropertyKey>> {
     value
         .as_array()
         .ok_or_else(|| Error::Type("property path must be an array".to_owned()))?
         .iter()
         .map(|part| match part {
-            WireValue::String(value) => Ok(PropertyKey::String(value.clone())),
-            WireValue::Number(value) => value
-                .as_f64()
-                .map(PropertyKey::Number)
-                .ok_or_else(|| Error::Type("invalid numeric property path component".to_owned())),
+            CapnwebValue::String(value) => Ok(PropertyKey::String(value.clone())),
+            CapnwebValue::Number(value) => Ok(PropertyKey::Number(*value)),
             _ => Err(Error::Type(
                 "property path components must be strings or numbers".to_owned(),
             )),
@@ -1859,10 +1949,10 @@ fn property_path_from_wire(value: &WireValue) -> Result<Vec<PropertyKey>> {
         .collect()
 }
 
-fn unknown_special(expression: &[WireValue]) -> Error {
+fn unknown_special(expression: &[CapnwebValue]) -> Error {
     Error::Type(format!(
-        "unknown special value: {}",
-        WireValue::Array(expression.to_vec())
+        "unknown special value: {:?}",
+        CapnwebValue::Array(expression.to_vec())
     ))
 }
 
@@ -1885,7 +1975,7 @@ fn is_blocked_object_property(property: &str) -> bool {
         )
 }
 
-fn validate_byte_marker(marker: &WireValue, byte_len: usize) -> Result<()> {
+fn validate_byte_marker(marker: &CapnwebValue, byte_len: usize) -> Result<()> {
     let marker = marker
         .as_str()
         .ok_or_else(|| Error::Type("bytes type marker must be a string".to_owned()))?;
@@ -1920,8 +2010,9 @@ fn validate_byte_marker(marker: &WireValue, byte_len: usize) -> Result<()> {
 // JS: }
 /// Deserializes a standalone Cap'n Web JSON value.
 pub fn deserialize(value: &str) -> Result<CapnwebValue> {
-    let wire = serde_json::from_str(value)
+    let json = serde_json::from_str(value)
         .map_err(|error| Error::Type(format!("invalid JSON: {error}")))?;
+    let wire = json_to_capnweb(json)?;
     let mut importer = NULL_IMPORTER;
     let payload = Evaluator::new(&mut importer, EncodingLevel::String).evaluate(wire)?;
     Ok(payload.value)

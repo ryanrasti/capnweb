@@ -88,6 +88,40 @@ impl std::fmt::Debug for CapnwebValue {
     }
 }
 
+impl CapnwebValue {
+    pub(crate) fn is_array(&self) -> bool {
+        matches!(self, Self::Array(_))
+    }
+
+    pub(crate) fn as_array(&self) -> Option<&Vec<Self>> {
+        match self {
+            Self::Array(value) => Some(value),
+            _ => None,
+        }
+    }
+
+    pub(crate) fn as_str(&self) -> Option<&str> {
+        match self {
+            Self::String(value) => Some(value),
+            _ => None,
+        }
+    }
+
+    pub(crate) fn as_i64(&self) -> Option<i64> {
+        match self {
+            Self::Number(value)
+                if value.is_finite()
+                    && value.fract() == 0.0
+                    && *value >= i64::MIN as f64
+                    && *value <= i64::MAX as f64 =>
+            {
+                Some(*value as i64)
+            }
+            _ => None,
+        }
+    }
+}
+
 impl From<()> for CapnwebValue {
     fn from((): ()) -> Self {
         Self::Undefined
@@ -179,7 +213,7 @@ impl<T: RpcTargetInner> RpcTarget for T {}
 pub type PropertyPath = Vec<PropertyKey>;
 
 /// Raw wire expressions interpreted by the map runtime.
-pub type MapInstructions = Vec<serde_json::Value>;
+pub type MapInstructions = Vec<CapnwebValue>;
 
 /// One component of an RPC property path.
 #[derive(Clone, Debug, PartialEq)]
