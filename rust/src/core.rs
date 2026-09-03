@@ -27,9 +27,6 @@ pub enum Error {
     /// A deliberately deferred JavaScript built-in was requested.
     #[error("JavaScript built-in `{0}` is not supported by the Rust runtime")]
     UnsupportedBuiltin(&'static str),
-    /// An operation used a disposed RPC reference.
-    #[error("Attempted to use RPC stub after it has been disposed.")]
-    Disposed,
 }
 
 /// The result type used by the RPC runtime.
@@ -540,7 +537,7 @@ pub trait StubHookInner: Send + Sync {
         let pulled = match hook.pull() {
             Ok(pulled) => pulled,
             Err(error) => {
-                hook.dispose();
+                drop(hook);
                 return Err(error);
             }
         };
@@ -548,11 +545,11 @@ pub trait StubHookInner: Send + Sync {
         let promise: Pin<Box<dyn Future<Output = Result<()>> + Send + 'static>> = match pulled {
             MaybePromise::Pending(pending) => Box::pin(async move {
                 let payload = pending.await?;
-                payload.dispose();
+                drop(payload);
                 Ok(())
             }),
             MaybePromise::Immediate(payload) => {
-                payload.dispose();
+                drop(payload);
                 Box::pin(async { Ok(()) })
             }
         };
@@ -606,8 +603,7 @@ pub trait StubHookInner: Send + Sync {
     // JS:   // The returned hook is NOT considered a promise, so will not resolve to a payload (you can use
     // JS:   // `get([])` to get a promise for a cloned payload).
     // JS:   abstract dup(): StubHook;
-    /// Creates an independently disposable logical RPC reference.
-    fn dup(&self) -> StubHook;
+    // RUST-DIFF(local refcount): callers use `Arc::clone()` instead of a hook-level `dup()`.
     // JS:
     // JS:   // Requests resolution of a StubHook that represents a promise, and eventually produces the
     // JS:   // payload.
@@ -649,8 +645,7 @@ pub trait StubHookInner: Send + Sync {
     // JS:   // pull() would return (if any). If a pull() promise is outstanding, it may still resolve (with
     // JS:   // a disposed payload) or it may reject. It's safe to call dispose() multiple times.
     // JS:   abstract dispose(): void;
-    /// Cancels outstanding work and releases this logical reference idempotently.
-    fn dispose(&self);
+    // RUST-DIFF(local refcount): dropping the final `Arc` cancels and releases the hook.
     // JS:
     // JS:   abstract onBroken(callback: (error: any) => void): void;
     /// Invokes `callback` when this hook becomes permanently broken.
@@ -681,7 +676,7 @@ impl ErrorStubHook {
 impl StubHookInner for ErrorStubHook {
     // JS:   call(path: PropertyPath, args: RpcPayload): StubHook { args.dispose(); return this; }
     fn call(&self, _path: PropertyPath, args: RpcPayload) -> Result<StubHook> {
-        args.dispose();
+        drop(args);
         Ok(self.new_hook())
     }
     // JS:   map(path: PropertyPath, captures: StubHook[], instructions: unknown[]): StubHook {
@@ -694,7 +689,7 @@ impl StubHookInner for ErrorStubHook {
         // JS:     for (let cap of captures) {
         for capture in captures {
             // JS:       cap.dispose();
-            capture.dispose();
+            drop(capture);
             // JS:     }
         }
         // JS:     return this;
@@ -706,9 +701,7 @@ impl StubHookInner for ErrorStubHook {
         Ok(self.new_hook())
     }
     // JS:   dup(): StubHook { return this; }
-    fn dup(&self) -> StubHook {
-        self.new_hook()
-    }
+    // RUST-DIFF(local refcount): `Arc::clone()` shares this stateless broken hook.
     // JS:   pull(): RpcPayload | Promise<RpcPayload> { return Promise.reject(this.error); }
     fn pull(&self) -> Result<MaybePromise<RpcPayload>> {
         let error = self.error.clone();
@@ -717,7 +710,7 @@ impl StubHookInner for ErrorStubHook {
     // JS:   ignoreUnhandledRejections(): void {}
     fn ignore_unhandled_rejections(&self) {}
     // JS:   dispose(): void {}
-    fn dispose(&self) {}
+    // RUST-DIFF(local refcount): dropping an ErrorStubHook requires no explicit work.
     // JS:   onBroken(callback: (error: any) => void): void {
     fn on_broken(&self, callback: Box<dyn FnOnce(Error) + Send + 'static>) {
         // JS:     try {
@@ -739,8 +732,7 @@ impl StubHookInner for ErrorStubHook {
 // JS:
 // JS: const DISPOSED_HOOK: StubHook = new ErrorStubHook(
 // JS:     new Error("Attempted to use RPC stub after it has been disposed."));
-static DISPOSED_HOOK: std::sync::LazyLock<StubHook> =
-    std::sync::LazyLock::new(|| Arc::new(ErrorStubHook::new(Error::Disposed)));
+// RUST-DIFF(local refcount): moves and `Drop` make a reusable disposed sentinel unrepresentable.
 // JS:
 // JS: // A call interceptor can be used to intercept all RPC stub invocations within some synchronous
 // JS: // scope. This is used to implement record/replay
@@ -800,6 +792,7 @@ pub(crate) fn with_call_interceptor<T>(
 // JS:   // Declare magic `RAW_STUB` key that unwraps the proxy.
 // JS:   [RAW_STUB]: this;
 // JS: }
+// RUST-DIFF(JS Proxy): generated typed wrappers hold an ordinary `RpcStub` directly.
 // JS:
 // JS: const PROXY_HANDLERS: ProxyHandler<{raw: RpcStub}> = {
 // JS:   apply(target: {raw: RpcStub}, thisArg: any, argumentsList: any[]) {
@@ -895,6 +888,8 @@ pub(crate) fn with_call_interceptor<T>(
 // JS:     throw new Error("Can't override prototype of RPC stubs.");
 // JS:   },
 // JS: };
+// RUST-DIFF(JS Proxy): `#[rpc_interface]` emits only declared calls and properties, so unsupported
+// Proxy traps are unrepresentable in the typed Rust API.
 // JS:
 // JS: // Implementation of RpcStub.
 // JS: //
@@ -905,6 +900,7 @@ pub(crate) fn with_call_interceptor<T>(
 // JS:   // Although `hook` and `path` are declared `public` here, they are effectively hidden by the
 // JS:   // proxy.
 // JS:   constructor(hook: StubHook, pathIfPromise?: PropertyPath) {
+// The constructor translation follows the two fields so Rust can declare the complete struct.
 // JS:     super();
 // JS:
 // JS:     if (!(hook instanceof StubHook)) {
@@ -940,6 +936,51 @@ pub(crate) fn with_call_interceptor<T>(
 // JS:
 // JS:   public hook: StubHook;
 // JS:   public pathIfPromise?: PropertyPath;
+/// An untyped RPC capability reference.
+#[derive(Clone)]
+pub struct RpcStub {
+    hook: StubHook,
+    path_if_promise: Option<PropertyPath>,
+}
+
+impl RpcStub {
+    pub(crate) fn from_hook(hook: StubHook, path_if_promise: Option<PropertyPath>) -> Self {
+        Self {
+            hook,
+            path_if_promise,
+        }
+    }
+
+    /// Constructs a stub which adopts an application value.
+    pub fn from_value(value: CapnwebValue) -> Self {
+        let hook = match value {
+            CapnwebValue::Target(target) | CapnwebValue::Function(target) => {
+                TargetStubHook::create(target, None)
+            }
+            value => Arc::new(PayloadStubHook::new(RpcPayload::from_app_return(value))),
+        };
+        Self::from_hook(hook, None)
+    }
+
+    fn current_hook(&self) -> StubHook {
+        Arc::clone(&self.hook)
+    }
+
+    pub(crate) fn property(&self, property: PropertyKey) -> RpcPromise {
+        let mut path = self.path_if_promise.clone().unwrap_or_default();
+        path.push(property);
+        RpcPromise::from_hook(self.current_hook(), path)
+    }
+
+    pub(crate) fn call_path(&self, args: RpcPayload) -> Result<RpcPromise> {
+        let hook = do_call(
+            self.current_hook(),
+            self.path_if_promise.clone().unwrap_or_default(),
+            args,
+        )?;
+        Ok(RpcPromise::from_hook(hook, Vec::new()))
+    }
+}
 // JS:
 // JS:   dup(): RpcStub {
 // JS:     // Unfortunately the method will be invoked with `this` being the Proxy, not the `RpcPromise`
@@ -956,20 +997,39 @@ pub(crate) fn with_call_interceptor<T>(
 // JS:       return new RpcStub(target.hook.dup());
 // JS:     }
 // JS:   }
+// RUST-DIFF(local refcount): `RpcStub::clone()` retains the same typed path and shares its hook.
 // JS:
 // JS:   onRpcBroken(callback: (error: any) => void) {
-// JS:     this[RAW_STUB].hook.onBroken(callback);
-// JS:   }
+/// Registers a callback for permanent capability failure.
+pub fn on_rpc_broken(&self, callback: impl FnOnce(Error) + Send + 'static) {
+    // JS:     this[RAW_STUB].hook.onBroken(callback);
+    self.hook.on_broken(Box::new(callback));
+    // JS:   }
+}
 // JS:
 // JS:   map(func: (value: RpcPromise) => unknown): RpcPromise {
-// JS:     let {hook, pathIfPromise} = this[RAW_STUB];
-// JS:     return mapImpl.sendMap(hook, pathIfPromise || [], func);
-// JS:   }
+/// Builds and sends a wire-level map operation without first pulling this value.
+pub fn map(
+    &self,
+    function: impl FnOnce(RpcPromise) -> Result<CapnwebValue> + Send + 'static,
+) -> Result<RpcPromise> {
+    // JS:     let {hook, pathIfPromise} = this[RAW_STUB];
+    let hook = self.current_hook();
+    let path = self.path_if_promise.clone().unwrap_or_default();
+    // JS:     return mapImpl.sendMap(hook, pathIfPromise || [], func);
+    loaded_map_impl()?.send_map(hook, path, Box::new(function))
+    // JS:   }
+}
 // JS:
 // JS:   toString() {
 // JS:     return "[object RpcStub]";
 // JS:   }
 // JS: }
+impl std::fmt::Display for RpcStub {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("[object RpcStub]")
+    }
+}
 // JS:
 // JS: export class RpcPromise extends RpcStub {
 // JS:   // Internally, an `RpcPromise` is constructed from a `StubHook` plus a property path. The

@@ -56,7 +56,7 @@ JavaScript comments and blank lines are also preserved:
 // JS:
 
 // JS:   // Create a clone which can be disposed independently.
-// Create a clone which can be dropped independently.
+// RUST-DIFF(local refcount): ordinary `Clone` and `Drop` provide the Rust lifetime semantics.
 ```
 
 The text following `// JS:` must match the original source line exactly. The source lines must occur
@@ -122,13 +122,24 @@ ownership system:
 - `Drop`;
 - owned moves and borrows.
 
-The Rust code must preserve observable disposal timing and independent-reference semantics. An
-`Arc::clone()` must not replace a JavaScript `dup()` when `dup()` creates an independently disposable
-RPC reference.
+JavaScript `dup()`, explicit hook `dispose()`, disposed sentinels, and local integer refcounts are
+removed when they exist only to emulate ownership. Rust uses ordinary `Clone`, moves, and `Drop`:
 
-Wire-visible reference accounting is not covered by this exception. Import/export counts,
-introduction counts, `release` messages, remote reference counts, and protocol-visible disposal are
-translated exactly because they are part of Cap'n Web behavior.
+- `Arc::clone()` creates another local handle to the same logical capability;
+- dropping the last local handle performs cancellation or release;
+- payload ownership recursively drops contained handles;
+- promise adoption consumes the source value;
+- use after disposal or adoption is prevented by the type system;
+- explicit early disposal uses `drop(value)` or a consuming convenience method.
+
+The JavaScript behavior where `RpcPromise.dup()` changes a promise into a non-promise stub is not
+carried into the Rust API. Any required internal type conversion is explicit and consuming.
+
+This intentionally trades a small local-lifetime divergence for substantially less state-machine
+code and an idiomatic Rust API. Wire-visible reference accounting is not covered by this exception.
+Import/export counts, introduction counts, `release` messages, remote reference counts, and
+serialization of repeated references are translated exactly because they are part of Cap'n Web
+behavior.
 
 ### 3. JavaScript Proxy and reflection
 
@@ -195,7 +206,7 @@ including internal test-only surfaces such as:
 - controllable transports and injected failures;
 - transport logs and wire-message inspection;
 - fences and pending-message counts;
-- explicit disposal;
+- deterministic release through `Drop` and explicit `drop(value)`;
 - brokenness callbacks;
 - session statistics and draining;
 - promise resolvers;
