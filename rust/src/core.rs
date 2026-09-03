@@ -140,6 +140,9 @@ pub trait RpcTarget: RpcTargetInner {
 pub trait RpcTargetInner: Send + Sync + 'static {
     /// Dispatches a call after generated property-path lookup.
     fn call(self: Arc<Self>, path: PropertyPath, args: RpcPayload) -> Result<StubHook>;
+
+    /// Dispatches a generated getter after property-path lookup.
+    fn get(self: Arc<Self>, path: PropertyPath) -> Result<StubHook>;
 }
 
 impl<T: RpcTargetInner> RpcTarget for T {}
@@ -964,9 +967,8 @@ impl RpcStub {
     /// Constructs a stub which adopts an application value.
     pub fn from_value(value: CapnwebValue) -> Self {
         let hook = match value {
-            CapnwebValue::Target(target) | CapnwebValue::Function(target) => {
-                TargetStubHook::create(target, None)
-            }
+            CapnwebValue::Target(target) => TargetStubHook::create(target, false),
+            CapnwebValue::Function(target) => TargetStubHook::create(target, true),
             value => Arc::new(PayloadStubHook::new(RpcPayload::from_app_return(value))),
         };
         Self::from_hook(hook, None)
@@ -2514,9 +2516,15 @@ fn follow_path(
                 }
                 _ => CapnwebValue::Null,
             },
-            CapnwebValue::Target(target) | CapnwebValue::Function(target) => {
+            CapnwebValue::Target(target) => {
                 return Ok(FollowPathResult::Hook {
-                    hook: TargetStubHook::create(target, None),
+                    hook: TargetStubHook::create(target, false),
+                    remaining_path: remainder(),
+                });
+            }
+            CapnwebValue::Function(target) => {
+                return Ok(FollowPathResult::Hook {
+                    hook: TargetStubHook::create(target, true),
                     remaining_path: remainder(),
                 });
             }
@@ -2678,6 +2686,96 @@ fn is_object_prototype_property(property: &str) -> bool {
 // JS:     }
 // JS:   }
 // JS: }
+trait ValueStubHook: Send + Sync + 'static {
+    fn get_value(&self) -> (CapnwebValue, Option<RpcPayload>);
+
+    fn call_value(&self, path: PropertyPath, args: RpcPayload) -> Result<StubHook> {
+        let (value, owner) = self.get_value();
+        let followed = match follow_path(value, path.clone(), owner) {
+            Ok(followed) => followed,
+            Err(error) => {
+                drop(args);
+                return Ok(Arc::new(ErrorStubHook::new(error)));
+            }
+        };
+
+        match followed {
+            FollowPathResult::Hook {
+                hook,
+                remaining_path,
+            } => hook.call(remaining_path, args),
+            FollowPathResult::Value {
+                value: CapnwebValue::Function(target),
+                ..
+            } => target.call(Vec::new(), args),
+            FollowPathResult::Value { .. } => {
+                drop(args);
+                let path = path
+                    .iter()
+                    .map(|part| match part {
+                        PropertyKey::String(value) => value.clone(),
+                        PropertyKey::Number(value) => value.to_string(),
+                    })
+                    .collect::<Vec<_>>()
+                    .join(".");
+                Ok(Arc::new(ErrorStubHook::new(Error::Type(format!(
+                    "'{path}' is not a function."
+                )))))
+            }
+        }
+    }
+
+    fn map_value(
+        &self,
+        path: PropertyPath,
+        captures: Vec<StubHook>,
+        instructions: Vec<CapnwebValue>,
+    ) -> Result<StubHook> {
+        let (value, owner) = self.get_value();
+        let followed = match follow_path(value, path, owner) {
+            Ok(followed) => followed,
+            Err(error) => {
+                drop(captures);
+                return Ok(Arc::new(ErrorStubHook::new(error)));
+            }
+        };
+
+        let result = match followed {
+            FollowPathResult::Hook {
+                hook,
+                remaining_path,
+            } => hook.map(remaining_path, captures, instructions),
+            FollowPathResult::Value { value, owner } => {
+                loaded_map_impl()?.apply_map(value, None, owner.as_ref(), captures, instructions)
+            }
+        };
+
+        match result {
+            Ok(hook) => Ok(hook),
+            Err(error) => Ok(Arc::new(ErrorStubHook::new(error))),
+        }
+    }
+
+    fn get_value_at(&self, path: PropertyPath) -> Result<StubHook> {
+        let (value, owner) = self.get_value();
+        if path.is_empty() && owner.is_none() {
+            return Ok(Arc::new(ErrorStubHook::new(Error::Message(
+                "Can't clone an RpcTarget stub as a promise.".to_owned(),
+            ))));
+        }
+
+        match follow_path(value, path, owner) {
+            Ok(FollowPathResult::Hook {
+                hook,
+                remaining_path,
+            }) => hook.get(remaining_path),
+            Ok(FollowPathResult::Value { value, owner }) => Ok(Arc::new(PayloadStubHook::new(
+                RpcPayload::deep_copy_from(&value, None, owner.as_ref()),
+            ))),
+            Err(error) => Ok(Arc::new(ErrorStubHook::new(error))),
+        }
+    }
+}
 // JS:
 // JS: // StubHook wrapping an RpcPayload in local memory.
 // JS: //
@@ -2754,6 +2852,59 @@ fn is_object_prototype_property(property: &str) -> bool {
 // JS:     }
 // JS:   }
 // JS: }
+/// A hook backed by an immutable, locally-owned payload.
+#[derive(Clone, Debug)]
+pub struct PayloadStubHook {
+    payload: RpcPayload,
+}
+
+impl PayloadStubHook {
+    /// Wraps a locally-owned payload.
+    pub fn new(payload: RpcPayload) -> Self {
+        Self { payload }
+    }
+}
+
+impl ValueStubHook for PayloadStubHook {
+    fn get_value(&self) -> (CapnwebValue, Option<RpcPayload>) {
+        (self.payload.value.clone(), Some(self.payload.clone()))
+    }
+}
+
+impl StubHookInner for PayloadStubHook {
+    fn call(&self, path: PropertyPath, args: RpcPayload) -> Result<StubHook> {
+        self.call_value(path, args)
+    }
+
+    fn map(
+        &self,
+        path: PropertyPath,
+        captures: Vec<StubHook>,
+        instructions: Vec<CapnwebValue>,
+    ) -> Result<StubHook> {
+        self.map_value(path, captures, instructions)
+    }
+
+    fn get(&self, path: PropertyPath) -> Result<StubHook> {
+        self.get_value_at(path)
+    }
+
+    fn pull(&self) -> Result<MaybePromise<RpcPayload>> {
+        Ok(MaybePromise::Immediate(self.payload.clone()))
+    }
+
+    fn ignore_unhandled_rejections(&self) {
+        self.payload.ignore_unhandled_rejections();
+    }
+
+    fn on_broken(&self, callback: Box<dyn FnOnce(Error) + Send + 'static>) {
+        match &self.payload.value {
+            CapnwebValue::Stub(stub) => stub.hook.on_broken(callback),
+            CapnwebValue::RpcPromise(promise) => promise.stub.hook.on_broken(callback),
+            _ => drop(callback),
+        }
+    }
+}
 // JS:
 // JS: function disposeRpcTarget(target: RpcTarget | Function) {
 // JS:   if (Symbol.dispose in target) {
@@ -2767,6 +2918,7 @@ fn is_object_prototype_property(property: &str) -> bool {
 // JS:     }
 // JS:   }
 // JS: }
+// RUST-DIFF(local refcount): the concrete target's `Drop` runs when its final `Arc` is dropped.
 // JS:
 // JS: // Many TargetStubHooks could point at the same RpcTarget. We store a refcount in a separate
 // JS: // object that they all share.
@@ -2775,6 +2927,7 @@ fn is_object_prototype_property(property: &str) -> bool {
 // JS: // the same RpcTarget into the RPC system multiple times, we need to call this disposer multiple
 // JS: // times for consistency.
 // JS: type BoxedRefcount = { count: number };
+// RUST-DIFF(local refcount): `Arc<dyn RpcTargetInner>` is the boxed target refcount.
 // JS:
 // JS: // StubHook which wraps an RpcTarget. This has similarities to PayloadStubHook (especially when
 // JS: // the root of the payload happens to be an RpcTarget), but there can only be one RpcPayload
@@ -2872,6 +3025,60 @@ fn is_object_prototype_property(property: &str) -> bool {
 // JS:     // TODO: Should non-thenable RpcTargets be able to implement onRpcBroken?
 // JS:   }
 // JS: }
+#[derive(Clone)]
+struct TargetStubHook {
+    target: Arc<dyn RpcTargetInner>,
+    callable: bool,
+}
+
+impl TargetStubHook {
+    fn create(target: Arc<dyn RpcTargetInner>, callable: bool) -> StubHook {
+        Arc::new(Self { target, callable })
+    }
+}
+
+impl ValueStubHook for TargetStubHook {
+    fn get_value(&self) -> (CapnwebValue, Option<RpcPayload>) {
+        let value = if self.callable {
+            CapnwebValue::Function(Arc::clone(&self.target))
+        } else {
+            CapnwebValue::Target(Arc::clone(&self.target))
+        };
+        (value, None)
+    }
+}
+
+impl StubHookInner for TargetStubHook {
+    fn call(&self, path: PropertyPath, args: RpcPayload) -> Result<StubHook> {
+        Arc::clone(&self.target).call(path, args)
+    }
+
+    fn map(
+        &self,
+        path: PropertyPath,
+        captures: Vec<StubHook>,
+        instructions: Vec<CapnwebValue>,
+    ) -> Result<StubHook> {
+        let property = Arc::clone(&self.target).get(path)?;
+        property.map(Vec::new(), captures, instructions)
+    }
+
+    fn get(&self, path: PropertyPath) -> Result<StubHook> {
+        Arc::clone(&self.target).get(path)
+    }
+
+    fn pull(&self) -> Result<MaybePromise<RpcPayload>> {
+        Ok(MaybePromise::Pending(Box::pin(async {
+            Err(Error::Message(
+                "Tried to resolve a non-promise stub.".to_owned(),
+            ))
+        })))
+    }
+
+    fn ignore_unhandled_rejections(&self) {}
+
+    fn on_broken(&self, _callback: Box<dyn FnOnce(Error) + Send + 'static>) {}
+}
 // JS:
 // JS: // StubHook derived from a Promise for some other StubHook. Waits for the promise and then
 // JS: // forward calls, being careful to honor e-order.

@@ -171,6 +171,7 @@ The generated target boundary uses an object-safe runtime trait equivalent to:
 ```rust
 trait RpcTargetInner {
     fn call(self: Arc<Self>, path: PropertyPath, args: RpcPayload) -> Result<StubHook>;
+    fn get(self: Arc<Self>, path: PropertyPath) -> Result<StubHook>;
 }
 ```
 
