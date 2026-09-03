@@ -13,7 +13,8 @@ use std::sync::Arc;
 use base64::Engine as _;
 
 use crate::core::{
-    CapnwebValue, Error, PropertyKey, Result, RpcPayload, StubHook, unwrap_stub_and_path,
+    CapnwebError, CapnwebValue, Error, PropertyKey, Result, RpcPayload, StubHook,
+    unwrap_stub_and_path,
 };
 // JS:
 // JS: export type ImportId = number;
@@ -249,7 +250,7 @@ pub trait Exporter {
     // JS:
     // JS:   onSendError(error: Error): Error | void;
     /// Optionally replaces an error raised while sending.
-    fn on_send_error(&mut self, error: Error) -> Option<Error>;
+    fn on_send_error(&mut self, error: CapnwebError) -> Option<CapnwebError>;
     // JS: }
 }
 // JS:
@@ -290,7 +291,7 @@ impl Exporter for NullExporter {
     // RUST-DEFERRED(JS built-in: ReadableStream): NullExporter has no pipe method.
     // JS:
     // JS:   onSendError(error: Error): Error | void {}
-    fn on_send_error(&mut self, _error: Error) -> Option<Error> {
+    fn on_send_error(&mut self, _error: CapnwebError) -> Option<CapnwebError> {
         None
     }
     // JS: }
@@ -794,17 +795,41 @@ impl<'a> Devaluator<'a> {
             // JS:         }
             // JS:         return result;
             CapnwebValue::Error(error) => {
-                let error = self
-                    .exporter
-                    .on_send_error(error.clone())
-                    .unwrap_or_else(|| error.clone());
-                Ok(wire_tag(
-                    "error",
-                    vec![
-                        CapnwebValue::String("Error".to_owned()),
-                        CapnwebValue::String(error.to_string()),
-                    ],
-                ))
+                let rewritten = self.exporter.on_send_error(error.clone());
+                let rewritten_stack = rewritten.as_ref().and_then(|error| error.stack.clone());
+                let error = rewritten.unwrap_or_else(|| error.clone());
+                let mut properties = BTreeMap::new();
+                for (key, value) in &error.properties {
+                    if matches!(key.as_str(), "name" | "message" | "stack") {
+                        continue;
+                    }
+                    let exports_before = self.exports.len();
+                    match self.devaluate_impl(value, depth + 1) {
+                        Ok(value) => {
+                            properties.insert(key.clone(), value);
+                        }
+                        Err(_) => {
+                            let tail = self.exports.split_off(exports_before);
+                            let _ = self.exporter.unexport(tail);
+                        }
+                    }
+                }
+
+                let mut result = vec![
+                    CapnwebValue::String(error.name.clone()),
+                    CapnwebValue::String(error.message.clone()),
+                ];
+                if !properties.is_empty() {
+                    result.push(
+                        rewritten_stack
+                            .map(CapnwebValue::String)
+                            .unwrap_or(CapnwebValue::Null),
+                    );
+                    result.push(CapnwebValue::Object(properties));
+                } else if let Some(stack) = rewritten_stack {
+                    result.push(CapnwebValue::String(stack));
+                }
+                Ok(wire_tag("error", result))
             }
             // JS:       }
             // JS:
@@ -1453,10 +1478,40 @@ impl<'a> Evaluator<'a> {
                     // JS:           }
                     // JS:           break;
                     "error" if expression.len() >= 3 => {
+                        let name = expression[1]
+                            .as_str()
+                            .ok_or_else(|| unknown_special(&expression))?
+                            .to_owned();
                         let message = expression[2]
                             .as_str()
-                            .ok_or_else(|| unknown_special(&expression))?;
-                        Ok(CapnwebValue::Error(Error::Message(message.to_owned())))
+                            .ok_or_else(|| unknown_special(&expression))?
+                            .to_owned();
+                        let stack = expression
+                            .get(3)
+                            .and_then(CapnwebValue::as_str)
+                            .map(str::to_owned);
+                        let mut properties = BTreeMap::new();
+                        if expression.len() >= 5 {
+                            let CapnwebValue::Object(values) = expression[4].clone() else {
+                                return Err(unknown_special(&expression));
+                            };
+                            for (key, value) in values {
+                                let value = self.evaluate_impl(value, depth + 1)?;
+                                if is_blocked_object_property(&key)
+                                    || matches!(key.as_str(), "name" | "message" | "stack")
+                                {
+                                    drop(value);
+                                } else {
+                                    properties.insert(key, value);
+                                }
+                            }
+                        }
+                        Ok(CapnwebValue::Error(CapnwebError {
+                            name,
+                            message,
+                            stack,
+                            properties,
+                        }))
                     }
                     // JS:         case "undefined":
                     // JS:           if (value.length === 1) {

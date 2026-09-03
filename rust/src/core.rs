@@ -34,6 +34,35 @@ pub enum Error {
 /// The result type used by the RPC runtime.
 pub type Result<T> = std::result::Result<T, Error>;
 
+/// A JavaScript-compatible error carried as a dynamic RPC value.
+#[derive(Clone, Debug)]
+pub struct CapnwebError {
+    /// JavaScript error constructor/name.
+    pub name: String,
+    /// Error message.
+    pub message: String,
+    /// Optional remote stack string.
+    pub stack: Option<String>,
+    /// Additional own enumerable properties, including `cause` and aggregate `errors`.
+    pub properties: BTreeMap<String, CapnwebValue>,
+}
+
+impl From<Error> for CapnwebError {
+    fn from(error: Error) -> Self {
+        let name = if matches!(error, Error::Type(_)) {
+            "TypeError"
+        } else {
+            "Error"
+        };
+        Self {
+            name: name.to_owned(),
+            message: error.to_string(),
+            stack: None,
+            properties: BTreeMap::new(),
+        }
+    }
+}
+
 /// An owned dynamic value accepted by the Rust RPC boundary.
 #[derive(Clone)]
 pub enum CapnwebValue {
@@ -64,7 +93,7 @@ pub enum CapnwebValue {
     /// A local RPC target.
     Target(Arc<dyn RpcTargetInner>),
     /// A serialized application error.
-    Error(Error),
+    Error(CapnwebError),
 }
 
 impl std::fmt::Debug for CapnwebValue {
