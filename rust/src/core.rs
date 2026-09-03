@@ -1,20 +1,34 @@
 // JS: // Copyright (c) 2025 Cloudflare, Inc.
+// Copyright (c) 2025 Cloudflare, Inc.
 // JS: // Licensed under the MIT license found in the LICENSE.txt file or at:
+// Licensed under the MIT license found in the LICENSE.txt file or at:
 // JS: //     https://opensource.org/license/mit
+//     https://opensource.org/license/mit
 // JS:
+
 // JS: import type { RpcTargetBranded, __RPC_TARGET_BRAND } from "./types.js";
+use std::sync::Arc;
+
+use num_bigint::BigInt;
 // JS: import { WORKERS_MODULE_SYMBOL } from "./symbols.js"
+// RUST-DEFERRED(JS built-in: workers module Symbol): no Rust global-symbol lookup is performed.
 // JS:
+
 // JS: // Polyfill Symbol.dispose for browsers that don't support it yet
+// Polyfill Symbol.dispose for browsers that don't support it yet.
 // JS: if (!Symbol.dispose) {
 // JS:   (Symbol as any).dispose = Symbol.for('dispose');
 // JS: }
 // JS: if (!Symbol.asyncDispose) {
 // JS:   (Symbol as any).asyncDispose = Symbol.for('asyncDispose');
 // JS: }
+// RUST-DEFERRED(JS built-in: Symbol.dispose): Rust uses `Drop` for local disposal.
 // JS:
+
 // JS: // Polyfill Promise.withResolvers() for old Safari versions (ugh), Hermes (React Native), and
+// Polyfill Promise.withResolvers() for old Safari versions (ugh), Hermes (React Native), and
 // JS: // maybe others.
+// maybe others.
 // JS: if (!Promise.withResolvers) {
 // JS:   Promise.withResolvers = function<T>(): PromiseWithResolvers<T> {
 // JS:     let resolve: (value: T | PromiseLike<T>) => void;
@@ -26,146 +40,262 @@
 // JS:     return { promise, resolve: resolve!, reject: reject! };
 // JS:   };
 // JS: }
+// RUST-DEFERRED(JS built-in: Promise.withResolvers): Rust resolver state is defined where used.
 // JS:
+
 // JS: let workersModule: any = (globalThis as any)[WORKERS_MODULE_SYMBOL];
+// RUST-DEFERRED(JS built-in: workers module global): native Workers RPC objects are unsupported.
 // JS:
+
 // JS: export interface RpcTarget {
-// JS:   [__RPC_TARGET_BRAND]: never;
-// JS: };
+/// Marker implemented by values exposed as local RPC targets.
+pub trait RpcTarget: Send + Sync + 'static {
+    // JS:   [__RPC_TARGET_BRAND]: never;
+    // RUST-DIFF(JS Proxy): generated target implementations provide the unforgeable marker.
+    // JS: };
+}
 // JS:
+
 // JS: export let RpcTarget = workersModule ? workersModule.RpcTarget : class {};
+// RUST-DIFF(JS Proxy): `#[rpc_target]` replaces the runtime target constructor and reflection.
 // JS:
+
 // JS: export type PropertyPath = (string | number)[];
+/// A sequence of string or numeric property keys traversed by an RPC operation.
+pub type PropertyPath = Vec<PropertyKey>;
+
+/// One component of an RPC property path.
+#[derive(Clone, Debug, PartialEq)]
+pub enum PropertyKey {
+    /// A named object property.
+    String(String),
+    /// A numeric array property.
+    Number(f64),
+}
 // JS:
+
 // JS: type TypeForRpc = "unsupported" | "primitive" | "object" | "function" | "array" | "date" |
 // JS:     "bigint" | "bytes" | "blob" | "stub" | "rpc-promise" | "rpc-target" | "rpc-thenable" |
 // JS:     "error" | "undefined" | "writable" | "readable" | "url" | "headers" | "request" | "response";
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum TypeForRpc {
+    Unsupported,
+    Primitive,
+    Object,
+    Function,
+    Array,
+    Date,
+    Bigint,
+    Bytes,
+    Blob,
+    Stub,
+    RpcPromise,
+    RpcTarget,
+    RpcThenable,
+    Error,
+    Undefined,
+    Writable,
+    Readable,
+    Url,
+    Headers,
+    Request,
+    Response,
+}
 // JS:
+
 // JS: const AsyncFunction = (async function () {}).constructor;
+// RUST-DEFERRED(JS built-in: Function prototypes): callable values have an explicit enum variant.
 // JS:
+
 // JS: // Buffer.prototype for Node.js environments, where Buffer is a Uint8Array subclass that we want
+// Buffer.prototype for Node.js environments, where Buffer is a Uint8Array subclass that we want
 // JS: // to accept as "bytes". In browsers, this is undefined, which won't match any prototype.
+// to accept as "bytes". In browsers, this is undefined, which won't match any prototype.
 // JS: let BUFFER_PROTOTYPE: object | undefined =
 // JS:     typeof Buffer !== "undefined" ? Buffer.prototype : undefined;
+// RUST-DEFERRED(JS built-in: typed-array prototypes): all selected Rust byte containers become Bytes.
 // JS:
+
 // JS: export function typeForRpc(value: unknown): TypeForRpc {
-// JS:   switch (typeof value) {
-// JS:     case "boolean":
-// JS:     case "number":
-// JS:     case "string":
-// JS:       return "primitive";
-// JS:
-// JS:     case "undefined":
-// JS:       return "undefined";
-// JS:
-// JS:     case "object":
-// JS:     case "function":
-// JS:       // Test by prototype, below.
-// JS:       break;
-// JS:
-// JS:     case "bigint":
-// JS:       return "bigint";
-// JS:
-// JS:     default:
-// JS:       return "unsupported";
-// JS:   }
-// JS:
-// JS:   // Ugh JavaScript, why is `typeof null` equal to "object" but null isn't otherwise anything like
-// JS:   // an object?
-// JS:   if (value === null) {
-// JS:     return "primitive";
-// JS:   }
-// JS:
-// JS:   // Aside from RpcTarget, we generally don't support serializing *subclasses* of serializable
-// JS:   // types, so we switch on the exact prototype rather than use `instanceof` here.
-// JS:   let prototype = Object.getPrototypeOf(value);
-// JS:   switch (prototype) {
-// JS:     case Object.prototype:
-// JS:       return "object";
-// JS:
-// JS:     case Function.prototype:
-// JS:     case AsyncFunction.prototype:
-// JS:       return "function";
-// JS:
-// JS:     case Array.prototype:
-// JS:       return "array";
-// JS:
-// JS:     case Date.prototype:
-// JS:       return "date";
-// JS:
-// JS:     case Uint8Array.prototype:
-// JS:     case BUFFER_PROTOTYPE:
-// JS:     case ArrayBuffer.prototype:
-// JS:     case DataView.prototype:
-// JS:     case Int8Array.prototype:
-// JS:     case Uint8ClampedArray.prototype:
-// JS:     case Int16Array.prototype:
-// JS:     case Uint16Array.prototype:
-// JS:     case Int32Array.prototype:
-// JS:     case Uint32Array.prototype:
-// JS:     case BigInt64Array.prototype:
-// JS:     case BigUint64Array.prototype:
-// JS:     case Float32Array.prototype:
-// JS:     case Float64Array.prototype:
-// JS:       return "bytes";
-// JS:
-// JS:     case WritableStream.prototype:
-// JS:       return "writable";
-// JS:
-// JS:     case ReadableStream.prototype:
-// JS:       return "readable";
-// JS:
-// JS:     case URL.prototype:
-// JS:       return "url";
-// JS:
-// JS:     case Headers.prototype:
-// JS:       return "headers";
-// JS:
-// JS:     case Request.prototype:
-// JS:       return "request";
-// JS:
-// JS:     case Response.prototype:
-// JS:       return "response";
-// JS:
-// JS:     case Blob.prototype:
-// JS:       return "blob";
-// JS:
-// JS:     // TODO: Other RPC-compatible pass-by-value types.
-// JS:
-// JS:     case RpcStub.prototype:
-// JS:       return "stub";
-// JS:
-// JS:     case RpcPromise.prototype:
-// JS:       return "rpc-promise";
-// JS:
-// JS:     // TODO: Promise<T> or thenable
-// JS:
-// JS:     default:
-// JS:       if (workersModule) {
-// JS:         // TODO: We also need to match `RpcPromise` and `RpcProperty`, but they currently aren't
-// JS:         //   exported by cloudflare:workers.
-// JS:         if (prototype == workersModule.RpcStub.prototype ||
-// JS:             value instanceof workersModule.ServiceStub) {
-// JS:           return "rpc-target";
-// JS:         } else if (prototype == workersModule.RpcPromise.prototype ||
-// JS:                    prototype == workersModule.RpcProperty.prototype) {
-// JS:           // Like rpc-target, but should be wrapped in RpcPromise, so that it can be pull()ed,
-// JS:           // which will await the thenable.
-// JS:           return "rpc-thenable";
-// JS:         }
-// JS:       }
-// JS:
-// JS:       if (value instanceof RpcTarget) {
-// JS:         return "rpc-target";
-// JS:       }
-// JS:
-// JS:       if (value instanceof Error) {
-// JS:         return "error";
-// JS:       }
-// JS:
-// JS:       return "unsupported";
-// JS:   }
-// JS: }
+pub(crate) fn type_for_rpc(value: &CapnwebValue) -> TypeForRpc {
+    // JS:   switch (typeof value) {
+    match value {
+        // JS:     case "boolean":
+        // JS:     case "number":
+        // JS:     case "string":
+        // JS:       return "primitive";
+        CapnwebValue::Bool(_) | CapnwebValue::Number(_) | CapnwebValue::String(_) => {
+            TypeForRpc::Primitive
+        }
+        // JS:
+
+        // JS:     case "undefined":
+        // JS:       return "undefined";
+        // Rust aliases `undefined` to `Null`, which is classified with the other primitive values below.
+        // JS:
+
+        // JS:     case "object":
+        // JS:     case "function":
+        // JS:       // Test by prototype, below.
+        // JS:       break;
+        // Object and function variants are classified by the exhaustive enum match below.
+        // JS:
+
+        // JS:     case "bigint":
+        // JS:       return "bigint";
+        CapnwebValue::BigInt(_) => TypeForRpc::Bigint,
+        // JS:
+
+        // JS:     default:
+        // JS:       return "unsupported";
+        // Rust's dynamic enum cannot contain an unclassified application value.
+        // JS:   }
+        // JS:
+
+        // JS:   // Ugh JavaScript, why is `typeof null` equal to "object" but null isn't otherwise anything like
+        // Ugh JavaScript, why is `typeof null` equal to "object" but null isn't otherwise anything like
+        // JS:   // an object?
+        // an object?
+        // JS:   if (value === null) {
+        // JS:     return "primitive";
+        CapnwebValue::Null => TypeForRpc::Primitive,
+        // JS:   }
+        // JS:
+
+        // JS:   // Aside from RpcTarget, we generally don't support serializing *subclasses* of serializable
+        // Aside from RpcTarget, we generally don't support serializing *subclasses* of serializable
+        // JS:   // types, so we switch on the exact prototype rather than use `instanceof` here.
+        // types, so we switch on the exact prototype rather than use `instanceof` here.
+        // JS:   let prototype = Object.getPrototypeOf(value);
+        // Rust's exhaustive dynamic-value enum mechanically replaces prototype inspection.
+        // JS:   switch (prototype) {
+        // JS:     case Object.prototype:
+        // JS:       return "object";
+        CapnwebValue::Object(_) => TypeForRpc::Object,
+        // JS:
+
+        // JS:     case Function.prototype:
+        // JS:     case AsyncFunction.prototype:
+        // JS:       return "function";
+        CapnwebValue::Function(_) => TypeForRpc::Function,
+        // JS:
+
+        // JS:     case Array.prototype:
+        // JS:       return "array";
+        CapnwebValue::Array(_) => TypeForRpc::Array,
+        // JS:
+
+        // JS:     case Date.prototype:
+        // JS:       return "date";
+        // RUST-DEFERRED(JS built-in: Date): there is no dynamic Date variant.
+        // JS:
+
+        // JS:     case Uint8Array.prototype:
+        // JS:     case BUFFER_PROTOTYPE:
+        // JS:     case ArrayBuffer.prototype:
+        // JS:     case DataView.prototype:
+        // JS:     case Int8Array.prototype:
+        // JS:     case Uint8ClampedArray.prototype:
+        // JS:     case Int16Array.prototype:
+        // JS:     case Uint16Array.prototype:
+        // JS:     case Int32Array.prototype:
+        // JS:     case Uint32Array.prototype:
+        // JS:     case BigInt64Array.prototype:
+        // JS:     case BigUint64Array.prototype:
+        // JS:     case Float32Array.prototype:
+        // JS:     case Float64Array.prototype:
+        // JS:       return "bytes";
+        CapnwebValue::Bytes(_) => TypeForRpc::Bytes,
+        // JS:
+
+        // JS:     case WritableStream.prototype:
+        // JS:       return "writable";
+        // RUST-DEFERRED(JS built-in: WritableStream): there is no dynamic writable-stream variant.
+        // JS:
+
+        // JS:     case ReadableStream.prototype:
+        // JS:       return "readable";
+        // RUST-DEFERRED(JS built-in: ReadableStream): there is no dynamic readable-stream variant.
+        // JS:
+
+        // JS:     case URL.prototype:
+        // JS:       return "url";
+        // RUST-DEFERRED(JS built-in: URL): there is no dynamic URL variant.
+        // JS:
+
+        // JS:     case Headers.prototype:
+        // JS:       return "headers";
+        // RUST-DEFERRED(JS built-in: Headers): there is no dynamic Headers variant.
+        // JS:
+
+        // JS:     case Request.prototype:
+        // JS:       return "request";
+        // RUST-DEFERRED(JS built-in: Request): there is no dynamic Request variant.
+        // JS:
+
+        // JS:     case Response.prototype:
+        // JS:       return "response";
+        // RUST-DEFERRED(JS built-in: Response): there is no dynamic Response variant.
+        // JS:
+
+        // JS:     case Blob.prototype:
+        // JS:       return "blob";
+        // RUST-DEFERRED(JS built-in: Blob): there is no dynamic Blob variant.
+        // JS:
+
+        // JS:     // TODO: Other RPC-compatible pass-by-value types.
+        // TODO: Other RPC-compatible pass-by-value types.
+        // JS:
+
+        // JS:     case RpcStub.prototype:
+        // JS:       return "stub";
+        CapnwebValue::Stub(_) => TypeForRpc::Stub,
+        // JS:
+
+        // JS:     case RpcPromise.prototype:
+        // JS:       return "rpc-promise";
+        CapnwebValue::RpcPromise(_) => TypeForRpc::RpcPromise,
+        // JS:
+
+        // JS:     // TODO: Promise<T> or thenable
+        // TODO: Promise<T> or thenable.
+        // JS:
+
+        // JS:     default:
+        // JS:       if (workersModule) {
+        // JS:         // TODO: We also need to match `RpcPromise` and `RpcProperty`, but they currently aren't
+        // JS:         //   exported by cloudflare:workers.
+        // JS:         if (prototype == workersModule.RpcStub.prototype ||
+        // JS:             value instanceof workersModule.ServiceStub) {
+        // JS:           return "rpc-target";
+        // JS:         } else if (prototype == workersModule.RpcPromise.prototype ||
+        // JS:                    prototype == workersModule.RpcProperty.prototype) {
+        // JS:           // Like rpc-target, but should be wrapped in RpcPromise, so that it can be pull()ed,
+        // JS:           // which will await the thenable.
+        // JS:           return "rpc-thenable";
+        // JS:         }
+        // JS:       }
+        // RUST-DEFERRED(JS built-in: Workers RPC prototypes): native Workers capabilities are unsupported.
+        // JS:
+
+        // JS:       if (value instanceof RpcTarget) {
+        // JS:         return "rpc-target";
+        CapnwebValue::Target(_) => TypeForRpc::RpcTarget,
+        // JS:       }
+        // JS:
+
+        // JS:       if (value instanceof Error) {
+        // JS:         return "error";
+        CapnwebValue::Error(_) => TypeForRpc::Error,
+        // JS:       }
+        // JS:
+
+        // JS:       return "unsupported";
+        // The exhaustive Rust value enum makes this branch unrepresentable.
+        // JS:   }
+    }
+    // JS: }
+}
 // JS:
 // JS: function mapNotLoaded(): never {
 // JS:   throw new Error("RPC map() implementation was not loaded.");

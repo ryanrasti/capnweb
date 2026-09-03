@@ -1,5 +1,10 @@
 // JS: // Copyright (c) 2025 Cloudflare, Inc.
+// Copyright (c) 2025 Cloudflare, Inc.
 // JS: // Licensed under the MIT license found in the LICENSE.txt file or at:
+// Licensed under the MIT license found in the LICENSE.txt file or at:
 // JS: //     https://opensource.org/license/mit
+//     https://opensource.org/license/mit
 // JS:
+
 // JS: export let WORKERS_MODULE_SYMBOL = Symbol("workers-module");
+// RUST-DEFERRED(JS built-in: workers module Symbol): Rust has no workers-module global symbol.
