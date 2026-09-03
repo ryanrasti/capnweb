@@ -1221,6 +1221,16 @@ impl std::fmt::Display for RpcPromise {
 // JS:     return hook;
 // JS:   }
 // JS: }
+pub(crate) fn unwrap_stub_taking_ownership(stub: RpcStub) -> Result<StubHook> {
+    let RpcStub {
+        hook,
+        path_if_promise,
+    } = stub;
+    match path_if_promise {
+        Some(path) if !path.is_empty() => hook.get(path),
+        _ => Ok(hook),
+    }
+}
 // JS:
 // JS: // Given a stub (still wrapped in a Proxy), extract the underlying `StubHook`, and duplicate it,
 // JS: // returning the duplicate.
@@ -1239,6 +1249,13 @@ impl std::fmt::Display for RpcPromise {
 // JS:     return hook.dup();
 // JS:   }
 // JS: }
+pub(crate) fn unwrap_stub_and_clone(stub: &RpcStub) -> Result<StubHook> {
+    let hook = stub.current_hook();
+    match &stub.path_if_promise {
+        Some(path) => hook.get(path.clone()),
+        None => Ok(hook),
+    }
+}
 // JS:
 // JS: // Unwrap a stub returning the underlying `StubHook`, returning `undefined` if it is a property
 // JS: // stub.
@@ -1255,6 +1272,17 @@ impl std::fmt::Display for RpcPromise {
 // JS:
 // JS:   return hook;
 // JS: }
+pub(crate) fn unwrap_stub_no_properties(stub: &RpcStub) -> Option<StubHook> {
+    if stub
+        .path_if_promise
+        .as_ref()
+        .is_some_and(|path| !path.is_empty())
+    {
+        None
+    } else {
+        Some(stub.current_hook())
+    }
+}
 // JS:
 // JS: // Unwrap a stub returning the underlying `StubHook`. If it's a property, return the `StubHook`
 // JS: // representing the stub or promise of which is is a property.
@@ -1264,6 +1292,9 @@ impl std::fmt::Display for RpcPromise {
 // JS: export function unwrapStubOrParent(stub: RpcStub): StubHook {
 // JS:   return stub[RAW_STUB].hook;
 // JS: }
+pub(crate) fn unwrap_stub_or_parent(stub: &RpcStub) -> StubHook {
+    stub.current_hook()
+}
 // JS:
 // JS: // Given a stub (still wrapped in a Proxy), extract the `hook` and `pathIfPromise` properties.
 // JS: //
@@ -1272,6 +1303,9 @@ impl std::fmt::Display for RpcPromise {
 // JS: export function unwrapStubAndPath(stub: RpcStub): {hook: StubHook, pathIfPromise?: PropertyPath} {
 // JS:   return stub[RAW_STUB];
 // JS: }
+pub(crate) fn unwrap_stub_and_path(stub: &RpcStub) -> (StubHook, Option<PropertyPath>) {
+    (stub.current_hook(), stub.path_if_promise.clone())
+}
 // JS:
 // JS: // Given a promise stub (still wrapped in a Proxy), pull the remote promise and deliver the
 // JS: // payload. This is a helper used to implement the then/catch/finally methods of RpcPromise.
@@ -1287,11 +1321,27 @@ impl std::fmt::Display for RpcPromise {
 // JS:   let payload = await hook.pull();
 // JS:   return payload.deliverResolve();
 // JS: }
+async fn pull_promise(promise: RpcPromise) -> Result<CapnwebValue> {
+    let (mut hook, path_if_promise) = unwrap_stub_and_path(&promise.stub);
+    if let Some(path) = path_if_promise.filter(|path| !path.is_empty()) {
+        hook = hook.get(path)?;
+    }
+    let payload = match hook.pull()? {
+        MaybePromise::Immediate(payload) => payload,
+        MaybePromise::Pending(payload) => payload.await?,
+    };
+    payload.deliver_resolve().await
+}
 // JS:
 // JS: // =======================================================================================
 // JS: // RpcPayload
 // JS:
 // JS: export type LocatedPromise = {parent: object, property: string | number, promise: RpcPromise};
+// RUST-DIFF(local refcount): owned trees identify a promise by path instead of parent-object identity.
+pub(crate) struct LocatedPromise {
+    path: PropertyPath,
+    promise: RpcPromise,
+}
 // JS:
 // JS: // Represents the params to an RPC call, or the resolution of an RPC promise, as it passes
 // JS: // through the system.
@@ -1352,830 +1402,918 @@ impl std::fmt::Display for RpcPromise {
 // JS: //   taking ownership of stubs -- then the payload will NOT be disposed explicitly, so this step
 // JS: //   will not be needed.
 // JS: export class RpcPayload {
-// JS:   // Create a payload from a value passed as params to an RPC from the app.
-// JS:   //
-// JS:   // The payload does NOT take ownership of any stubs in `value`, and but promises not to modify
-// JS:   // `value`. If the payload is delivered locally, `value` will be deep-copied first, so as not
-// JS:   // to have the sender and recipient end up sharing the same mutable object. `value` will not be
-// JS:   // touched again after the call returns synchronously (returns a promise) -- by that point,
-// JS:   // the value has either been copied or serialized to the wire.
-// JS:   public static fromAppParams(value: unknown): RpcPayload {
-// JS:     return new RpcPayload(value, "params");
-// JS:   }
-// JS:
-// JS:   // Create a payload from a value return from an RPC implementation by the app.
-// JS:   //
-// JS:   // Unlike fromAppParams(), in this case the payload takes ownership of all stubs in `value`, and
-// JS:   // may hold onto `value` for an arbitrarily long time (e.g. to serve pipelined requests). It
-// JS:   // will still avoid modifying `value` and will make a deep copy if it is delivered locally.
-// JS:   public static fromAppReturn(value: unknown): RpcPayload {
-// JS:     return new RpcPayload(value, "return");
-// JS:   }
-// JS:
-// JS:   // Combine an array of payloads into a single payload whose value is an array. Ownership of all
-// JS:   // stubs is transferred from the inputs to the outputs, hence if the output is disposed, the
-// JS:   // inputs should not be. (In case of exception, nothing is disposed, though.)
-// JS:   public static fromArray(array: RpcPayload[]): RpcPayload {
-// JS:     let hooks: StubHook[] = [];
-// JS:     let promises: LocatedPromise[] = [];
-// JS:
-// JS:     let resultArray: unknown[] = [];
-// JS:
-// JS:     for (let payload of array) {
-// JS:       payload.ensureDeepCopied();
-// JS:       for (let hook of payload.hooks!) {
-// JS:         hooks.push(hook);
-// JS:       }
-// JS:       for (let promise of payload.promises!) {
-// JS:         if (promise.parent === payload) {
-// JS:           // This promise is the root of the source payload. We need to reparent it to its proper
-// JS:           // location in the result array.
-// JS:           promise = {
-// JS:             parent: resultArray,
-// JS:             property: resultArray.length,
-// JS:             promise: promise.promise
-// JS:           };
-// JS:         }
-// JS:         promises.push(promise);
-// JS:       }
-// JS:       resultArray.push(payload.value);
-// JS:     }
-// JS:
-// JS:     return new RpcPayload(resultArray, "owned", hooks, promises);
-// JS:   }
-// JS:
-// JS:   // Create a payload from a value parsed off the wire using Evaluator.evaluate().
-// JS:   //
-// JS:   // A payload is constructed with a null value and the given hooks and promises arrays. The value
-// JS:   // is expected to be filled in by the evaluator, and the hooks and promises arrays are expected
-// JS:   // to be extended with stubs found during parsing. (This weird usage model is necessary so that
-// JS:   // if the root value turns out to be a promise, its `parent` in `promises` can be the payload
-// JS:   // object itself.)
-// JS:   //
-// JS:   // When done, the payload takes ownership of the final value and all the stubs within. It may
-// JS:   // modify the value in preparation for delivery, and may deliver the value directly to the app
-// JS:   // without copying.
-// JS:   public static forEvaluate(hooks: StubHook[], promises: LocatedPromise[]) {
-// JS:     return new RpcPayload(null, "owned", hooks, promises);
-// JS:   }
-// JS:
-// JS:   // Deep-copy the given value, including dup()ing all stubs.
-// JS:   //
-// JS:   // If `value` is a function, it should be bound to `oldParent` as its `this`.
-// JS:   //
-// JS:   // If deep-copying from a branch of some other RpcPayload, it must be provided, to make sure
-// JS:   // RpcTargets found within don't get duplicate stubs.
-// JS:   public static deepCopyFrom(
-// JS:       value: unknown, oldParent: object | undefined, owner: RpcPayload | null): RpcPayload {
-// JS:     let result = new RpcPayload(null, "owned", [], []);
-// JS:     result.value = result.deepCopy(value, oldParent, "value", result, /*dupStubs=*/true, owner);
-// JS:     return result;
-// JS:   }
-// JS:
-// JS:   // Private constructor; use factory functions above to construct.
-// JS:   private constructor(
-// JS:     // The payload value.
-// JS:     public value: unknown,
-// JS:
-// JS:     // What is the provenance of `value`?
-// JS:     // "params": It came from the app, in params to a call. We must dupe any stubs within.
-// JS:     // "return": It came from the app, returned from a call. We take ownership of all stubs within.
-// JS:     // "owned": This value belongs fully to us, either because it was deserialized from the wire
-// JS:     //   or because we deep-copied a value from the app.
-// JS:     private source: "params" | "return" | "owned",
-// JS:
-// JS:     // `hooks` and `promises` are filled in only if `value` belongs to us (`source` is "owned") and
-// JS:     // so can safely be delivered to the app. If `value` came from then app in the first place,
-// JS:     // then it cannot be delivered back to the app nor modified by us without first deep-copying
-// JS:     // it. `hooks` and `promises` will be computed as part of the deep-copy.
-// JS:
-// JS:     // All non-promise stubs found in `value`. This list is needed only for the purpose of being
-// JS:     // able to dispose them when desired. This intentionally doesn't inculde promises because they
-// JS:     // are already covered by `promises`, below.
-// JS:     private hooks?: StubHook[],
-// JS:
-// JS:     // All promises found in `value`. The locations of each promise are provided to allow
-// JS:     // substitutions later.
-// JS:     private promises?: LocatedPromise[]
-// JS:   ) {}
-// JS:
-// JS:   // For `source === "return"` payloads only, this tracks any StubHooks created around RpcTargets
-// JS:   // or WritableStreams found in the payload at the time that it is serialized (or deep-copied) for
-// JS:   // return, so that we can make sure they are not disposed before the pipeline ends.
-// JS:   //
-// JS:   // This is initialized on first use.
-// JS:   private rpcTargets?: Map<RpcTarget | Function | WritableStream | ReadableStream, StubHook>;
-// JS:
-// JS:   // Get the StubHook representing the given RpcTarget found inside this payload.
-// JS:   public getHookForRpcTarget(target: RpcTarget | Function, parent: object | undefined,
-// JS:                              dupStubs: boolean = true): StubHook {
-// JS:     if (this.source === "params") {
-// JS:       if (dupStubs) {
-// JS:         // We aren't supposed to take ownership of stubs appearing in params -- we're supposed to
-// JS:         // dupe them. But an RpcTarget isn't a stub. If we create a stub around it, the stub takes
-// JS:         // ownership.
-// JS:         //
-// JS:         // Usually, people passing raw RpcTargets into functions actually want the call to take
-// JS:         // ownership -- that is, they want to have the disposer called later.
-// JS:         //
-// JS:         // But, if the RpcTarget happens to implement a `dup()` method, we will go ahead and call
-// JS:         // that method, and wrap whatever it returns instead. This method wouldn't actually be
-// JS:         // available over RPC anyway (since calling `dup()` on the client-side stub just dupes the
-// JS:         // stub), so if an `RpcTarget` implements this, it must intend for us to use it.
-// JS:         //
-// JS:         // This is particularly important for the case of workerd-native RpcStubs, that is, stubs
-// JS:         // from the built-in RPC system, rather than the pure-JS implementation of Cap'n Web.
-// JS:         // We treat those stubs as RpcTargets. But, we do need to dup() them, just like we would
-// JS:         // our own stubs.
-// JS:
-// JS:         let dupable = target as any;
-// JS:         if (typeof dupable.dup === "function") {
-// JS:           target = dupable.dup();
-// JS:         }
-// JS:       }
-// JS:
-// JS:       return TargetStubHook.create(target, parent);
-// JS:     } else if (this.source === "return") {
-// JS:       // If dupStubs is true, we want to both make sure the map contains the stub, and also return
-// JS:       // a dup of that stub.
-// JS:       //
-// JS:       // If dupStubs is false, then we are being called as part of ensureDeepCopy(), i.e. replacing
-// JS:       // ourselves with a deep copy. In this case we actually want the copy to end up owning all
-// JS:       // the hooks, and the map to be left empty. So what we do in this case is:
-// JS:       // * If the target is not in the map, we just create it, but don't populate the map.
-// JS:       // * If the target *is* in the map, we *remove* the hook from the map, and return it.
-// JS:
-// JS:       let hook = this.rpcTargets?.get(target);
-// JS:       if (hook) {
-// JS:         if (dupStubs) {
-// JS:           return hook.dup();
-// JS:         } else {
-// JS:           this.rpcTargets?.delete(target);
-// JS:           return hook;
-// JS:         }
-// JS:       } else {
-// JS:         hook = TargetStubHook.create(target, parent);
-// JS:         if (dupStubs) {
-// JS:           if (!this.rpcTargets) {
-// JS:             this.rpcTargets = new Map;
-// JS:           }
-// JS:           this.rpcTargets.set(target, hook);
-// JS:           return hook.dup();
-// JS:         } else {
-// JS:           return hook;
-// JS:         }
-// JS:       }
-// JS:     } else {
-// JS:       throw new Error("owned payload shouldn't contain raw RpcTargets");
-// JS:     }
-// JS:   }
-// JS:
-// JS:   // Get the StubHook representing the given WritableStream found inside this payload.
-// JS:   public getHookForWritableStream(stream: WritableStream, parent: object | undefined,
-// JS:                                   dupStubs: boolean = true): StubHook {
-// JS:     if (this.source === "params") {
-// JS:       // For params, we always create a new hook. WritableStreams don't have a dup() method,
-// JS:       // and it wouldn't really make sense anyway since we're locking the stream by calling
-// JS:       // getWriter().
-// JS:       return streamImpl.createWritableStreamHook(stream);
-// JS:     } else if (this.source === "return") {
-// JS:       // Similar logic to getHookForRpcTarget().
-// JS:       let hook = this.rpcTargets?.get(stream);
-// JS:       if (hook) {
-// JS:         if (dupStubs) {
-// JS:           return hook.dup();
-// JS:         } else {
-// JS:           this.rpcTargets?.delete(stream);
-// JS:           return hook;
-// JS:         }
-// JS:       } else {
-// JS:         hook = streamImpl.createWritableStreamHook(stream);
-// JS:         if (dupStubs) {
-// JS:           if (!this.rpcTargets) {
-// JS:             this.rpcTargets = new Map;
-// JS:           }
-// JS:           this.rpcTargets.set(stream, hook);
-// JS:           return hook.dup();
-// JS:         } else {
-// JS:           return hook;
-// JS:         }
-// JS:       }
-// JS:     } else {
-// JS:       throw new Error("owned payload shouldn't contain raw WritableStreams");
-// JS:     }
-// JS:   }
-// JS:
-// JS:   // Get the StubHook representing the given ReadableStream found inside this payload.
-// JS:   public getHookForReadableStream(stream: ReadableStream, parent: object | undefined,
-// JS:                                   dupStubs: boolean = true): StubHook {
-// JS:     if (this.source === "params") {
-// JS:       return streamImpl.createReadableStreamHook(stream);
-// JS:     } else if (this.source === "return") {
-// JS:       let hook = this.rpcTargets?.get(stream);
-// JS:       if (hook) {
-// JS:         if (dupStubs) {
-// JS:           return hook.dup();
-// JS:         } else {
-// JS:           this.rpcTargets?.delete(stream);
-// JS:           return hook;
-// JS:         }
-// JS:       } else {
-// JS:         hook = streamImpl.createReadableStreamHook(stream);
-// JS:         if (dupStubs) {
-// JS:           if (!this.rpcTargets) {
-// JS:             this.rpcTargets = new Map;
-// JS:           }
-// JS:           this.rpcTargets.set(stream, hook);
-// JS:           return hook.dup();
-// JS:         } else {
-// JS:           return hook;
-// JS:         }
-// JS:       }
-// JS:     } else {
-// JS:       throw new Error("owned payload shouldn't contain raw ReadableStreams");
-// JS:     }
-// JS:   }
-// JS:
-// JS:   private deepCopy(
-// JS:       value: unknown, oldParent: object | undefined, property: string | number, parent: object,
-// JS:       dupStubs: boolean, owner: RpcPayload | null): unknown {
-// JS:     let kind = typeForRpc(value);
-// JS:     switch (kind) {
-// JS:       case "unsupported":
-// JS:         // This will throw later on when someone tries to do something with it.
-// JS:         return value;
-// JS:
-// JS:       case "primitive":
-// JS:       case "bigint":
-// JS:       case "date":
-// JS:       case "bytes":
-// JS:       case "blob":
-// JS:       case "url":
-// JS:       case "error":
-// JS:       case "undefined":
-// JS:         // immutable, no need to copy
-// JS:         // TODO: Should errors be copied if they have own properties?
-// JS:         return value;
-// JS:
-// JS:       case "array": {
-// JS:         // We have to construct the new array first, then fill it in, so we can pass it as the
-// JS:         // parent.
-// JS:         let array = <Array<unknown>>value;
-// JS:         let len = array.length;
-// JS:         let result = new Array(len);
-// JS:         for (let i = 0; i < len; i++) {
-// JS:           result[i] = this.deepCopy(array[i], array, i, result, dupStubs, owner);
-// JS:         }
-// JS:         return result;
-// JS:       }
-// JS:
-// JS:       case "object": {
-// JS:         // Plain object. Unfortunately there's no way to pre-allocate the right shape.
-// JS:         let result: Record<string, unknown> = {};
-// JS:         let object = <Record<string, unknown>>value;
-// JS:         for (let i in object) {
-// JS:           result[i] = this.deepCopy(object[i], object, i, result, dupStubs, owner);
-// JS:         }
-// JS:         return result;
-// JS:       }
-// JS:
-// JS:       case "stub":
-// JS:       case "rpc-promise": {
-// JS:         let stub = <RpcStub>value;
-// JS:         let hook: StubHook;
-// JS:         if (dupStubs) {
-// JS:           hook = unwrapStubAndDup(stub);
-// JS:         } else {
-// JS:           hook = unwrapStubTakingOwnership(stub);
-// JS:         }
-// JS:         if (stub instanceof RpcPromise) {
-// JS:           let promise = new RpcPromise(hook, []);
-// JS:           this.promises!.push({parent, property, promise});
-// JS:           return promise;
-// JS:         } else {
-// JS:           this.hooks!.push(hook);
-// JS:           return new RpcStub(hook);
-// JS:         }
-// JS:       }
-// JS:
-// JS:       case "function":
-// JS:       case "rpc-target": {
-// JS:         let target = <RpcTarget | Function>value;
-// JS:         let hook: StubHook;
-// JS:         if (owner) {
-// JS:           hook = owner.getHookForRpcTarget(target, oldParent, dupStubs);
-// JS:         } else {
-// JS:           hook = TargetStubHook.create(target, oldParent);
-// JS:         }
-// JS:         this.hooks!.push(hook);
-// JS:         return new RpcStub(hook);
-// JS:       }
-// JS:
-// JS:       case "rpc-thenable": {
-// JS:         let target = <RpcTarget>value;
-// JS:         let promise: RpcPromise;
-// JS:         if (owner) {
-// JS:           promise = new RpcPromise(owner.getHookForRpcTarget(target, oldParent, dupStubs), []);
-// JS:         } else {
-// JS:           promise = new RpcPromise(TargetStubHook.create(target, oldParent), []);
-// JS:         }
-// JS:         this.promises!.push({parent, property, promise});
-// JS:         return promise;
-// JS:       }
-// JS:
-// JS:       case "writable": {
-// JS:         let stream = <WritableStream>value;
-// JS:         let hook: StubHook;
-// JS:         if (owner) {
-// JS:           hook = owner.getHookForWritableStream(stream, oldParent, dupStubs);
-// JS:         } else {
-// JS:           hook = streamImpl.createWritableStreamHook(stream);
-// JS:         }
-// JS:         this.hooks!.push(hook);
-// JS:         return stream;
-// JS:       }
-// JS:
-// JS:       case "readable": {
-// JS:         // Note that we don't use tee() here because we treat streams as reference types -- we
-// JS:         // actually want to share the same body. tee()ing the stream would force the runtime to
-// JS:         // buffer a copy of the whole body which would usually never be read.
-// JS:         let stream = <ReadableStream>value;
-// JS:         let hook: StubHook;
-// JS:         if (owner) {
-// JS:           hook = owner.getHookForReadableStream(stream, oldParent, dupStubs);
-// JS:         } else {
-// JS:           hook = streamImpl.createReadableStreamHook(stream);
-// JS:         }
-// JS:         this.hooks!.push(hook);
-// JS:         return stream;
-// JS:       }
-// JS:
-// JS:       case "headers":
-// JS:         return new Headers(<Headers>value);
-// JS:
-// JS:       case "request": {
-// JS:         let req = <Request>value;
-// JS:         if (req.body) {
-// JS:           // Note "deep-copy" of a ReadableStream always returns the same stream, but we still
-// JS:           // need to run it in order to handle refcounting / disposal properly.
-// JS:           this.deepCopy(req.body, req, "body", req, dupStubs, owner);
-// JS:         }
-// JS:
-// JS:         // Make an actual copy of the object, e.g. so the headers are copied.
-// JS:         // Note that it would be incorrect to use clone() here since that would tee() the body
-// JS:         // stream.
-// JS:         return new Request(req);
-// JS:       }
-// JS:
-// JS:       case "response": {
-// JS:         let resp = <Response>value;
-// JS:         if (resp.body) {
-// JS:           // Note "deep-copy" of a ReadableStream always returns the same stream, but we still
-// JS:           // need to run it in order to handle refcounting / disposal properly.
-// JS:           this.deepCopy(resp.body, resp, "body", resp, dupStubs, owner);
-// JS:         }
-// JS:
-// JS:         // Make an actual copy of the object, e.g. so the headers are copied.
-// JS:         // Note that it would be incorrect to use clone() here since that would tee() the body
-// JS:         // stream.
-// JS:         return new Response(resp.body, resp);
-// JS:       }
-// JS:
-// JS:       default:
-// JS:         kind satisfies never;
-// JS:         throw new Error("unreachable");
-// JS:     }
-// JS:   }
-// JS:
-// JS:   // Ensures that if the value originally came from an unowned source, we have replaced it with a
-// JS:   // deep copy.
-// JS:   public ensureDeepCopied() {
-// JS:     if (this.source !== "owned") {
-// JS:       // If we came from call params, we need to dupe any stubs. Otherwise (we came from a return),
-// JS:       // we take ownership of all stubs.
-// JS:       let dupStubs = this.source === "params";
-// JS:
-// JS:       this.hooks = [];
-// JS:       this.promises = [];
-// JS:
-// JS:       // Deep-copy the value.
-// JS:       try {
-// JS:         this.value = this.deepCopy(this.value, undefined, "value", this, dupStubs, this);
-// JS:       } catch (err) {
-// JS:         // Roll back the change.
-// JS:         this.hooks = undefined;
-// JS:         this.promises = undefined;
-// JS:         throw err;
-// JS:       }
-// JS:
-// JS:       // We now own the value.
-// JS:       this.source = "owned";
-// JS:
-// JS:       // `rpcTargets` should have been left empty. We can throw it out.
-// JS:       if (this.rpcTargets && this.rpcTargets.size > 0) {
-// JS:         throw new Error("Not all rpcTargets were accounted for in deep-copy?");
-// JS:       }
-// JS:       this.rpcTargets = undefined;
-// JS:     }
-// JS:   }
-// JS:
-// JS:   // Resolve all promises in this payload and then assign the final value into `parent[property]`.
-// JS:   private deliverTo(parent: object, property: string | number, promises: Promise<any>[]): void {
-// JS:     this.ensureDeepCopied();
-// JS:
-// JS:     if (this.value instanceof RpcPromise) {
-// JS:       RpcPayload.deliverRpcPromiseTo(this.value, parent, property, promises);
-// JS:     } else {
-// JS:       (<any>parent)[property] = this.value;
-// JS:
-// JS:       for (let record of this.promises!) {
-// JS:         // Note that because we already did ensureDeepCopied(), replacing each promise with its
-// JS:         // resolution does not interfere with disposal later on -- disposal will be based on the
-// JS:         // `promises` list, so will still properly dispose each promise, which in turn disposes
-// JS:         // the promise's eventual payload.
-// JS:         RpcPayload.deliverRpcPromiseTo(record.promise, record.parent, record.property, promises);
-// JS:       }
-// JS:     }
-// JS:   }
-// JS:
-// JS:   private static deliverRpcPromiseTo(
-// JS:       promise: RpcPromise, parent: object, property: string | number,
-// JS:       promises: Promise<unknown>[]) {
-// JS:     // deepCopy() should have replaced any property stubs with normal promise stubs.
-// JS:     let hook = unwrapStubNoProperties(promise);
-// JS:     if (!hook) {
-// JS:       throw new Error("property promises should have been resolved earlier");
-// JS:     }
-// JS:
-// JS:     let inner = hook.pull();
-// JS:     if (inner instanceof RpcPayload) {
-// JS:       // Immediately resolved to payload.
-// JS:       inner.deliverTo(parent, property, promises);
-// JS:     } else {
-// JS:       // It's a promise.
-// JS:       promises.push(inner.then(payload => {
-// JS:         let subPromises: Promise<unknown>[] = [];
-// JS:         payload.deliverTo(parent, property, subPromises);
-// JS:         if (subPromises.length > 0) {
-// JS:           return Promise.all(subPromises);
-// JS:         }
-// JS:       }));
-// JS:     }
-// JS:   }
-// JS:
-// JS:   // Call the given function with the payload as an argument. The call is made synchronously if
-// JS:   // possible, in order to maintain e-order. However, if any RpcPromises exist in the payload,
-// JS:   // they are awaited and substituted before calling the function. The result of the call is
-// JS:   // wrapped into another payload.
-// JS:   //
-// JS:   // The payload is automatically disposed after the call completes. The caller should not call
-// JS:   // dispose().
-// JS:   public async deliverCall(func: Function, thisArg: object | undefined): Promise<RpcPayload> {
-// JS:     try {
-// JS:       let promises: Promise<void>[] = [];
-// JS:       this.deliverTo(this, "value", promises);
-// JS:
-// JS:       // WARNING: It is critical that if the promises list is empty, we do not await anything, so
-// JS:       //   that the function is called immediately and synchronously. Otherwise, we might violate
-// JS:       //   e-order.
-// JS:       if (promises.length > 0) {
-// JS:         await Promise.all(promises);
-// JS:       }
-// JS:
-// JS:       // Call the function.
-// JS:       let result = Function.prototype.apply.call(func, thisArg, this.value);
-// JS:
-// JS:       if (result instanceof RpcPromise) {
-// JS:         // Special case: If the function immediately returns RpcPromise, we don't want to await it,
-// JS:         // since that will actually wait for the promise. Instead we want to construct a payload
-// JS:         // around it directly.
-// JS:         return RpcPayload.fromAppReturn(result);
-// JS:       } else {
-// JS:         // In all other cases, await the result (which may or may not be a promise, but `await`
-// JS:         // will just pass through non-promises).
-// JS:         return RpcPayload.fromAppReturn(await result);
-// JS:       }
-// JS:     } finally {
-// JS:       this.dispose();
-// JS:     }
-// JS:   }
-// JS:
-// JS:   // Deliver this payload as the argument list to `WritableStreamDefaultWriter.write(chunk)`.
-// JS:   //
-// JS:   // Unlike deliverCall(), stream chunks are enqueued and read asynchronously. Disposing the
-// JS:   // payload when write() returns would free any stubs nested in the chunk before the reader
-// JS:   // dequeues them. A chunk only needs its disposal deferred if it owns capabilities the
-// JS:   // reader will use after write() resolves. Pure data (primitives, bytes, Date, plain
-// JS:   // objects) carries no capabilities, so dispose it immediately and leave the chunk
-// JS:   // untouched. Bare RpcStubs already implement Symbol.dispose, so their own disposer owns
-// JS:   // the capability; only attach a payload disposer otherwise.
-// JS:   //
-// JS:   // Expects `this.value` to be a one-element argument array `[chunk]`. Returns a payload
-// JS:   // wrapping the (void) write result.
-// JS:   public async deliverStreamWrite(
-// JS:       writer: { write(chunk: unknown): Promise<void> }): Promise<RpcPayload> {
-// JS:     try {
-// JS:       let promises: Promise<void>[] = [];
-// JS:       this.deliverTo(this, "value", promises);
-// JS:
-// JS:       // Same e-order constraint as deliverCall: if there are no nested promises, call write
-// JS:       // synchronously so concurrent writes stay ordered.
-// JS:       if (promises.length > 0) {
-// JS:         await Promise.all(promises);
-// JS:       }
-// JS:
-// JS:       let chunk = (this.value as unknown[])[0];
-// JS:
-// JS:       // deliverTo → ensureDeepCopied, so hooks/promises are populated.
-// JS:       const ownsCapabilities = this.hooks!.length > 0 || this.promises!.length > 0;
-// JS:
-// JS:       if (ownsCapabilities && chunk instanceof Object) {
-// JS:         // Keep the payload alive until the reader disposes the chunk. A bare RpcStub already
-// JS:         // implements Symbol.dispose (its own disposer owns the hook); only attach otherwise.
-// JS:         if (!(Symbol.dispose in chunk)) {
-// JS:           Object.defineProperty(chunk, Symbol.dispose, {
-// JS:             value: () => this.dispose(),
-// JS:             writable: true,
-// JS:             enumerable: false,
-// JS:             configurable: true,
-// JS:           });
-// JS:         }
-// JS:         await writer.write(chunk);
-// JS:         return RpcPayload.fromAppReturn(undefined);
-// JS:       }
-// JS:
-// JS:       // No capabilities (or non-object chunk): nothing to keep alive beyond the write.
-// JS:       await writer.write(chunk);
-// JS:       this.dispose();
-// JS:       return RpcPayload.fromAppReturn(undefined);
-// JS:     } catch (err) {
-// JS:       // deliverTo / write failed: free any capabilities we still own.
-// JS:       this.dispose();
-// JS:       throw err;
-// JS:     }
-// JS:   }
-// JS:
-// JS:   // Produce a promise for this payload for return to the application. Any RpcPromises in the
-// JS:   // payload are awaited and substituted with their results first.
-// JS:   //
-// JS:   // The returned object will have a disposer which disposes the payload. The caller should not
-// JS:   // separately dispose it.
-// JS:   public async deliverResolve(): Promise<unknown> {
-// JS:     try {
-// JS:       let promises: Promise<void>[] = [];
-// JS:       this.deliverTo(this, "value", promises);
-// JS:
-// JS:       if (promises.length > 0) {
-// JS:         await Promise.all(promises);
-// JS:       }
-// JS:
-// JS:       let result = this.value;
-// JS:
-// JS:       // Add disposer to result.
-// JS:       if (result instanceof Object) {
-// JS:         if (!(Symbol.dispose in result)) {
-// JS:           // We want the disposer to be non-enumerable as otherwise it gets in the way of things
-// JS:           // like unit tests trying to deep-compare the result to an object.
-// JS:           Object.defineProperty(result, Symbol.dispose, {
-// JS:             // NOTE: Using `this.dispose.bind(this)` here causes Playwright's build of
-// JS:             //   Chromium 140.0.7339.16 to fail when the object is assigned to a `using` variable,
-// JS:             //   with the error:
-// JS:             //       TypeError: Symbol(Symbol.dispose) is not a function
-// JS:             //   I cannot reproduce this problem in Chrome 140.0.7339.127 nor in Node or workerd,
-// JS:             //   so maybe it was a short-lived V8 bug or something. To be safe, though, we use
-// JS:             //   `() => this.dispose()`, which seems to always work.
-// JS:             value: () => this.dispose(),
-// JS:             writable: true,
-// JS:             enumerable: false,
-// JS:             configurable: true,
-// JS:           });
-// JS:         }
-// JS:       }
-// JS:
-// JS:       return result;
-// JS:     } catch (err) {
-// JS:       // Automatically dispose since the application will never receive the disposable...
-// JS:       this.dispose();
-// JS:       throw err;
-// JS:     }
-// JS:   }
-// JS:
-// JS:   public dispose() {
-// JS:     if (this.source === "owned") {
-// JS:       // Oh good, we can just run through them.
-// JS:       this.hooks!.forEach(hook => hook.dispose());
-// JS:       this.promises!.forEach(promise => promise.promise[Symbol.dispose]());
-// JS:     } else if (this.source === "return") {
-// JS:       // Value received directly from app as a return value. We take ownership of all stubs, so we
-// JS:       // must recursively scan it for things to dispose.
-// JS:       this.disposeImpl(this.value, undefined);
-// JS:       if (this.rpcTargets && this.rpcTargets.size > 0) {
-// JS:         throw new Error("Not all rpcTargets were accounted for in disposeImpl()?");
-// JS:       }
-// JS:     } else {
-// JS:       // this.source is "params". We don't own the stubs within.
-// JS:     }
-// JS:
-// JS:     // Make dispose() idempotent.
-// JS:     this.source = "owned";
-// JS:     this.hooks = [];
-// JS:     this.promises = [];
-// JS:   }
-// JS:
-// JS:   // Recursive dispose, called only when `source` is "return".
-// JS:   private disposeImpl(value: unknown, parent: object | undefined) {
-// JS:     let kind = typeForRpc(value);
-// JS:     switch (kind) {
-// JS:       case "unsupported":
-// JS:       case "primitive":
-// JS:       case "bigint":
-// JS:       case "bytes":
-// JS:       case "blob":
-// JS:       case "date":
-// JS:       case "url":
-// JS:       case "error":
-// JS:       case "undefined":
-// JS:         return;
-// JS:
-// JS:       case "array": {
-// JS:         let array = <Array<unknown>>value;
-// JS:         let len = array.length;
-// JS:         for (let i = 0; i < len; i++) {
-// JS:           this.disposeImpl(array[i], array);
-// JS:         }
-// JS:         return;
-// JS:       }
-// JS:
-// JS:       case "object": {
-// JS:         let object = <Record<string, unknown>>value;
-// JS:         for (let i in object) {
-// JS:           this.disposeImpl(object[i], object);
-// JS:         }
-// JS:         return;
-// JS:       }
-// JS:
-// JS:       case "stub":
-// JS:       case "rpc-promise": {
-// JS:         let stub = <RpcStub>value;
-// JS:         let hook = unwrapStubNoProperties(stub);
-// JS:         if (hook) {
-// JS:           hook.dispose();
-// JS:         }
-// JS:         return;
-// JS:       }
-// JS:
-// JS:       case "function":
-// JS:       case "rpc-target": {
-// JS:         let target = <RpcTarget | Function>value;
-// JS:         let hook = this.rpcTargets?.get(target);
-// JS:         if (hook) {
-// JS:           // We created a hook around this target earlier. Dispose it now.
-// JS:           hook.dispose();
-// JS:           this.rpcTargets!.delete(target);
-// JS:         } else {
-// JS:           // There never was a stub pointing at this target. This could be because:
-// JS:           // * The call was used only for promise pipelining, so the result was never serialized,
-// JS:           //   so it never got added to `rpcTargets`.
-// JS:           // * The same RpcTarget appears in the results twice, and we already disposed the hook
-// JS:           //   when we saw it earlier. Note that it's intentional that we should call the disposer
-// JS:           //   twice if the same object appears twice.
-// JS:           disposeRpcTarget(target);
-// JS:         }
-// JS:         return;
-// JS:       }
-// JS:
-// JS:       case "rpc-thenable":
-// JS:         // Since thenables are promises, we don't own them, so we don't dispose them.
-// JS:         return;
-// JS:
-// JS:       case "headers":
-// JS:         // Headers have no owned resources to dispose.
-// JS:         return;
-// JS:
-// JS:       case "request": {
-// JS:         // The body may be a ReadableStream that has an associated hook in rpcTargets.
-// JS:         let req = <Request>value;
-// JS:         if (req.body) this.disposeImpl(req.body, req);
-// JS:         // TODO: When we support AbortSignal, we may need to dispose request.signal here?
-// JS:         return;
-// JS:       }
-// JS:
-// JS:       case "response": {
-// JS:         // The body may be a ReadableStream that has an associated hook in rpcTargets.
-// JS:         let resp = <Response>value;
-// JS:         if (resp.body) this.disposeImpl(resp.body, resp);
-// JS:         // TODO: When we support WebSocket, we may need to dispose response.webSocket here?
-// JS:         return;
-// JS:       }
-// JS:
-// JS:       case "writable": {
-// JS:         let stream = <WritableStream>value;
-// JS:         let hook = this.rpcTargets?.get(stream);
-// JS:         if (hook) {
-// JS:           this.rpcTargets!.delete(stream);
-// JS:         } else {
-// JS:           // Create a hook just so we can call its disposer for consistent behavior, which will
-// JS:           // abort the stream.
-// JS:           hook = streamImpl.createWritableStreamHook(stream);
-// JS:         }
-// JS:
-// JS:         hook.dispose();
-// JS:
-// JS:         return;
-// JS:       }
-// JS:
-// JS:       case "readable": {
-// JS:         let stream = <ReadableStream>value;
-// JS:         let hook = this.rpcTargets?.get(stream);
-// JS:         if (hook) {
-// JS:           this.rpcTargets!.delete(stream);
-// JS:         } else {
-// JS:           // Create a hook just so we can call its disposer for consistent behavior, which will
-// JS:           // cancel the stream.
-// JS:           hook = streamImpl.createReadableStreamHook(stream);
-// JS:         }
-// JS:
-// JS:         hook.dispose();
-// JS:
-// JS:         return;
-// JS:       }
-// JS:
-// JS:       default:
-// JS:         kind satisfies never;
-// JS:         return;
-// JS:     }
-// JS:   }
-// JS:
-// JS:   // Ignore unhandled rejections in all promises in this payload -- that is, all promises that
-// JS:   // *would* be awaited if this payload were to be delivered. See the similarly-named method of
-// JS:   // StubHook for explanation.
-// JS:   ignoreUnhandledRejections(): void {
-// JS:     if (this.hooks) {
-// JS:       // Propagate to all stubs and promises.
-// JS:       this.hooks.forEach(hook => {
-// JS:         hook.ignoreUnhandledRejections();
-// JS:       });
-// JS:       this.promises!.forEach(
-// JS:           promise => unwrapStubOrParent(promise.promise).ignoreUnhandledRejections());
-// JS:     } else {
-// JS:       // Ugh we have to walk the tree.
-// JS:       this.ignoreUnhandledRejectionsImpl(this.value);
-// JS:     }
-// JS:   }
-// JS:
-// JS:   private ignoreUnhandledRejectionsImpl(value: unknown) {
-// JS:     let kind = typeForRpc(value);
-// JS:     switch (kind) {
-// JS:       case "unsupported":
-// JS:       case "primitive":
-// JS:       case "bigint":
-// JS:       case "bytes":
-// JS:       case "blob":
-// JS:       case "date":
-// JS:       case "error":
-// JS:       case "undefined":
-// JS:       case "function":
-// JS:       case "rpc-target":
-// JS:       case "writable":
-// JS:       case "readable":
-// JS:       case "url":
-// JS:       case "headers":
-// JS:       case "request":
-// JS:       case "response":
-// JS:         return;
-// JS:
-// JS:       case "array": {
-// JS:         let array = <Array<unknown>>value;
-// JS:         let len = array.length;
-// JS:         for (let i = 0; i < len; i++) {
-// JS:           this.ignoreUnhandledRejectionsImpl(array[i]);
-// JS:         }
-// JS:         return;
-// JS:       }
-// JS:
-// JS:       case "object": {
-// JS:         let object = <Record<string, unknown>>value;
-// JS:         for (let i in object) {
-// JS:           this.ignoreUnhandledRejectionsImpl(object[i]);
-// JS:         }
-// JS:         return;
-// JS:       }
-// JS:
-// JS:       case "stub":
-// JS:       case "rpc-promise":
-// JS:         unwrapStubOrParent(<RpcStub>value).ignoreUnhandledRejections();
-// JS:         return;
-// JS:
-// JS:       case "rpc-thenable":
-// JS:         (<any>value).then((_: any) => {}, (_: any) => {});
-// JS:         return;
-// JS:
-// JS:       default:
-// JS:         kind satisfies never;
-// JS:         return;
-// JS:     }
-// JS:   }
-// JS: };
+/// An owned RPC call argument or promise resolution.
+#[derive(Clone, Debug)]
+pub struct RpcPayload {
+    /// The root dynamic value.
+    pub value: CapnwebValue,
+}
+
+impl RpcPayload {
+    // JS:   // Create a payload from a value passed as params to an RPC from the app.
+    // JS:   //
+    // JS:   // The payload does NOT take ownership of any stubs in `value`, and but promises not to modify
+    // JS:   // `value`. If the payload is delivered locally, `value` will be deep-copied first, so as not
+    // JS:   // to have the sender and recipient end up sharing the same mutable object. `value` will not be
+    // JS:   // touched again after the call returns synchronously (returns a promise) -- by that point,
+    // JS:   // the value has either been copied or serialized to the wire.
+    // JS:   public static fromAppParams(value: unknown): RpcPayload {
+    // JS:     return new RpcPayload(value, "params");
+    // JS:   }
+    /// Takes ownership of application call parameters.
+    pub fn from_app_params(value: CapnwebValue) -> Self {
+        Self { value }
+    }
+    // JS:
+    // JS:   // Create a payload from a value return from an RPC implementation by the app.
+    // JS:   //
+    // JS:   // Unlike fromAppParams(), in this case the payload takes ownership of all stubs in `value`, and
+    // JS:   // may hold onto `value` for an arbitrarily long time (e.g. to serve pipelined requests). It
+    // JS:   // will still avoid modifying `value` and will make a deep copy if it is delivered locally.
+    // JS:   public static fromAppReturn(value: unknown): RpcPayload {
+    // JS:     return new RpcPayload(value, "return");
+    // JS:   }
+    /// Takes ownership of an application return value.
+    pub fn from_app_return(value: CapnwebValue) -> Self {
+        Self { value }
+    }
+    // JS:
+    // JS:   // Combine an array of payloads into a single payload whose value is an array. Ownership of all
+    // JS:   // stubs is transferred from the inputs to the outputs, hence if the output is disposed, the
+    // JS:   // inputs should not be. (In case of exception, nothing is disposed, though.)
+    // JS:   public static fromArray(array: RpcPayload[]): RpcPayload {
+    // JS:     let hooks: StubHook[] = [];
+    // JS:     let promises: LocatedPromise[] = [];
+    // JS:
+    // JS:     let resultArray: unknown[] = [];
+    // JS:
+    // JS:     for (let payload of array) {
+    // JS:       payload.ensureDeepCopied();
+    // JS:       for (let hook of payload.hooks!) {
+    // JS:         hooks.push(hook);
+    // JS:       }
+    // JS:       for (let promise of payload.promises!) {
+    // JS:         if (promise.parent === payload) {
+    // JS:           // This promise is the root of the source payload. We need to reparent it to its proper
+    // JS:           // location in the result array.
+    // JS:           promise = {
+    // JS:             parent: resultArray,
+    // JS:             property: resultArray.length,
+    // JS:             promise: promise.promise
+    // JS:           };
+    // JS:         }
+    // JS:         promises.push(promise);
+    // JS:       }
+    // JS:       resultArray.push(payload.value);
+    // JS:     }
+    // JS:
+    // JS:     return new RpcPayload(resultArray, "owned", hooks, promises);
+    // JS:   }
+    /// Combines payloads into an array without additional hook bookkeeping.
+    pub fn from_array(array: Vec<Self>) -> Self {
+        Self {
+            value: CapnwebValue::Array(array.into_iter().map(|payload| payload.value).collect()),
+        }
+    }
+    // JS:
+    // JS:   // Create a payload from a value parsed off the wire using Evaluator.evaluate().
+    // JS:   //
+    // JS:   // A payload is constructed with a null value and the given hooks and promises arrays. The value
+    // JS:   // is expected to be filled in by the evaluator, and the hooks and promises arrays are expected
+    // JS:   // to be extended with stubs found during parsing. (This weird usage model is necessary so that
+    // JS:   // if the root value turns out to be a promise, its `parent` in `promises` can be the payload
+    // JS:   // object itself.)
+    // JS:   //
+    // JS:   // When done, the payload takes ownership of the final value and all the stubs within. It may
+    // JS:   // modify the value in preparation for delivery, and may deliver the value directly to the app
+    // JS:   // without copying.
+    // JS:   public static forEvaluate(hooks: StubHook[], promises: LocatedPromise[]) {
+    // JS:     return new RpcPayload(null, "owned", hooks, promises);
+    // JS:   }
+    pub(crate) fn for_evaluate(_hooks: Vec<StubHook>, _promises: Vec<LocatedPromise>) -> Self {
+        Self {
+            value: CapnwebValue::Null,
+        }
+    }
+    // JS:
+    // JS:   // Deep-copy the given value, including dup()ing all stubs.
+    // JS:   //
+    // JS:   // If `value` is a function, it should be bound to `oldParent` as its `this`.
+    // JS:   //
+    // JS:   // If deep-copying from a branch of some other RpcPayload, it must be provided, to make sure
+    // JS:   // RpcTargets found within don't get duplicate stubs.
+    // JS:   public static deepCopyFrom(
+    // JS:       value: unknown, oldParent: object | undefined, owner: RpcPayload | null): RpcPayload {
+    // JS:     let result = new RpcPayload(null, "owned", [], []);
+    // JS:     result.value = result.deepCopy(value, oldParent, "value", result, /*dupStubs=*/true, owner);
+    // JS:     return result;
+    // JS:   }
+    pub(crate) fn deep_copy_from(
+        value: &CapnwebValue,
+        _old_parent: Option<&CapnwebValue>,
+        _owner: Option<&RpcPayload>,
+    ) -> Self {
+        Self {
+            value: value.clone(),
+        }
+    }
+    // JS:
+    // JS:   // Private constructor; use factory functions above to construct.
+    // JS:   private constructor(
+    // JS:     // The payload value.
+    // JS:     public value: unknown,
+    // JS:
+    // JS:     // What is the provenance of `value`?
+    // JS:     // "params": It came from the app, in params to a call. We must dupe any stubs within.
+    // JS:     // "return": It came from the app, returned from a call. We take ownership of all stubs within.
+    // JS:     // "owned": This value belongs fully to us, either because it was deserialized from the wire
+    // JS:     //   or because we deep-copied a value from the app.
+    // JS:     private source: "params" | "return" | "owned",
+    // JS:
+    // JS:     // `hooks` and `promises` are filled in only if `value` belongs to us (`source` is "owned") and
+    // JS:     // so can safely be delivered to the app. If `value` came from then app in the first place,
+    // JS:     // then it cannot be delivered back to the app nor modified by us without first deep-copying
+    // JS:     // it. `hooks` and `promises` will be computed as part of the deep-copy.
+    // JS:
+    // JS:     // All non-promise stubs found in `value`. This list is needed only for the purpose of being
+    // JS:     // able to dispose them when desired. This intentionally doesn't inculde promises because they
+    // JS:     // are already covered by `promises`, below.
+    // JS:     private hooks?: StubHook[],
+    // JS:
+    // JS:     // All promises found in `value`. The locations of each promise are provided to allow
+    // JS:     // substitutions later.
+    // JS:     private promises?: LocatedPromise[]
+    // JS:   ) {}
+    // JS:
+    // JS:   // For `source === "return"` payloads only, this tracks any StubHooks created around RpcTargets
+    // JS:   // or WritableStreams found in the payload at the time that it is serialized (or deep-copied) for
+    // JS:   // return, so that we can make sure they are not disposed before the pipeline ends.
+    // JS:   //
+    // JS:   // This is initialized on first use.
+    // JS:   private rpcTargets?: Map<RpcTarget | Function | WritableStream | ReadableStream, StubHook>;
+    // JS:
+    // JS:   // Get the StubHook representing the given RpcTarget found inside this payload.
+    // JS:   public getHookForRpcTarget(target: RpcTarget | Function, parent: object | undefined,
+    // JS:                              dupStubs: boolean = true): StubHook {
+    // JS:     if (this.source === "params") {
+    // JS:       if (dupStubs) {
+    // JS:         // We aren't supposed to take ownership of stubs appearing in params -- we're supposed to
+    // JS:         // dupe them. But an RpcTarget isn't a stub. If we create a stub around it, the stub takes
+    // JS:         // ownership.
+    // JS:         //
+    // JS:         // Usually, people passing raw RpcTargets into functions actually want the call to take
+    // JS:         // ownership -- that is, they want to have the disposer called later.
+    // JS:         //
+    // JS:         // But, if the RpcTarget happens to implement a `dup()` method, we will go ahead and call
+    // JS:         // that method, and wrap whatever it returns instead. This method wouldn't actually be
+    // JS:         // available over RPC anyway (since calling `dup()` on the client-side stub just dupes the
+    // JS:         // stub), so if an `RpcTarget` implements this, it must intend for us to use it.
+    // JS:         //
+    // JS:         // This is particularly important for the case of workerd-native RpcStubs, that is, stubs
+    // JS:         // from the built-in RPC system, rather than the pure-JS implementation of Cap'n Web.
+    // JS:         // We treat those stubs as RpcTargets. But, we do need to dup() them, just like we would
+    // JS:         // our own stubs.
+    // JS:
+    // JS:         let dupable = target as any;
+    // JS:         if (typeof dupable.dup === "function") {
+    // JS:           target = dupable.dup();
+    // JS:         }
+    // JS:       }
+    // JS:
+    // JS:       return TargetStubHook.create(target, parent);
+    // JS:     } else if (this.source === "return") {
+    // JS:       // If dupStubs is true, we want to both make sure the map contains the stub, and also return
+    // JS:       // a dup of that stub.
+    // JS:       //
+    // JS:       // If dupStubs is false, then we are being called as part of ensureDeepCopy(), i.e. replacing
+    // JS:       // ourselves with a deep copy. In this case we actually want the copy to end up owning all
+    // JS:       // the hooks, and the map to be left empty. So what we do in this case is:
+    // JS:       // * If the target is not in the map, we just create it, but don't populate the map.
+    // JS:       // * If the target *is* in the map, we *remove* the hook from the map, and return it.
+    // JS:
+    // JS:       let hook = this.rpcTargets?.get(target);
+    // JS:       if (hook) {
+    // JS:         if (dupStubs) {
+    // JS:           return hook.dup();
+    // JS:         } else {
+    // JS:           this.rpcTargets?.delete(target);
+    // JS:           return hook;
+    // JS:         }
+    // JS:       } else {
+    // JS:         hook = TargetStubHook.create(target, parent);
+    // JS:         if (dupStubs) {
+    // JS:           if (!this.rpcTargets) {
+    // JS:             this.rpcTargets = new Map;
+    // JS:           }
+    // JS:           this.rpcTargets.set(target, hook);
+    // JS:           return hook.dup();
+    // JS:         } else {
+    // JS:           return hook;
+    // JS:         }
+    // JS:       }
+    // JS:     } else {
+    // JS:       throw new Error("owned payload shouldn't contain raw RpcTargets");
+    // JS:     }
+    // JS:   }
+    // JS:
+    // JS:   // Get the StubHook representing the given WritableStream found inside this payload.
+    // JS:   public getHookForWritableStream(stream: WritableStream, parent: object | undefined,
+    // JS:                                   dupStubs: boolean = true): StubHook {
+    // JS:     if (this.source === "params") {
+    // JS:       // For params, we always create a new hook. WritableStreams don't have a dup() method,
+    // JS:       // and it wouldn't really make sense anyway since we're locking the stream by calling
+    // JS:       // getWriter().
+    // JS:       return streamImpl.createWritableStreamHook(stream);
+    // JS:     } else if (this.source === "return") {
+    // JS:       // Similar logic to getHookForRpcTarget().
+    // JS:       let hook = this.rpcTargets?.get(stream);
+    // JS:       if (hook) {
+    // JS:         if (dupStubs) {
+    // JS:           return hook.dup();
+    // JS:         } else {
+    // JS:           this.rpcTargets?.delete(stream);
+    // JS:           return hook;
+    // JS:         }
+    // JS:       } else {
+    // JS:         hook = streamImpl.createWritableStreamHook(stream);
+    // JS:         if (dupStubs) {
+    // JS:           if (!this.rpcTargets) {
+    // JS:             this.rpcTargets = new Map;
+    // JS:           }
+    // JS:           this.rpcTargets.set(stream, hook);
+    // JS:           return hook.dup();
+    // JS:         } else {
+    // JS:           return hook;
+    // JS:         }
+    // JS:       }
+    // JS:     } else {
+    // JS:       throw new Error("owned payload shouldn't contain raw WritableStreams");
+    // JS:     }
+    // JS:   }
+    // JS:
+    // JS:   // Get the StubHook representing the given ReadableStream found inside this payload.
+    // JS:   public getHookForReadableStream(stream: ReadableStream, parent: object | undefined,
+    // JS:                                   dupStubs: boolean = true): StubHook {
+    // JS:     if (this.source === "params") {
+    // JS:       return streamImpl.createReadableStreamHook(stream);
+    // JS:     } else if (this.source === "return") {
+    // JS:       let hook = this.rpcTargets?.get(stream);
+    // JS:       if (hook) {
+    // JS:         if (dupStubs) {
+    // JS:           return hook.dup();
+    // JS:         } else {
+    // JS:           this.rpcTargets?.delete(stream);
+    // JS:           return hook;
+    // JS:         }
+    // JS:       } else {
+    // JS:         hook = streamImpl.createReadableStreamHook(stream);
+    // JS:         if (dupStubs) {
+    // JS:           if (!this.rpcTargets) {
+    // JS:             this.rpcTargets = new Map;
+    // JS:           }
+    // JS:           this.rpcTargets.set(stream, hook);
+    // JS:           return hook.dup();
+    // JS:         } else {
+    // JS:           return hook;
+    // JS:         }
+    // JS:       }
+    // JS:     } else {
+    // JS:       throw new Error("owned payload shouldn't contain raw ReadableStreams");
+    // JS:     }
+    // JS:   }
+    // JS:
+    // JS:   private deepCopy(
+    // JS:       value: unknown, oldParent: object | undefined, property: string | number, parent: object,
+    // JS:       dupStubs: boolean, owner: RpcPayload | null): unknown {
+    // JS:     let kind = typeForRpc(value);
+    // JS:     switch (kind) {
+    // JS:       case "unsupported":
+    // JS:         // This will throw later on when someone tries to do something with it.
+    // JS:         return value;
+    // JS:
+    // JS:       case "primitive":
+    // JS:       case "bigint":
+    // JS:       case "date":
+    // JS:       case "bytes":
+    // JS:       case "blob":
+    // JS:       case "url":
+    // JS:       case "error":
+    // JS:       case "undefined":
+    // JS:         // immutable, no need to copy
+    // JS:         // TODO: Should errors be copied if they have own properties?
+    // JS:         return value;
+    // JS:
+    // JS:       case "array": {
+    // JS:         // We have to construct the new array first, then fill it in, so we can pass it as the
+    // JS:         // parent.
+    // JS:         let array = <Array<unknown>>value;
+    // JS:         let len = array.length;
+    // JS:         let result = new Array(len);
+    // JS:         for (let i = 0; i < len; i++) {
+    // JS:           result[i] = this.deepCopy(array[i], array, i, result, dupStubs, owner);
+    // JS:         }
+    // JS:         return result;
+    // JS:       }
+    // JS:
+    // JS:       case "object": {
+    // JS:         // Plain object. Unfortunately there's no way to pre-allocate the right shape.
+    // JS:         let result: Record<string, unknown> = {};
+    // JS:         let object = <Record<string, unknown>>value;
+    // JS:         for (let i in object) {
+    // JS:           result[i] = this.deepCopy(object[i], object, i, result, dupStubs, owner);
+    // JS:         }
+    // JS:         return result;
+    // JS:       }
+    // JS:
+    // JS:       case "stub":
+    // JS:       case "rpc-promise": {
+    // JS:         let stub = <RpcStub>value;
+    // JS:         let hook: StubHook;
+    // JS:         if (dupStubs) {
+    // JS:           hook = unwrapStubAndDup(stub);
+    // JS:         } else {
+    // JS:           hook = unwrapStubTakingOwnership(stub);
+    // JS:         }
+    // JS:         if (stub instanceof RpcPromise) {
+    // JS:           let promise = new RpcPromise(hook, []);
+    // JS:           this.promises!.push({parent, property, promise});
+    // JS:           return promise;
+    // JS:         } else {
+    // JS:           this.hooks!.push(hook);
+    // JS:           return new RpcStub(hook);
+    // JS:         }
+    // JS:       }
+    // JS:
+    // JS:       case "function":
+    // JS:       case "rpc-target": {
+    // JS:         let target = <RpcTarget | Function>value;
+    // JS:         let hook: StubHook;
+    // JS:         if (owner) {
+    // JS:           hook = owner.getHookForRpcTarget(target, oldParent, dupStubs);
+    // JS:         } else {
+    // JS:           hook = TargetStubHook.create(target, oldParent);
+    // JS:         }
+    // JS:         this.hooks!.push(hook);
+    // JS:         return new RpcStub(hook);
+    // JS:       }
+    // JS:
+    // JS:       case "rpc-thenable": {
+    // JS:         let target = <RpcTarget>value;
+    // JS:         let promise: RpcPromise;
+    // JS:         if (owner) {
+    // JS:           promise = new RpcPromise(owner.getHookForRpcTarget(target, oldParent, dupStubs), []);
+    // JS:         } else {
+    // JS:           promise = new RpcPromise(TargetStubHook.create(target, oldParent), []);
+    // JS:         }
+    // JS:         this.promises!.push({parent, property, promise});
+    // JS:         return promise;
+    // JS:       }
+    // JS:
+    // JS:       case "writable": {
+    // JS:         let stream = <WritableStream>value;
+    // JS:         let hook: StubHook;
+    // JS:         if (owner) {
+    // JS:           hook = owner.getHookForWritableStream(stream, oldParent, dupStubs);
+    // JS:         } else {
+    // JS:           hook = streamImpl.createWritableStreamHook(stream);
+    // JS:         }
+    // JS:         this.hooks!.push(hook);
+    // JS:         return stream;
+    // JS:       }
+    // JS:
+    // JS:       case "readable": {
+    // JS:         // Note that we don't use tee() here because we treat streams as reference types -- we
+    // JS:         // actually want to share the same body. tee()ing the stream would force the runtime to
+    // JS:         // buffer a copy of the whole body which would usually never be read.
+    // JS:         let stream = <ReadableStream>value;
+    // JS:         let hook: StubHook;
+    // JS:         if (owner) {
+    // JS:           hook = owner.getHookForReadableStream(stream, oldParent, dupStubs);
+    // JS:         } else {
+    // JS:           hook = streamImpl.createReadableStreamHook(stream);
+    // JS:         }
+    // JS:         this.hooks!.push(hook);
+    // JS:         return stream;
+    // JS:       }
+    // JS:
+    // JS:       case "headers":
+    // JS:         return new Headers(<Headers>value);
+    // JS:
+    // JS:       case "request": {
+    // JS:         let req = <Request>value;
+    // JS:         if (req.body) {
+    // JS:           // Note "deep-copy" of a ReadableStream always returns the same stream, but we still
+    // JS:           // need to run it in order to handle refcounting / disposal properly.
+    // JS:           this.deepCopy(req.body, req, "body", req, dupStubs, owner);
+    // JS:         }
+    // JS:
+    // JS:         // Make an actual copy of the object, e.g. so the headers are copied.
+    // JS:         // Note that it would be incorrect to use clone() here since that would tee() the body
+    // JS:         // stream.
+    // JS:         return new Request(req);
+    // JS:       }
+    // JS:
+    // JS:       case "response": {
+    // JS:         let resp = <Response>value;
+    // JS:         if (resp.body) {
+    // JS:           // Note "deep-copy" of a ReadableStream always returns the same stream, but we still
+    // JS:           // need to run it in order to handle refcounting / disposal properly.
+    // JS:           this.deepCopy(resp.body, resp, "body", resp, dupStubs, owner);
+    // JS:         }
+    // JS:
+    // JS:         // Make an actual copy of the object, e.g. so the headers are copied.
+    // JS:         // Note that it would be incorrect to use clone() here since that would tee() the body
+    // JS:         // stream.
+    // JS:         return new Response(resp.body, resp);
+    // JS:       }
+    // JS:
+    // JS:       default:
+    // JS:         kind satisfies never;
+    // JS:         throw new Error("unreachable");
+    // JS:     }
+    // JS:   }
+    // JS:
+    // JS:   // Ensures that if the value originally came from an unowned source, we have replaced it with a
+    // JS:   // deep copy.
+    // JS:   public ensureDeepCopied() {
+    // JS:     if (this.source !== "owned") {
+    // JS:       // If we came from call params, we need to dupe any stubs. Otherwise (we came from a return),
+    // JS:       // we take ownership of all stubs.
+    // JS:       let dupStubs = this.source === "params";
+    // JS:
+    // JS:       this.hooks = [];
+    // JS:       this.promises = [];
+    // JS:
+    // JS:       // Deep-copy the value.
+    // JS:       try {
+    // JS:         this.value = this.deepCopy(this.value, undefined, "value", this, dupStubs, this);
+    // JS:       } catch (err) {
+    // JS:         // Roll back the change.
+    // JS:         this.hooks = undefined;
+    // JS:         this.promises = undefined;
+    // JS:         throw err;
+    // JS:       }
+    // JS:
+    // JS:       // We now own the value.
+    // JS:       this.source = "owned";
+    // JS:
+    // JS:       // `rpcTargets` should have been left empty. We can throw it out.
+    // JS:       if (this.rpcTargets && this.rpcTargets.size > 0) {
+    // JS:         throw new Error("Not all rpcTargets were accounted for in deep-copy?");
+    // JS:       }
+    // JS:       this.rpcTargets = undefined;
+    // JS:     }
+    // JS:   }
+    // JS:
+    // JS:   // Resolve all promises in this payload and then assign the final value into `parent[property]`.
+    // JS:   private deliverTo(parent: object, property: string | number, promises: Promise<any>[]): void {
+    // JS:     this.ensureDeepCopied();
+    // JS:
+    // JS:     if (this.value instanceof RpcPromise) {
+    // JS:       RpcPayload.deliverRpcPromiseTo(this.value, parent, property, promises);
+    // JS:     } else {
+    // JS:       (<any>parent)[property] = this.value;
+    // JS:
+    // JS:       for (let record of this.promises!) {
+    // JS:         // Note that because we already did ensureDeepCopied(), replacing each promise with its
+    // JS:         // resolution does not interfere with disposal later on -- disposal will be based on the
+    // JS:         // `promises` list, so will still properly dispose each promise, which in turn disposes
+    // JS:         // the promise's eventual payload.
+    // JS:         RpcPayload.deliverRpcPromiseTo(record.promise, record.parent, record.property, promises);
+    // JS:       }
+    // JS:     }
+    // JS:   }
+    // JS:
+    // JS:   private static deliverRpcPromiseTo(
+    // JS:       promise: RpcPromise, parent: object, property: string | number,
+    // JS:       promises: Promise<unknown>[]) {
+    // JS:     // deepCopy() should have replaced any property stubs with normal promise stubs.
+    // JS:     let hook = unwrapStubNoProperties(promise);
+    // JS:     if (!hook) {
+    // JS:       throw new Error("property promises should have been resolved earlier");
+    // JS:     }
+    // JS:
+    // JS:     let inner = hook.pull();
+    // JS:     if (inner instanceof RpcPayload) {
+    // JS:       // Immediately resolved to payload.
+    // JS:       inner.deliverTo(parent, property, promises);
+    // JS:     } else {
+    // JS:       // It's a promise.
+    // JS:       promises.push(inner.then(payload => {
+    // JS:         let subPromises: Promise<unknown>[] = [];
+    // JS:         payload.deliverTo(parent, property, subPromises);
+    // JS:         if (subPromises.length > 0) {
+    // JS:           return Promise.all(subPromises);
+    // JS:         }
+    // JS:       }));
+    // JS:     }
+    // JS:   }
+    // JS:
+    // JS:   // Call the given function with the payload as an argument. The call is made synchronously if
+    // JS:   // possible, in order to maintain e-order. However, if any RpcPromises exist in the payload,
+    // JS:   // they are awaited and substituted before calling the function. The result of the call is
+    // JS:   // wrapped into another payload.
+    // JS:   //
+    // JS:   // The payload is automatically disposed after the call completes. The caller should not call
+    // JS:   // dispose().
+    // JS:   public async deliverCall(func: Function, thisArg: object | undefined): Promise<RpcPayload> {
+    // JS:     try {
+    // JS:       let promises: Promise<void>[] = [];
+    // JS:       this.deliverTo(this, "value", promises);
+    // JS:
+    // JS:       // WARNING: It is critical that if the promises list is empty, we do not await anything, so
+    // JS:       //   that the function is called immediately and synchronously. Otherwise, we might violate
+    // JS:       //   e-order.
+    // JS:       if (promises.length > 0) {
+    // JS:         await Promise.all(promises);
+    // JS:       }
+    // JS:
+    // JS:       // Call the function.
+    // JS:       let result = Function.prototype.apply.call(func, thisArg, this.value);
+    // JS:
+    // JS:       if (result instanceof RpcPromise) {
+    // JS:         // Special case: If the function immediately returns RpcPromise, we don't want to await it,
+    // JS:         // since that will actually wait for the promise. Instead we want to construct a payload
+    // JS:         // around it directly.
+    // JS:         return RpcPayload.fromAppReturn(result);
+    // JS:       } else {
+    // JS:         // In all other cases, await the result (which may or may not be a promise, but `await`
+    // JS:         // will just pass through non-promises).
+    // JS:         return RpcPayload.fromAppReturn(await result);
+    // JS:       }
+    // JS:     } finally {
+    // JS:       this.dispose();
+    // JS:     }
+    // JS:   }
+    // JS:
+    // JS:   // Deliver this payload as the argument list to `WritableStreamDefaultWriter.write(chunk)`.
+    // JS:   //
+    // JS:   // Unlike deliverCall(), stream chunks are enqueued and read asynchronously. Disposing the
+    // JS:   // payload when write() returns would free any stubs nested in the chunk before the reader
+    // JS:   // dequeues them. A chunk only needs its disposal deferred if it owns capabilities the
+    // JS:   // reader will use after write() resolves. Pure data (primitives, bytes, Date, plain
+    // JS:   // objects) carries no capabilities, so dispose it immediately and leave the chunk
+    // JS:   // untouched. Bare RpcStubs already implement Symbol.dispose, so their own disposer owns
+    // JS:   // the capability; only attach a payload disposer otherwise.
+    // JS:   //
+    // JS:   // Expects `this.value` to be a one-element argument array `[chunk]`. Returns a payload
+    // JS:   // wrapping the (void) write result.
+    // JS:   public async deliverStreamWrite(
+    // JS:       writer: { write(chunk: unknown): Promise<void> }): Promise<RpcPayload> {
+    // JS:     try {
+    // JS:       let promises: Promise<void>[] = [];
+    // JS:       this.deliverTo(this, "value", promises);
+    // JS:
+    // JS:       // Same e-order constraint as deliverCall: if there are no nested promises, call write
+    // JS:       // synchronously so concurrent writes stay ordered.
+    // JS:       if (promises.length > 0) {
+    // JS:         await Promise.all(promises);
+    // JS:       }
+    // JS:
+    // JS:       let chunk = (this.value as unknown[])[0];
+    // JS:
+    // JS:       // deliverTo → ensureDeepCopied, so hooks/promises are populated.
+    // JS:       const ownsCapabilities = this.hooks!.length > 0 || this.promises!.length > 0;
+    // JS:
+    // JS:       if (ownsCapabilities && chunk instanceof Object) {
+    // JS:         // Keep the payload alive until the reader disposes the chunk. A bare RpcStub already
+    // JS:         // implements Symbol.dispose (its own disposer owns the hook); only attach otherwise.
+    // JS:         if (!(Symbol.dispose in chunk)) {
+    // JS:           Object.defineProperty(chunk, Symbol.dispose, {
+    // JS:             value: () => this.dispose(),
+    // JS:             writable: true,
+    // JS:             enumerable: false,
+    // JS:             configurable: true,
+    // JS:           });
+    // JS:         }
+    // JS:         await writer.write(chunk);
+    // JS:         return RpcPayload.fromAppReturn(undefined);
+    // JS:       }
+    // JS:
+    // JS:       // No capabilities (or non-object chunk): nothing to keep alive beyond the write.
+    // JS:       await writer.write(chunk);
+    // JS:       this.dispose();
+    // JS:       return RpcPayload.fromAppReturn(undefined);
+    // JS:     } catch (err) {
+    // JS:       // deliverTo / write failed: free any capabilities we still own.
+    // JS:       this.dispose();
+    // JS:       throw err;
+    // JS:     }
+    // JS:   }
+    // JS:
+    // JS:   // Produce a promise for this payload for return to the application. Any RpcPromises in the
+    // JS:   // payload are awaited and substituted with their results first.
+    // JS:   //
+    // JS:   // The returned object will have a disposer which disposes the payload. The caller should not
+    // JS:   // separately dispose it.
+    // JS:   public async deliverResolve(): Promise<unknown> {
+    // JS:     try {
+    // JS:       let promises: Promise<void>[] = [];
+    // JS:       this.deliverTo(this, "value", promises);
+    // JS:
+    // JS:       if (promises.length > 0) {
+    // JS:         await Promise.all(promises);
+    // JS:       }
+    // JS:
+    // JS:       let result = this.value;
+    // JS:
+    // JS:       // Add disposer to result.
+    // JS:       if (result instanceof Object) {
+    // JS:         if (!(Symbol.dispose in result)) {
+    // JS:           // We want the disposer to be non-enumerable as otherwise it gets in the way of things
+    // JS:           // like unit tests trying to deep-compare the result to an object.
+    // JS:           Object.defineProperty(result, Symbol.dispose, {
+    // JS:             // NOTE: Using `this.dispose.bind(this)` here causes Playwright's build of
+    // JS:             //   Chromium 140.0.7339.16 to fail when the object is assigned to a `using` variable,
+    // JS:             //   with the error:
+    // JS:             //       TypeError: Symbol(Symbol.dispose) is not a function
+    // JS:             //   I cannot reproduce this problem in Chrome 140.0.7339.127 nor in Node or workerd,
+    // JS:             //   so maybe it was a short-lived V8 bug or something. To be safe, though, we use
+    // JS:             //   `() => this.dispose()`, which seems to always work.
+    // JS:             value: () => this.dispose(),
+    // JS:             writable: true,
+    // JS:             enumerable: false,
+    // JS:             configurable: true,
+    // JS:           });
+    // JS:         }
+    // JS:       }
+    // JS:
+    // JS:       return result;
+    // JS:     } catch (err) {
+    // JS:       // Automatically dispose since the application will never receive the disposable...
+    // JS:       this.dispose();
+    // JS:       throw err;
+    // JS:     }
+    // JS:   }
+    // JS:
+    // JS:   public dispose() {
+    // JS:     if (this.source === "owned") {
+    // JS:       // Oh good, we can just run through them.
+    // JS:       this.hooks!.forEach(hook => hook.dispose());
+    // JS:       this.promises!.forEach(promise => promise.promise[Symbol.dispose]());
+    // JS:     } else if (this.source === "return") {
+    // JS:       // Value received directly from app as a return value. We take ownership of all stubs, so we
+    // JS:       // must recursively scan it for things to dispose.
+    // JS:       this.disposeImpl(this.value, undefined);
+    // JS:       if (this.rpcTargets && this.rpcTargets.size > 0) {
+    // JS:         throw new Error("Not all rpcTargets were accounted for in disposeImpl()?");
+    // JS:       }
+    // JS:     } else {
+    // JS:       // this.source is "params". We don't own the stubs within.
+    // JS:     }
+    // JS:
+    // JS:     // Make dispose() idempotent.
+    // JS:     this.source = "owned";
+    // JS:     this.hooks = [];
+    // JS:     this.promises = [];
+    // JS:   }
+    // JS:
+    // JS:   // Recursive dispose, called only when `source` is "return".
+    // JS:   private disposeImpl(value: unknown, parent: object | undefined) {
+    // JS:     let kind = typeForRpc(value);
+    // JS:     switch (kind) {
+    // JS:       case "unsupported":
+    // JS:       case "primitive":
+    // JS:       case "bigint":
+    // JS:       case "bytes":
+    // JS:       case "blob":
+    // JS:       case "date":
+    // JS:       case "url":
+    // JS:       case "error":
+    // JS:       case "undefined":
+    // JS:         return;
+    // JS:
+    // JS:       case "array": {
+    // JS:         let array = <Array<unknown>>value;
+    // JS:         let len = array.length;
+    // JS:         for (let i = 0; i < len; i++) {
+    // JS:           this.disposeImpl(array[i], array);
+    // JS:         }
+    // JS:         return;
+    // JS:       }
+    // JS:
+    // JS:       case "object": {
+    // JS:         let object = <Record<string, unknown>>value;
+    // JS:         for (let i in object) {
+    // JS:           this.disposeImpl(object[i], object);
+    // JS:         }
+    // JS:         return;
+    // JS:       }
+    // JS:
+    // JS:       case "stub":
+    // JS:       case "rpc-promise": {
+    // JS:         let stub = <RpcStub>value;
+    // JS:         let hook = unwrapStubNoProperties(stub);
+    // JS:         if (hook) {
+    // JS:           hook.dispose();
+    // JS:         }
+    // JS:         return;
+    // JS:       }
+    // JS:
+    // JS:       case "function":
+    // JS:       case "rpc-target": {
+    // JS:         let target = <RpcTarget | Function>value;
+    // JS:         let hook = this.rpcTargets?.get(target);
+    // JS:         if (hook) {
+    // JS:           // We created a hook around this target earlier. Dispose it now.
+    // JS:           hook.dispose();
+    // JS:           this.rpcTargets!.delete(target);
+    // JS:         } else {
+    // JS:           // There never was a stub pointing at this target. This could be because:
+    // JS:           // * The call was used only for promise pipelining, so the result was never serialized,
+    // JS:           //   so it never got added to `rpcTargets`.
+    // JS:           // * The same RpcTarget appears in the results twice, and we already disposed the hook
+    // JS:           //   when we saw it earlier. Note that it's intentional that we should call the disposer
+    // JS:           //   twice if the same object appears twice.
+    // JS:           disposeRpcTarget(target);
+    // JS:         }
+    // JS:         return;
+    // JS:       }
+    // JS:
+    // JS:       case "rpc-thenable":
+    // JS:         // Since thenables are promises, we don't own them, so we don't dispose them.
+    // JS:         return;
+    // JS:
+    // JS:       case "headers":
+    // JS:         // Headers have no owned resources to dispose.
+    // JS:         return;
+    // JS:
+    // JS:       case "request": {
+    // JS:         // The body may be a ReadableStream that has an associated hook in rpcTargets.
+    // JS:         let req = <Request>value;
+    // JS:         if (req.body) this.disposeImpl(req.body, req);
+    // JS:         // TODO: When we support AbortSignal, we may need to dispose request.signal here?
+    // JS:         return;
+    // JS:       }
+    // JS:
+    // JS:       case "response": {
+    // JS:         // The body may be a ReadableStream that has an associated hook in rpcTargets.
+    // JS:         let resp = <Response>value;
+    // JS:         if (resp.body) this.disposeImpl(resp.body, resp);
+    // JS:         // TODO: When we support WebSocket, we may need to dispose response.webSocket here?
+    // JS:         return;
+    // JS:       }
+    // JS:
+    // JS:       case "writable": {
+    // JS:         let stream = <WritableStream>value;
+    // JS:         let hook = this.rpcTargets?.get(stream);
+    // JS:         if (hook) {
+    // JS:           this.rpcTargets!.delete(stream);
+    // JS:         } else {
+    // JS:           // Create a hook just so we can call its disposer for consistent behavior, which will
+    // JS:           // abort the stream.
+    // JS:           hook = streamImpl.createWritableStreamHook(stream);
+    // JS:         }
+    // JS:
+    // JS:         hook.dispose();
+    // JS:
+    // JS:         return;
+    // JS:       }
+    // JS:
+    // JS:       case "readable": {
+    // JS:         let stream = <ReadableStream>value;
+    // JS:         let hook = this.rpcTargets?.get(stream);
+    // JS:         if (hook) {
+    // JS:           this.rpcTargets!.delete(stream);
+    // JS:         } else {
+    // JS:           // Create a hook just so we can call its disposer for consistent behavior, which will
+    // JS:           // cancel the stream.
+    // JS:           hook = streamImpl.createReadableStreamHook(stream);
+    // JS:         }
+    // JS:
+    // JS:         hook.dispose();
+    // JS:
+    // JS:         return;
+    // JS:       }
+    // JS:
+    // JS:       default:
+    // JS:         kind satisfies never;
+    // JS:         return;
+    // JS:     }
+    // JS:   }
+    // JS:
+    // JS:   // Ignore unhandled rejections in all promises in this payload -- that is, all promises that
+    // JS:   // *would* be awaited if this payload were to be delivered. See the similarly-named method of
+    // JS:   // StubHook for explanation.
+    // JS:   ignoreUnhandledRejections(): void {
+    // JS:     if (this.hooks) {
+    // JS:       // Propagate to all stubs and promises.
+    // JS:       this.hooks.forEach(hook => {
+    // JS:         hook.ignoreUnhandledRejections();
+    // JS:       });
+    // JS:       this.promises!.forEach(
+    // JS:           promise => unwrapStubOrParent(promise.promise).ignoreUnhandledRejections());
+    // JS:     } else {
+    // JS:       // Ugh we have to walk the tree.
+    // JS:       this.ignoreUnhandledRejectionsImpl(this.value);
+    // JS:     }
+    // JS:   }
+    // JS:
+    // JS:   private ignoreUnhandledRejectionsImpl(value: unknown) {
+    // JS:     let kind = typeForRpc(value);
+    // JS:     switch (kind) {
+    // JS:       case "unsupported":
+    // JS:       case "primitive":
+    // JS:       case "bigint":
+    // JS:       case "bytes":
+    // JS:       case "blob":
+    // JS:       case "date":
+    // JS:       case "error":
+    // JS:       case "undefined":
+    // JS:       case "function":
+    // JS:       case "rpc-target":
+    // JS:       case "writable":
+    // JS:       case "readable":
+    // JS:       case "url":
+    // JS:       case "headers":
+    // JS:       case "request":
+    // JS:       case "response":
+    // JS:         return;
+    // JS:
+    // JS:       case "array": {
+    // JS:         let array = <Array<unknown>>value;
+    // JS:         let len = array.length;
+    // JS:         for (let i = 0; i < len; i++) {
+    // JS:           this.ignoreUnhandledRejectionsImpl(array[i]);
+    // JS:         }
+    // JS:         return;
+    // JS:       }
+    // JS:
+    // JS:       case "object": {
+    // JS:         let object = <Record<string, unknown>>value;
+    // JS:         for (let i in object) {
+    // JS:           this.ignoreUnhandledRejectionsImpl(object[i]);
+    // JS:         }
+    // JS:         return;
+    // JS:       }
+    // JS:
+    // JS:       case "stub":
+    // JS:       case "rpc-promise":
+    // JS:         unwrapStubOrParent(<RpcStub>value).ignoreUnhandledRejections();
+    // JS:         return;
+    // JS:
+    // JS:       case "rpc-thenable":
+    // JS:         (<any>value).then((_: any) => {}, (_: any) => {});
+    // JS:         return;
+    // JS:
+    // JS:       default:
+    // JS:         kind satisfies never;
+    // JS:         return;
+    // JS:     }
+    // JS:   }
+    fn resolve_value(
+        value: CapnwebValue,
+    ) -> Pin<Box<dyn Future<Output = Result<CapnwebValue>> + Send + 'static>> {
+        Box::pin(async move {
+            match value {
+                CapnwebValue::RpcPromise(promise) => {
+                    let resolution = promise.await?;
+                    Self::resolve_value(resolution).await
+                }
+                CapnwebValue::Array(values) => {
+                    let resolutions = values.into_iter().map(Self::resolve_value);
+                    let values = futures::future::join_all(resolutions)
+                        .await
+                        .into_iter()
+                        .collect::<Result<Vec<_>>>()?;
+                    Ok(CapnwebValue::Array(values))
+                }
+                CapnwebValue::Object(values) => {
+                    let resolutions = values.into_iter().map(|(key, value)| async move {
+                        Ok((key, Self::resolve_value(value).await?))
+                    });
+                    let values = futures::future::join_all(resolutions)
+                        .await
+                        .into_iter()
+                        .collect::<Result<BTreeMap<_, _>>>()?;
+                    Ok(CapnwebValue::Object(values))
+                }
+                value => Ok(value),
+            }
+        })
+    }
+
+    async fn deliver_resolve(self) -> Result<CapnwebValue> {
+        Self::resolve_value(self.value).await
+    }
+
+    fn ignore_unhandled_rejections(&self) {
+        fn visit(value: &CapnwebValue) {
+            match value {
+                CapnwebValue::Array(values) => values.iter().for_each(visit),
+                CapnwebValue::Object(values) => values.values().for_each(visit),
+                CapnwebValue::Stub(stub) => stub.hook.ignore_unhandled_rejections(),
+                CapnwebValue::RpcPromise(promise) => {
+                    promise.stub.hook.ignore_unhandled_rejections();
+                }
+                _ => {}
+            }
+        }
+
+        visit(&self.value);
+    }
+    // JS: };
+}
 // JS:
 // JS: // =======================================================================================
 // JS: // Local StubHook implementations
