@@ -1,271 +1,276 @@
 # JavaScript-to-Rust parity contract
 
-## Objective
-
-The Rust implementation is a source-structured port of the JavaScript implementation, not an
-independent implementation of the wire protocol.
-
-For every in-scope JavaScript runtime file, the Rust tree must contain a corresponding Rust file.
-Within each file, declarations, fields, methods, state transitions, control flow, and explanatory
-comments should appear in the same order as the JavaScript source. A reviewer should be able to
-read the files side by side and identify the Rust counterpart of each JavaScript operation.
-
-“Equivalent outcome in current tests” is not sufficient when the implementation uses a different
-state machine. Compatibility fallbacks and condensed replacement abstractions are not parity.
-
-## Required interpretation of 1:1
-
-“Line by line” means a structural and behavioral translation in source order. It does not require
-identical physical line numbers or deliberately unidiomatic syntax. Differences are allowed only
-where required by the languages or the deliberately excluded scope.
-
-Allowed mechanical translations include:
-
-| JavaScript                               | Rust                                                                 |
-| ---------------------------------------- | -------------------------------------------------------------------- |
-| object reference                         | `Arc<T>` or `Weak<T>`                                                |
-| explicit local lifetime counter          | `Arc`, `Clone`, and `Drop` when observably equivalent                |
-| abstract class                           | object-safe trait plus concrete structs                              |
-| `T \| Promise<T>`                        | an explicit immediate-or-pending enum                                |
-| eager `Promise<T>`                       | a future that is spawned or polled eagerly at construction           |
-| thrown exception                         | `Result<T, Error>` or an error hook at the equivalent boundary       |
-| `undefined` in the simplified Rust API   | `null`/`None`, with the lossy mapping documented                     |
-| JavaScript `Proxy` method interception   | generated typed Rust stub methods                                    |
-| prototype reflection                     | generated target dispatch and getter tables                          |
-| dynamic `instanceof` at an internal seam | explicit enum matching or narrowly scoped downcasting                |
-| microtask ordering                       | an explicit queue/state machine preserving the same observable order |
-
-The following are not acceptable mechanical translations:
-
-- replacing a JavaScript class hierarchy with a smaller unrelated provider model;
-- skipping methods because Rust ownership makes the common case appear safe;
-- replacing wire-level map instructions with pull-then-map;
-- eagerly resolving a promise that JavaScript keeps lazy;
-- relying on Tokio scheduling where JavaScript promise registration order is observable;
-- using a generated list of ignored tests instead of translating test bodies;
-- declaring a file a counterpart when it contains only a compatibility slice without a parity note.
-
-Every unavoidable behavioral difference must have a `Difference from JS:` comment on the affected
-Rust method. A module-level note is not enough when only one method differs.
+## Rule
 
-## Scope
-
-### Runtime files that must be ported
-
-These files are in scope and require source-ordered counterparts:
-
-| JavaScript                       | Rust                                        |
-| -------------------------------- | ------------------------------------------- |
-| `src/core.ts`                    | `rust/src/core.rs`                          |
-| `src/serialize.ts`               | `rust/src/serialize.rs`                     |
-| `src/rpc.ts`                     | `rust/src/rpc.rs`                           |
-| `src/map.ts`                     | `rust/src/map.rs`                           |
-| `src/websocket.ts`               | `rust/src/websocket.rs`                     |
-| `src/messageport.ts`             | `rust/src/messageport.rs`                   |
-| public exports in `src/index.ts` | `rust/src/lib.rs`                           |
-| proxy/reflection boundaries      | `rust/macros/src/lib.rs` and generated code |
-
-Transport splitting, pinning, synchronization, and generated dispatch may use Rust-only support
-files, but those files must be identified as mechanical support rather than JavaScript
-counterparts.
-
-### Deliberately deferred runtime areas
-
-The following are outside this rewrite and may remain absent rather than represented by fake
-implementations:
-
-- `src/streams.ts`;
-- readable/writable stream hooks and pipe protocol messages;
-- Blob serialization and Blob-over-stream behavior;
-- Headers, Request, and Response integration;
-- HTTP batch RPC in `src/batch.ts`;
-- Bun-only APIs;
-- workerd-native RPC and Durable Object integration.
-
-A deferred branch in an otherwise in-scope method should remain visibly localized at the same
-position as the JavaScript branch. It should return a clear unsupported error and link to the
-excluded feature. The surrounding method must still be translated.
-
-### JavaScript-specific built-ins
-
-Tests whose purpose is JavaScript object identity, prototype identity, or a JavaScript-only built-in
-are not copied into the Rust suite. Examples include exact prototypes for `ArrayBufferView`
-subclasses, JavaScript `Map`, `Set`, `RegExp`, and platform-native classes with no selected Rust wire
-type.
-
-This does not permit removing protocol-neutral behavior merely because JavaScript expresses it with
-a built-in. Rust equivalents are still required for:
-
-- null, booleans, numbers, strings, arrays, and records;
-- NaN and infinities;
-- arbitrary-size integers;
-- byte strings;
-- errors and nested error causes in the supported Rust error representation;
-- capabilities and promises nested in values;
-- resource limits and malformed-wire rejection.
+The Rust runtime is a mechanical, line-by-line port of the JavaScript runtime.
 
-A Rust-native representation can be added later for an excluded built-in, but the rewrite does not
-carry a permanently ignored JavaScript-prototype test for it.
+For every in-scope JavaScript/TypeScript source file:
 
-### Validation package
+1. Create the corresponding Rust file.
+2. Copy every source line into the Rust file as an exact `// JS:` comment.
+3. Put the Rust equivalent immediately below the source line or smallest group of source lines that
+   forms a translatable syntactic unit.
+4. Preserve declaration order, field order, method order, control flow, state transitions, and
+   explanatory comments.
+5. Do not condense, redesign, or replace the implementation merely because another implementation
+   could produce the same result.
 
-`packages/capnweb-validate` is not part of the Rust runtime port. Its test files must not be copied
-into `rust/tests` and do not count against runtime parity.
+A reviewer must be able to read the Rust file from top to bottom beside the JavaScript file and see
+where every source line was translated.
 
-The Rust code generator has its own tests for generated Rust APIs. Those tests should derive their
-contracts from `.d.ts` input, but they are not translations of the validation plugin's transformer
-or runtime-validation tests.
+## Required source format
 
-TypeScript-only compile-time tests are likewise not copied verbatim. Any public surface they reveal
-must instead have an appropriate Rust compile-pass, compile-fail, or generated-code test.
+A single-line translation looks like this:
 
-## Test-surface rule
+```rust
+// JS: export class ErrorStubHook extends StubHook {
+pub struct ErrorStubHook {
+```
 
-Every in-scope surface used by a JavaScript runtime test must have a Rust equivalent. This includes
-internal test seams, not only the published API. Examples include:
+Multiline syntax is preserved line by line and translated as one syntactic unit:
 
-- controllable in-memory transports with fencing, logs, pending counts, and injected failures;
-- session statistics and drain operations;
-- explicit disposal and brokenness registration;
-- raw hook construction where JavaScript tests construct hooks directly;
-- promise resolvers used to test calls before resolution;
-- target fixtures, counters, disposal spies, and error targets;
-- inspection of emitted protocol messages when a JavaScript test asserts wire behavior.
+```rust
+// JS:   call(path: PropertyPath,
+// JS:        args: RpcPayload): StubHook {
+fn call(
+    &self,
+    path: PropertyPath,
+    args: RpcPayload,
+) -> StubHook {
+```
 
-The Rust equivalent need not imitate JavaScript test syntax. It must expose the same observable
-control and make the same assertion possible without weakening the test.
+JavaScript comments and blank lines are also preserved:
 
-Tests must not be enabled based only on a similar broad E2E test. Each translated test retains the
-original test's scenario and assertions, adjusted only for mechanical Rust differences.
+```rust
+// JS:
 
-## Clean-rewrite plan
+// JS:   // Create a clone which can be disposed independently.
+// Create a clone which can be dropped independently.
+```
 
-The current condensed runtime should be removed rather than incrementally repaired. Preserve design
-documents, manifests as dependency references, `.d.ts` fixtures, interoperability fixtures, and
-unrelated code-generator work. Replace the runtime and its copied test inventory in the following
-order.
+The text following `// JS:` must match the original source line exactly. The source lines must occur
+in exactly the same order as the original file.
 
-### Phase 0: establish the source ledger
+One JavaScript line may require multiple Rust lines. A group of JavaScript lines may be followed by
+one Rust construct when Rust syntax cannot be interleaved more finely. The translation must still be
+immediately adjacent; source comments may not be collected into a separate header or ledger.
 
-1. Record the exact JavaScript revision being translated.
-2. List every top-level declaration from each in-scope source file in source order.
-3. For each declaration, record its Rust name and one of:
-   - translated;
-   - mechanically different, with the method-level note location;
-   - deferred because it belongs to the explicit excluded scope.
-4. Do not use “partial” as a completion state for a finished phase.
+## The only translation exceptions
 
-### Phase 1: translate `core.ts` line by line
+Everything is translated mechanically except the following three categories.
 
-Translate in source order, including:
+### 1. JavaScript built-ins
 
-1. property-path and RPC type classification;
-2. provider/importer/exporter interfaces used by core;
-3. every `StubHook` method and its ownership contract;
-4. `ErrorStubHook`;
-5. call interception and scoped restoration;
-6. the generated replacement for Proxy behavior;
-7. `RpcStub` and `RpcPromise`, including adoption and neutering rules;
-8. every unwrap helper and its ownership semantics;
-9. promise pulling and application delivery;
-10. `RpcPayload`, source tracking, deep-copy state, disposal, and rollback;
-11. value, payload, target, and promise hooks in their original order;
-12. brokenness forwarding, cancellation, and e-order behavior.
+A branch that depends on a JavaScript-only or currently deferred Web API keeps its exact `// JS:`
+source lines, but its Rust equivalent may be a localized unsupported branch.
 
-Do not implement map with a fallback. Keep the interception seam exact and connect it only when
-`map.ts` is translated.
+This currently includes:
 
-Completion gate: every non-deferred declaration and method in `core.ts` appears in the ledger as
-translated or mechanically different. Core unit tests and local-stub tests pass without broad
-substitute assertions.
+- ReadableStream and WritableStream integration;
+- Blob;
+- Headers, Request, and Response;
+- HTTP/fetch integration;
+- JavaScript prototype-identity checks;
+- JavaScript collection or typed-view identity when no Rust wire representation has been selected;
+- Bun and workerd platform objects.
 
-### Phase 2: translate `serialize.ts` line by line
+The unsupported Rust branch must remain at the same location as the JavaScript branch. It must say
+which built-in is deferred. The rest of the containing method is still translated line by line.
 
-Translate constants, limits, helper functions, interfaces, null contexts, `Devaluator`, standalone
-serialization, `Evaluator`, and standalone deserialization in source order.
+Protocol-neutral values are not excluded merely because JavaScript represents them with a built-in.
+Rust equivalents remain required for null, booleans, numbers, strings, arrays, records, arbitrary
+integers, byte strings, errors, capabilities, promises, limits, and malformed-wire handling.
 
-For each JavaScript built-in branch:
+### 2. Local JavaScript reference counting
 
-- translate it when a protocol-neutral Rust representation is selected;
-- leave a localized unsupported branch when it is deferred;
-- omit JavaScript-prototype-only test expectations rather than creating permanent ignored tests.
+Reference counting used only to manage local JavaScript object lifetime is translated to Rust's
+ownership system:
 
-Preserve recursion accounting, transactional export rollback, property filtering, special-number
-encoding, malformed-input checks, and error serialization behavior.
+- `Arc` and `Weak`;
+- `Clone`;
+- `Drop`;
+- owned moves and borrows.
 
-Completion gate: all in-scope serialization and limits tests pass, including hostile-input and
-rollback tests.
+The Rust code must preserve observable disposal timing and independent-reference semantics. An
+`Arc::clone()` must not replace a JavaScript `dup()` when `dup()` creates an independently disposable
+RPC reference.
 
-### Phase 3: translate `rpc.ts` line by line
+Wire-visible reference accounting is not covered by this exception. Import/export counts,
+introduction counts, `release` messages, remote reference counts, and protocol-visible disposal are
+translated exactly because they are part of Cap'n Web behavior.
 
-Translate transport interfaces, message types, table entries, import hooks, main hooks, session
-state, and public session methods in source order. Preserve:
+### 3. JavaScript Proxy and reflection
 
-- positive and negative ID allocation;
-- local and remote reference counts;
-- promise-ID uniqueness;
-- lazy pulls and eager exported-promise resolution;
-- root promise-chain elision;
-- release timing and auto-release;
-- callback registration order and transfer on resolution;
-- all abort, disconnect, and send-failure paths;
-- e-order and message ordering;
-- stats and drain behavior;
-- serialization rollback on failed sends.
+JavaScript Proxy call/property interception is replaced by generated Rust methods. JavaScript
+prototype reflection is replaced by generated target dispatch and getter tables.
 
-Stream-specific fields and message branches remain localized deferred sections.
+The original Proxy/reflection lines remain as `// JS:` comments in the corresponding Rust source.
+Their Rust equivalent points to or invokes the generated macro boundary at the same logical point.
+The generated code must perform the same hook calls, path construction, argument ownership, and
+return wrapping as the JavaScript Proxy.
 
-Completion gate: all non-stream RPC, capability-passing, lifecycle, e-order, brokenness, and
-transport-failure tests pass with their original assertions.
+## Mechanical language mappings
 
-### Phase 4: translate `map.ts` line by line
+These are syntax translations, not additional exceptions. They must preserve the JavaScript state
+machine and ordering.
+
+| JavaScript                         | Rust                                                       |
+| ---------------------------------- | ---------------------------------------------------------- |
+| class                              | struct plus inherent implementations                       |
+| abstract class                     | object-safe trait plus concrete structs                    |
+| object reference                   | `Arc<T>` or an owned value                                 |
+| weak reference                     | `Weak<T>`                                                  |
+| `T \| Promise<T>`                  | explicit immediate-or-pending enum                         |
+| eager `Promise<T>`                 | future eagerly started at the equivalent construction line |
+| thrown exception                   | `Result<T, Error>` or an error hook at the same boundary   |
+| `try` / `catch` / `finally`        | equivalent result handling and cleanup guards              |
+| discriminated union                | enum                                                       |
+| nullable value                     | `Option<T>`                                                |
+| dynamic RPC value                  | `CapnwebValue`                                             |
+| microtask ordering                 | explicit ordered state or queue                            |
+| callback registered before resolve | callback registered before resolution in Rust as well      |
+| synchronous fast path              | immediate enum branch, not an always-async future          |
 
-Translate `MapBuilder`, `MapVariableHook`, `MapApplicator`, scoped call interception, capture
-ownership, instruction evaluation, and RPC map messages in source order.
+Rust futures are lazy while JavaScript promises are eager. Therefore constructing the Rust
+counterpart must start or poll a future at the exact point where JavaScript constructs the promise.
+Execution may not be deferred until `pull()` unless the JavaScript implementation also defers it.
 
-Completion gate: local map, remote map, nested map, wire-message, rejection, and disposal tests pass
-without pulling the subject prematurely.
+## In-scope source files
 
-### Phase 5: translate WebSocket and MessagePort support
+The rewrite covers the runtime implementation, including:
 
-Translate non-Bun WebSocket construction and lifecycle behavior, including close-code handling,
-close-reason truncation, abort propagation, and bidirectional sessions. Implement a Rust
-message-channel equivalent exposing the same observable transport semantics as MessagePort tests.
+- `src/core.ts` → `rust/src/core.rs`;
+- `src/serialize.ts` → `rust/src/serialize.rs`;
+- `src/rpc.ts` → `rust/src/rpc.rs`;
+- `src/map.ts` → `rust/src/map.rs`;
+- `src/websocket.ts` → `rust/src/websocket.rs`;
+- `src/messageport.ts` → `rust/src/messageport.rs`;
+- public runtime exports from `src/index.ts` → `rust/src/lib.rs`;
+- Proxy and reflection replacements → Rust macros and generated code.
 
-HTTP, Blob, stream, Bun, and workerd branches remain excluded.
+Files dominated by deferred built-ins, such as streams and HTTP batch support, may initially contain
+the full `// JS:` source with localized deferred Rust markers. They are not silently represented by
+a different implementation.
 
-### Phase 6: rebuild the generated public boundary
+`packages/capnweb-validate` is a separate TypeScript validation/transformer project and is not copied
+into the Rust runtime or Rust test tree. The Rust `.d.ts` generator has its own Rust-facing tests.
 
-Once runtime hooks are stable:
+## Tests
 
-1. generate stub methods and getters from `.d.ts`;
-2. generate target dispatch tables instead of reflecting prototypes;
-3. support every non-excluded value and capability type used by runtime tests;
-4. add Rust compile-pass and compile-fail tests for generated surfaces;
-5. verify generated code calls the same hook methods at the same points as the JS Proxy.
+Every in-scope behavior exposed by the JavaScript runtime tests must have a Rust equivalent,
+including internal test-only surfaces such as:
 
-### Phase 7: translate and run tests
+- raw hook construction;
+- controllable transports and injected failures;
+- transport logs and wire-message inspection;
+- fences and pending-message counts;
+- explicit disposal;
+- brokenness callbacks;
+- session statistics and draining;
+- promise resolvers;
+- counters, disposal spies, and target fixtures.
 
-1. Create one handwritten Rust test file for each in-scope JavaScript runtime test file.
-2. Translate test fixtures and test cases in source order.
-3. Do not copy `capnweb-validate`, Bun, or workerd test files.
-4. Remove tests dedicated solely to excluded JavaScript built-ins.
-5. Mark only clearly deferred stream, Blob, Headers/Request/Response, and HTTP cases ignored.
-6. Every ignored test must name the exact excluded feature; generic “parity slice” reasons are not
-   allowed.
-7. Run the entire Rust test suite.
-8. Treat every other ignored test as a failure of the rewrite plan.
+Tests are handwritten Rust counterparts, kept in the same source order as the JavaScript tests. A
+broad E2E test does not replace a more specific JavaScript test.
+
+Do not copy:
+
+- `capnweb-validate` tests;
+- Bun or workerd tests;
+- tests whose only assertion is JavaScript built-in or prototype identity.
+
+A test may be ignored only when it directly depends on a deferred JavaScript built-in. Its ignore
+reason must name that built-in. Generic reasons such as “parity slice”, “not implemented”, or
+“platform behavior” are not accepted.
+
+All other tests must be translated and enabled. A failing translated test indicates missing runtime
+parity and must be fixed in the corresponding source translation.
+
+## Rewrite procedure
+
+### 1. Remove the condensed implementation
+
+Delete the current Rust runtime and copied ignored-test inventory. Preserve manifests as dependency
+references, design documents, `.d.ts` fixtures, interoperability fixtures, and unrelated codegen
+work.
+
+### 2. Copy source files before implementing
+
+For each in-scope JavaScript file, create its Rust counterpart by copying every original line with a
+`// JS:` prefix. Do not begin the next source file until the current file contains every source line
+in order.
+
+### 3. Translate from top to bottom
+
+Starting at the first source line, place the Rust equivalent directly beneath each source unit. Do
+not skip ahead to a test-relevant method. Do not introduce a condensed abstraction to avoid
+translating later methods.
+
+When a line falls under one of the three exceptions, mark it locally:
+
+```rust
+// JS: if (value instanceof Blob) {
+// RUST-DEFERRED(JS built-in: Blob): preserve this branch position.
+return Err(Error::UnsupportedBuiltin("Blob"));
+```
+
+When local JS refcounting maps to ownership, note it locally:
+
+```rust
+// JS: ++this.localRefcount;
+// RUST-DIFF(local refcount): Arc ownership increments through Clone.
+```
+
+When Proxy behavior maps to generation, note the generated entry point:
+
+```rust
+// JS: return doCall(target.hook, path, RpcPayload.fromAppParams(argumentsList));
+// RUST-DIFF(JS Proxy): #[rpc_interface] emits this call at each generated method.
+```
+
+No other `RUST-DIFF` category is allowed without updating this contract first.
+
+### 4. Verify source coverage mechanically
+
+Add a checker that:
+
+1. reads each original source file;
+2. extracts the text following every `// JS:` marker in its Rust counterpart;
+3. verifies exact text equality and ordering;
+4. reports missing, duplicated, reordered, or stale source lines;
+5. never generates or modifies Rust source.
+
+The checker proves source coverage, not behavioral correctness.
+
+### 5. Translate tests
+
+After an implementation file is complete, translate its relevant tests directly. Remove copied
+validation and JavaScript-built-in-only inventories instead of leaving them ignored.
+
+Run the complete Rust suite. Ignore only tests tied directly to the named deferred built-ins.
+
+### 6. Completion gate
+
+A source file is complete only when:
+
+- the source-line checker reports every original line present and ordered;
+- every non-built-in source unit has an adjacent Rust equivalent;
+- only the three documented translation exceptions appear;
+- all corresponding non-deferred tests are enabled and pass;
+- method-level ownership, eager execution, cleanup, and ordering match JavaScript;
+- formatting and clippy with warnings denied pass.
 
 ## Final acceptance criteria
 
-The rewrite is complete when:
+The port is complete when:
 
-- each in-scope JavaScript declaration has a source-ordered Rust counterpart;
-- no non-deferred method is represented by a fallback or default no-op;
-- every method-level Rust difference is documented inline;
-- every in-scope JavaScript test scenario has a handwritten Rust equivalent;
-- only explicitly excluded tests are absent or ignored;
-- no `capnweb-validate`, Bun, workerd, or JavaScript-prototype-only inventories remain in Rust tests;
-- all enabled Rust tests, clippy with warnings denied, formatting, and documentation lint pass;
-- Rust↔Rust and JavaScript↔Rust interoperability tests pass;
-- the source ledger contains no unexplained partial entries.
+- every in-scope JavaScript source line is preserved in its Rust counterpart;
+- every preserved line has an adjacent mechanical Rust translation or one of the three explicit
+  exception markers;
+- no compatibility fallback or condensed replacement runtime remains;
+- wire reference accounting matches exactly;
+- generated Proxy/dispatch boundaries invoke the same hook operations;
+- every non-deferred runtime test has a handwritten, enabled Rust equivalent;
+- no copied `capnweb-validate` or JavaScript-built-in-only test inventory remains;
+- the source checker, all Rust tests, interoperability tests, formatting, clippy, and documentation
+  lint pass.
