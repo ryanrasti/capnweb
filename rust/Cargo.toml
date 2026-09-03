@@ -1,0 +1,18 @@
+[package]
+name = "capnweb"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+description = "An idiomatic Rust implementation of the Cap'n Web RPC protocol"
+license = "MIT"
+repository = "https://github.com/cloudflare/capnweb"
+publish = false
+
+[dependencies]
+
+[lints.rust]
+missing_docs = "warn"
+unsafe_code = "forbid"
+
+[lints.clippy]
+all = "warn"
