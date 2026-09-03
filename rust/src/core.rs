@@ -3,7 +3,8 @@
 use std::collections::BTreeMap;
 use std::future::Future;
 use std::pin::Pin;
-use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll};
 
 use futures::future::BoxFuture;
@@ -302,6 +303,9 @@ pub enum MaybePromise<T> {
 /// Alias intentionally matching the object-reference role of JS `StubHook`.
 pub type StubHook = Arc<dyn StubHookInner>;
 
+/// Callback registered through `onRpcBroken()`.
+pub type BrokenCallback = Arc<dyn Fn(Error) + Send + Sync>;
+
 /// Direct Rust translation of the abstract JS `StubHook` class.
 pub trait StubHookInner: Send + Sync + std::any::Any + 'static {
     /// Equivalent of `StubHook.call()`.
@@ -319,6 +323,21 @@ pub trait StubHookInner: Send + Sync + std::any::Any + 'static {
     /// independently owned RPC reference, while cloning an Arc only keeps the
     /// same logical hook alive temporarily.
     fn dup(&self) -> StubHook;
+
+    /// Equivalent of `StubHook.ignoreUnhandledRejections()`.
+    ///
+    /// Difference from JS: Rust futures do not report unobserved errors, so
+    /// most implementations need no bookkeeping here.
+    fn ignore_unhandled_rejections(&self) {}
+
+    /// Equivalent of `StubHook.dispose()`.
+    ///
+    /// Logical references are normally released by `Drop`; this hook is for
+    /// promise cancellation and immediate forwarding where JS invokes it.
+    fn dispose(&self) {}
+
+    /// Equivalent of `StubHook.onBroken()`.
+    fn on_broken(&self, _callback: BrokenCallback) {}
 }
 
 /// Direct translation of JS `ErrorStubHook`.
@@ -349,6 +368,10 @@ impl StubHookInner for ErrorStubHook {
 
     fn dup(&self) -> StubHook {
         Self::create(self.error.clone())
+    }
+
+    fn on_broken(&self, callback: BrokenCallback) {
+        callback(self.error.clone());
     }
 }
 
@@ -422,7 +445,7 @@ impl StubHookInner for PayloadStubHook {
     fn call(&self, mut path: PropertyPath, args: RpcPayload) -> StubHook {
         match &self.payload.value {
             CapnwebValue::Promise(promise) => promise.hook().call(path, args),
-            CapnwebValue::Stub(stub) => stub.hook.call(path, args),
+            CapnwebValue::Stub(stub) => stub.current_hook().call(path, args),
             CapnwebValue::Target(target) => TargetStubHook::create(target.clone()).call(path, args),
             CapnwebValue::Object(object) if !path.is_empty() => {
                 let first = path.remove(0);
@@ -481,6 +504,22 @@ impl StubHookInner for PayloadStubHook {
         // boundary, so Clone replaces JS's explicit deep-copy traversal in v0.
         Self::create(self.payload.clone())
     }
+
+    fn ignore_unhandled_rejections(&self) {
+        match &self.payload.value {
+            CapnwebValue::Stub(stub) => stub.current_hook().ignore_unhandled_rejections(),
+            CapnwebValue::Promise(promise) => promise.hook().ignore_unhandled_rejections(),
+            _ => {}
+        }
+    }
+
+    fn on_broken(&self, callback: BrokenCallback) {
+        match &self.payload.value {
+            CapnwebValue::Stub(stub) => stub.current_hook().on_broken(callback),
+            CapnwebValue::Promise(promise) => promise.hook().on_broken(callback),
+            _ => {}
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -522,6 +561,59 @@ impl<T: Clone + Send + Sync + 'static> EagerPromise<T> {
 /// Direct translation of JS `PromiseStubHook`.
 pub struct PromiseStubHook {
     promise: EagerPromise<StubHook>,
+    order: Arc<PromiseOperationOrder>,
+}
+
+struct PromiseOperationOrder {
+    next_ticket: AtomicU64,
+    next_to_run: AtomicU64,
+    ready: Notify,
+}
+
+impl PromiseOperationOrder {
+    fn new() -> Self {
+        Self {
+            next_ticket: AtomicU64::new(0),
+            next_to_run: AtomicU64::new(0),
+            ready: Notify::new(),
+        }
+    }
+
+    fn ticket(self: &Arc<Self>) -> PromiseOperationTicket {
+        PromiseOperationTicket {
+            sequence: self.next_ticket.fetch_add(1, Ordering::Relaxed),
+            order: self.clone(),
+        }
+    }
+}
+
+struct PromiseOperationTicket {
+    sequence: u64,
+    order: Arc<PromiseOperationOrder>,
+}
+
+impl PromiseOperationTicket {
+    async fn wait(self) -> PromiseOperationGuard {
+        loop {
+            let notified = self.order.ready.notified();
+            if self.order.next_to_run.load(Ordering::Acquire) == self.sequence {
+                drop(notified);
+                return PromiseOperationGuard { order: self.order };
+            }
+            notified.await;
+        }
+    }
+}
+
+struct PromiseOperationGuard {
+    order: Arc<PromiseOperationOrder>,
+}
+
+impl Drop for PromiseOperationGuard {
+    fn drop(&mut self) {
+        self.order.next_to_run.fetch_add(1, Ordering::Release);
+        self.order.ready.notify_waiters();
+    }
 }
 
 impl PromiseStubHook {
@@ -532,6 +624,7 @@ impl PromiseStubHook {
     pub fn create(future: impl Future<Output = Result<StubHook>> + Send + 'static) -> StubHook {
         Arc::new(Self {
             promise: EagerPromise::new(future),
+            order: Arc::new(PromiseOperationOrder::new()),
         })
     }
 }
@@ -539,17 +632,25 @@ impl PromiseStubHook {
 impl StubHookInner for PromiseStubHook {
     fn call(&self, path: PropertyPath, args: RpcPayload) -> StubHook {
         let promise = self.promise.clone();
+        let ticket = self.order.ticket();
         PromiseStubHook::create(async move {
+            let guard = ticket.wait().await;
             let hook = promise.get().await?;
-            Ok(hook.call(path, args))
+            let result = hook.call(path, args);
+            drop(guard);
+            Ok(result)
         })
     }
 
     fn get(&self, path: PropertyPath) -> StubHook {
         let promise = self.promise.clone();
+        let ticket = self.order.ticket();
         PromiseStubHook::create(async move {
+            let guard = ticket.wait().await;
             let hook = promise.get().await?;
-            Ok(hook.get(path))
+            let result = hook.get(path);
+            drop(guard);
+            Ok(result)
         })
     }
 
@@ -571,11 +672,41 @@ impl StubHookInner for PromiseStubHook {
             Ok(hook.dup())
         })
     }
+
+    fn ignore_unhandled_rejections(&self) {
+        let promise = self.promise.clone();
+        tokio::spawn(async move {
+            if let Ok(hook) = promise.get().await {
+                hook.ignore_unhandled_rejections();
+            }
+        });
+    }
+
+    fn dispose(&self) {
+        let promise = self.promise.clone();
+        let ticket = self.order.ticket();
+        tokio::spawn(async move {
+            let _guard = ticket.wait().await;
+            if let Ok(hook) = promise.get().await {
+                hook.dispose();
+            }
+        });
+    }
+
+    fn on_broken(&self, callback: BrokenCallback) {
+        let promise = self.promise.clone();
+        tokio::spawn(async move {
+            match promise.get().await {
+                Ok(hook) => hook.on_broken(callback),
+                Err(error) => callback(error),
+            }
+        });
+    }
 }
 
 /// Rust representation of JS `RpcStub` without proxy interception.
 pub struct RpcStub {
-    pub(crate) hook: StubHook,
+    hook: Mutex<Option<StubHook>>,
 }
 
 impl std::fmt::Debug for RpcStub {
@@ -603,22 +734,48 @@ impl RpcStub {
 
     /// Constructs a stub around a hook.
     pub(crate) fn from_hook(hook: StubHook) -> Self {
-        Self { hook }
+        Self {
+            hook: Mutex::new(Some(hook)),
+        }
+    }
+
+    pub(crate) fn current_hook(&self) -> StubHook {
+        self.hook
+            .lock()
+            .expect("stub mutex poisoned")
+            .clone()
+            .unwrap_or_else(|| {
+                ErrorStubHook::create(Error::Remote(
+                    "attempted to use RPC stub after it was disposed".into(),
+                ))
+            })
     }
 
     /// Calls a generated method immediately.
     pub fn call(&self, path: PropertyPath, args: RpcPayload) -> RpcPromise {
-        RpcPromise::new(do_call(self.hook.clone(), path, args), Vec::new())
+        RpcPromise::new(do_call(self.current_hook(), path, args), Vec::new())
     }
 
     /// Accesses a property without pulling the containing stub.
     pub fn get(&self, path: PropertyPath) -> RpcPromise {
-        RpcPromise::new(self.hook.get(path), Vec::new())
+        RpcPromise::new(self.current_hook().get(path), Vec::new())
     }
 
     /// Duplicates the RPC reference.
     pub fn dup(&self) -> Self {
-        Self::from_hook(self.hook.dup())
+        Self::from_hook(self.current_hook().dup())
+    }
+
+    /// Registers a callback invoked if the capability breaks.
+    pub fn on_rpc_broken(&self, callback: impl Fn(Error) + Send + Sync + 'static) {
+        self.current_hook().on_broken(Arc::new(callback));
+    }
+
+    /// Idempotently disposes this logical RPC reference.
+    pub fn dispose(&self) {
+        if let Some(hook) = self.hook.lock().expect("stub mutex poisoned").take() {
+            hook.dispose();
+        }
     }
 }
 
@@ -628,7 +785,7 @@ impl RpcStub {
 /// generated `TypedRpcPromise<T>` implements Rust's `Future` trait and performs
 /// final value conversion.
 pub struct RpcPromise {
-    hook: StubHook,
+    hook: Mutex<Option<StubHook>>,
     path: PropertyPath,
 }
 
@@ -643,22 +800,40 @@ impl std::fmt::Debug for RpcPromise {
 
 impl Clone for RpcPromise {
     fn clone(&self) -> Self {
-        Self::new(self.hook.dup(), self.path.clone())
+        // JS `unwrapStubAndDup()` uses get(), including for an empty promise
+        // path, so the duplicate remains independently pullable as a promise.
+        Self::new(self.current_hook().get(self.path.clone()), Vec::new())
     }
 }
 
 impl RpcPromise {
     /// Constructs a promise from a hook and property path.
     pub(crate) fn new(hook: StubHook, path: PropertyPath) -> Self {
-        Self { hook, path }
+        Self {
+            hook: Mutex::new(Some(hook)),
+            path,
+        }
+    }
+
+    fn current_hook(&self) -> StubHook {
+        self.hook
+            .lock()
+            .expect("promise mutex poisoned")
+            .clone()
+            .unwrap_or_else(|| {
+                ErrorStubHook::create(Error::Remote(
+                    "attempted to use RPC promise after it was disposed".into(),
+                ))
+            })
     }
 
     /// Returns the underlying hook after applying the property path.
     pub(crate) fn hook(&self) -> StubHook {
+        let hook = self.current_hook();
         if self.path.is_empty() {
-            self.hook.clone()
+            hook
         } else {
-            self.hook.get(self.path.clone())
+            hook.get(self.path.clone())
         }
     }
 
@@ -666,7 +841,19 @@ impl RpcPromise {
     pub fn call(&self, mut path: PropertyPath, args: RpcPayload) -> RpcPromise {
         let mut full_path = self.path.clone();
         full_path.append(&mut path);
-        RpcPromise::new(do_call(self.hook.clone(), full_path, args), Vec::new())
+        RpcPromise::new(do_call(self.current_hook(), full_path, args), Vec::new())
+    }
+
+    /// Traverses a generated property without pulling this promise.
+    pub fn get(&self, mut path: PropertyPath) -> RpcPromise {
+        let mut full_path = self.path.clone();
+        full_path.append(&mut path);
+        RpcPromise::new(self.current_hook(), full_path)
+    }
+
+    /// Constructs an already-rejected provider for a local encoding error.
+    pub fn rejected(error: Error) -> Self {
+        Self::new(ErrorStubHook::create(error), Vec::new())
     }
 
     /// Applies a synchronous callback to a scalar or each array element.
@@ -680,27 +867,23 @@ impl RpcPromise {
         F: Fn(CapnwebValue) -> Result<R> + Send + Sync + 'static,
         R: IntoCapnwebValue,
     {
-        let callback = Arc::new(callback);
-        let hook = PromiseStubHook::create(async move {
-            let value = self.pull().await?.deliver().await?;
-            let mapped = match value {
-                CapnwebValue::Null => CapnwebValue::Null,
-                CapnwebValue::Array(values) => {
-                    let mut mapped = Vec::with_capacity(values.len());
-                    for value in values {
-                        mapped.push(callback(value)?.into_capnweb_value()?);
-                    }
-                    CapnwebValue::Array(mapped)
-                }
-                value => callback(value)?.into_capnweb_value()?,
-            };
-            Ok(PayloadStubHook::create(RpcPayload::from_app_return(mapped)))
-        });
-        RpcPromise::new(hook, Vec::new())
+        crate::map::map_after_pull(self, callback)
+    }
+
+    /// Registers a callback invoked if this promise or capability breaks.
+    pub fn on_rpc_broken(&self, callback: impl Fn(Error) + Send + Sync + 'static) {
+        self.hook().on_broken(Arc::new(callback));
+    }
+
+    /// Idempotently disposes this logical promise reference.
+    pub fn dispose(&self) {
+        if let Some(hook) = self.hook.lock().expect("promise mutex poisoned").take() {
+            hook.dispose();
+        }
     }
 
     /// Pulls and recursively delivers this promise.
-    pub async fn pull(self) -> Result<RpcPayload> {
+    pub async fn pull(&self) -> Result<RpcPayload> {
         let hook = self.hook();
         match hook.pull() {
             MaybePromise::Immediate(payload) => Ok(payload),

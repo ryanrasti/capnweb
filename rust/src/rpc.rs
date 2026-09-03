@@ -9,8 +9,8 @@ use serde_json::{Value as Json, json};
 use tokio::sync::{Notify, mpsc};
 
 use crate::core::{
-    ErrorStubHook, MaybePromise, PayloadStubHook, PropertyPath, RpcPayload, RpcStub, RpcTarget,
-    StubHook, StubHookInner, TargetStubHook, as_import_hook,
+    BrokenCallback, ErrorStubHook, MaybePromise, PayloadStubHook, PropertyPath, RpcPayload,
+    RpcStub, RpcTarget, StubHook, StubHookInner, TargetStubHook, as_import_hook,
 };
 use crate::serialize::{Devaluator, Evaluator, ExportId, Exporter, ImportId, Importer, RpcLimits};
 use crate::transport::Transport;
@@ -22,12 +22,26 @@ struct ExportTableEntry {
     pull_started: bool,
 }
 
+struct BrokenRegistration {
+    callback: BrokenCallback,
+    invoked: AtomicBool,
+}
+
+impl BrokenRegistration {
+    fn invoke(&self, error: Error) {
+        if !self.invoked.swap(true, Ordering::AcqRel) {
+            (self.callback)(error);
+        }
+    }
+}
+
 /// Direct translation of JS `ImportTableEntry`.
 pub(crate) struct ImportTableEntry {
     session: Weak<RpcSessionInner>,
     import_id: ImportId,
     resolution: Mutex<Option<StubHook>>,
     leases: Mutex<Vec<Weak<ImportLease>>>,
+    on_broken_callbacks: Mutex<Vec<Arc<BrokenRegistration>>>,
     ready: Notify,
     pulling: AtomicBool,
 }
@@ -39,6 +53,7 @@ impl ImportTableEntry {
             import_id,
             resolution: Mutex::new(None),
             leases: Mutex::new(Vec::new()),
+            on_broken_callbacks: Mutex::new(Vec::new()),
             ready: Notify::new(),
             pulling: AtomicBool::new(pulling),
         }
@@ -46,7 +61,7 @@ impl ImportTableEntry {
 
     /// Equivalent of `ImportTableEntry.resolve()`.
     fn resolve(&self, hook: StubHook) {
-        *self.resolution.lock().expect("import mutex poisoned") = Some(hook);
+        *self.resolution.lock().expect("import mutex poisoned") = Some(hook.clone());
         for lease in self
             .leases
             .lock()
@@ -56,7 +71,46 @@ impl ImportTableEntry {
         {
             lease.release();
         }
+        for registration in self
+            .on_broken_callbacks
+            .lock()
+            .expect("import callback mutex poisoned")
+            .drain(..)
+        {
+            hook.on_broken(Arc::new(move |error| registration.invoke(error)));
+        }
         self.ready.notify_waiters();
+    }
+
+    fn abort(&self, error: Error) {
+        if self.current_resolution().is_some() {
+            return;
+        }
+        let hook = ErrorStubHook::create(error.clone());
+        *self.resolution.lock().expect("import mutex poisoned") = Some(hook);
+        for registration in self
+            .on_broken_callbacks
+            .lock()
+            .expect("import callback mutex poisoned")
+            .drain(..)
+        {
+            registration.invoke(error.clone());
+        }
+        self.ready.notify_waiters();
+    }
+
+    fn on_broken(&self, callback: BrokenCallback) {
+        if let Some(resolution) = self.current_resolution() {
+            resolution.on_broken(callback);
+        } else if let Some(session) = self.session.upgrade() {
+            let registration = session.register_broken_callback(callback);
+            self.on_broken_callbacks
+                .lock()
+                .expect("import callback mutex poisoned")
+                .push(registration);
+        } else {
+            callback(Error::Disconnected);
+        }
     }
 
     /// Equivalent of `ImportTableEntry.awaitResolution()`.
@@ -201,6 +255,50 @@ impl StubHookInner for RpcImportHook {
             is_promise: false,
         })
     }
+
+    fn on_broken(&self, callback: BrokenCallback) {
+        self.entry.on_broken(callback);
+    }
+}
+
+/// Direct translation of JS `RpcMainHook`.
+struct RpcMainHook {
+    inner: StubHook,
+    session: Weak<RpcSessionInner>,
+}
+
+impl StubHookInner for RpcMainHook {
+    fn call(&self, path: PropertyPath, args: RpcPayload) -> StubHook {
+        self.inner.call(path, args)
+    }
+
+    fn get(&self, path: PropertyPath) -> StubHook {
+        self.inner.get(path)
+    }
+
+    fn pull(&self) -> MaybePromise<RpcPayload> {
+        self.inner.pull()
+    }
+
+    fn dup(&self) -> StubHook {
+        self.inner.dup()
+    }
+
+    fn ignore_unhandled_rejections(&self) {
+        self.inner.ignore_unhandled_rejections();
+    }
+
+    fn dispose(&self) {
+        if let Some(session) = self.session.upgrade() {
+            session.abort(Error::Remote(
+                "RPC session was shut down by disposing the main stub".into(),
+            ));
+        }
+    }
+
+    fn on_broken(&self, callback: BrokenCallback) {
+        self.inner.on_broken(callback);
+    }
 }
 
 struct RpcSessionState {
@@ -218,11 +316,71 @@ pub(crate) struct RpcSessionInner {
     state: Mutex<RpcSessionState>,
     next_import_id: AtomicI64,
     outbound: mpsc::UnboundedSender<Json>,
+    abort_reason: Mutex<Option<Error>>,
+    on_broken_callbacks: Mutex<Vec<Arc<BrokenRegistration>>>,
 }
 
 impl RpcSessionInner {
     fn send(&self, message: Json) -> Result<()> {
+        if let Some(error) = self
+            .abort_reason
+            .lock()
+            .expect("abort mutex poisoned")
+            .clone()
+        {
+            return Err(error);
+        }
         self.outbound.send(message).map_err(|_| Error::Disconnected)
+    }
+
+    fn register_broken_callback(&self, callback: BrokenCallback) -> Arc<BrokenRegistration> {
+        let registration = Arc::new(BrokenRegistration {
+            callback,
+            invoked: AtomicBool::new(false),
+        });
+        self.on_broken_callbacks
+            .lock()
+            .expect("session callback mutex poisoned")
+            .push(registration.clone());
+        registration
+    }
+
+    fn abort(&self, error: Error) {
+        let mut abort_reason = self.abort_reason.lock().expect("abort mutex poisoned");
+        if abort_reason.is_some() {
+            return;
+        }
+        *abort_reason = Some(error.clone());
+        drop(abort_reason);
+        for registration in self
+            .on_broken_callbacks
+            .lock()
+            .expect("session callback mutex poisoned")
+            .iter()
+        {
+            registration.invoke(error.clone());
+        }
+        let (imports, exports) = {
+            let mut state = self.state.lock().expect("session mutex poisoned");
+            let imports = state
+                .imports
+                .values()
+                .filter_map(Weak::upgrade)
+                .collect::<Vec<_>>();
+            let exports = state
+                .exports
+                .drain()
+                .map(|(_, entry)| entry.hook)
+                .collect::<Vec<_>>();
+            state.reverse_exports.clear();
+            (imports, exports)
+        };
+        for import in imports {
+            import.abort(error.clone());
+        }
+        for export in exports {
+            export.dispose();
+        }
     }
 
     /// Equivalent of `RpcSessionImpl.sendCall()`.
@@ -517,11 +675,15 @@ impl RpcSession {
             }),
             next_import_id: AtomicI64::new(1),
             outbound,
+            abort_reason: Mutex::new(None),
+            on_broken_callbacks: Mutex::new(Vec::new()),
         });
 
+        let write_session = inner.clone();
         tokio::spawn(async move {
             while let Some(message) = outgoing.recv().await {
-                if writer.send(message.to_string()).await.is_err() {
+                if let Err(error) = writer.send(message.to_string()).await {
+                    write_session.abort(error);
                     break;
                 }
             }
@@ -532,10 +694,19 @@ impl RpcSession {
             loop {
                 let raw = match reader.receive().await {
                     Ok(Some(raw)) => raw,
-                    Ok(None) | Err(_) => break,
+                    Ok(None) => {
+                        read_session.abort(Error::Disconnected);
+                        break;
+                    }
+                    Err(error) => {
+                        read_session.abort(error);
+                        break;
+                    }
                 };
                 if raw.len() > read_session.limits.max_message_size {
-                    let _ = read_session.send(json!(["abort", "message exceeds maximum size"]));
+                    let error = Error::Protocol("message exceeds maximum size".into());
+                    let _ = read_session.send(json!(["abort", error.to_string()]));
+                    read_session.abort(error);
                     break;
                 }
                 let mut deserializer = serde_json::Deserializer::from_str(&raw);
@@ -543,13 +714,31 @@ impl RpcSession {
                 let message = match Json::deserialize(&mut deserializer) {
                     Ok(message) => message,
                     Err(error) => {
+                        let error = Error::Protocol(format!("invalid JSON: {error}"));
                         let _ = read_session.send(json!(["abort", error.to_string()]));
+                        read_session.abort(error);
                         break;
                     }
                 };
 
+                if message
+                    .as_array()
+                    .and_then(|message| message.first())
+                    .and_then(Json::as_str)
+                    == Some("abort")
+                {
+                    let reason = message
+                        .as_array()
+                        .and_then(|message| message.get(1))
+                        .map(|value| decode_error(Some(value)))
+                        .unwrap_or_else(|| "peer aborted the RPC session".into());
+                    read_session.abort(Error::Remote(reason));
+                    break;
+                }
+
                 if let Err(error) = read_session.process_message(message).await {
                     let _ = read_session.send(json!(["abort", error.to_string()]));
+                    read_session.abort(error);
                     break;
                 }
             }
@@ -561,7 +750,11 @@ impl RpcSession {
     /// Equivalent of `RpcSession.getRemoteMain()`.
     pub fn get_remote_main(&self) -> RpcStub {
         let entry = self.inner.import_entry(0, false);
-        RpcStub::from_hook(RpcImportHook::create(entry, false))
+        let inner = RpcImportHook::create(entry, false);
+        RpcStub::from_hook(Arc::new(RpcMainHook {
+            inner,
+            session: Arc::downgrade(&self.inner),
+        }))
     }
 }
 

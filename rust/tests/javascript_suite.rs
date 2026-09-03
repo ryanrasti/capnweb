@@ -23,6 +23,73 @@ macro_rules! skipped_test {
     };
 }
 
+struct ControlledTransport {
+    outgoing: tokio::sync::mpsc::UnboundedSender<capnweb::Result<String>>,
+    incoming: tokio::sync::mpsc::UnboundedReceiver<capnweb::Result<String>>,
+}
+
+#[derive(Clone)]
+struct TransportControl(tokio::sync::mpsc::UnboundedSender<capnweb::Result<String>>);
+
+struct ControlledSender(tokio::sync::mpsc::UnboundedSender<capnweb::Result<String>>);
+struct ControlledReceiver(tokio::sync::mpsc::UnboundedReceiver<capnweb::Result<String>>);
+
+#[async_trait::async_trait]
+impl capnweb::transport::TransportSender for ControlledSender {
+    async fn send(&mut self, message: String) -> capnweb::Result<()> {
+        self.0
+            .send(Ok(message))
+            .map_err(|_| capnweb::Error::Disconnected)
+    }
+}
+
+#[async_trait::async_trait]
+impl capnweb::transport::TransportReceiver for ControlledReceiver {
+    async fn receive(&mut self) -> capnweb::Result<Option<String>> {
+        match self.0.recv().await {
+            Some(Ok(message)) => Ok(Some(message)),
+            Some(Err(error)) => Err(error),
+            None => Ok(None),
+        }
+    }
+}
+
+impl capnweb::transport::Transport for ControlledTransport {
+    fn split(
+        self,
+    ) -> (
+        Box<dyn capnweb::transport::TransportSender>,
+        Box<dyn capnweb::transport::TransportReceiver>,
+    ) {
+        (
+            Box::new(ControlledSender(self.outgoing)),
+            Box::new(ControlledReceiver(self.incoming)),
+        )
+    }
+}
+
+fn controlled_transport_pair() -> (
+    ControlledTransport,
+    TransportControl,
+    ControlledTransport,
+    TransportControl,
+) {
+    let (to_left, left_incoming) = tokio::sync::mpsc::unbounded_channel();
+    let (to_right, right_incoming) = tokio::sync::mpsc::unbounded_channel();
+    (
+        ControlledTransport {
+            outgoing: to_right.clone(),
+            incoming: left_incoming,
+        },
+        TransportControl(to_left.clone()),
+        ControlledTransport {
+            outgoing: to_left,
+            incoming: right_incoming,
+        },
+        TransportControl(to_right),
+    )
+}
+
 struct ScriptedTransport {
     frame: String,
     sent: Arc<Mutex<Vec<String>>>,
@@ -93,6 +160,37 @@ impl Drop for DisposableTarget {
 
 #[rpc_target]
 impl DisposableTarget {}
+
+struct BrokenTarget;
+
+#[rpc_target]
+impl BrokenTarget {
+    fn get_value(&self) -> f64 {
+        42.0
+    }
+
+    fn make_counter(&self) -> Arc<Counter> {
+        Arc::new(Counter(Mutex::new(0.0)))
+    }
+
+    async fn hanging_call(&self) -> f64 {
+        std::future::pending().await
+    }
+
+    fn throw_error(&self) -> Result<f64, &'static str> {
+        Err("test error")
+    }
+}
+
+struct OrderTarget(Arc<Mutex<Vec<f64>>>);
+
+#[rpc_target]
+impl OrderTarget {
+    fn record_call(&self, id: f64) -> f64 {
+        self.0.lock().expect("order mutex poisoned").push(id);
+        id
+    }
+}
 
 struct ParityTarget;
 

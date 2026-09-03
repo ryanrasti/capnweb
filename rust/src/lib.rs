@@ -10,6 +10,17 @@ mod core;
 mod rpc;
 mod serialize;
 
+/// HTTP batch RPC counterpart; deferred in the current parity pass.
+pub mod batch;
+/// Map instruction runtime. The wire protocol remains incomplete.
+pub mod map;
+/// JavaScript MessagePort counterpart; not yet implemented.
+pub mod messageport;
+/// Stream runtime counterpart; deferred in the current parity pass.
+pub mod streams;
+/// WebSocket session helpers and transport exports.
+pub mod websocket;
+
 /// Framed transport implementations and traits.
 pub mod transport;
 

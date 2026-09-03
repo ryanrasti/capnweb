@@ -1,5 +1,7 @@
 # JavaScript parity notes
 
+See [`PARITY-AUDIT.md`](PARITY-AUDIT.md) for the file-by-file and class-method audit.
+
 The v0 runtime is a structural translation of the corresponding parts of `src/core.ts`,
 `src/serialize.ts`, and `src/rpc.ts`. Rust source keeps JavaScript class names and method names where
 possible. Every implemented method with different behavior has an inline `Difference from JS:`

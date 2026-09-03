@@ -752,19 +752,50 @@ skipped_test!(
     "the JavaScript behavior exercised by this case is not implemented in the Rust parity slice"
 );
 
-skipped_test!(
-    js_093_index_shuts_down_the_connection_if_the_main_capability_is_disposed_line_1892,
-    "__tests__/index.test.ts:1892",
-    "shuts down the connection if the main capability is disposed",
-    "the JavaScript behavior exercised by this case is not implemented in the Rust parity slice"
-);
+#[tokio::test]
+async fn shuts_down_the_connection_if_the_main_capability_is_disposed() {
+    let (client_transport, server_transport) = capnweb::transport::memory_transport_pair();
+    let client = RpcSession::new(client_transport, Arc::new(ParityTarget));
+    let _server = RpcSession::new(server_transport, Arc::new(ParityTarget));
+    let main = client.get_remote_main();
+    let counter_value = TypedRpcPromise::<CapnwebValue>::new(main.call(
+        vec!["makeCounter".into()],
+        RpcPayload::from_app_params(CapnwebValue::Array(vec![CapnwebValue::Number(0.0)])),
+    ))
+    .await
+    .expect("counter");
+    let CapnwebValue::Stub(counter) = counter_value else {
+        panic!("expected counter stub");
+    };
 
-skipped_test!(
-    js_094_index_maintains_e_order_for_concurrent_calls_on_single_stub_line_1909,
-    "__tests__/index.test.ts:1909",
-    "maintains e-order for concurrent calls on single stub",
-    "the JavaScript behavior exercised by this case is not implemented in the Rust parity slice"
-);
+    main.dispose();
+    let result = TypedRpcPromise::<f64>::new(increment(&counter, 1.0)).await;
+    assert!(
+        result
+            .expect_err("session shutdown")
+            .to_string()
+            .contains("RPC session was shut down by disposing the main stub")
+    );
+}
+
+#[tokio::test]
+async fn maintains_e_order_for_concurrent_calls_on_single_stub() {
+    let order = Arc::new(Mutex::new(Vec::new()));
+    let stub = RpcStub::from_target(Arc::new(OrderTarget(order.clone())));
+    let calls = [1.0, 2.0, 3.0, 4.0].map(|id| {
+        TypedRpcPromise::<f64>::new(stub.call(
+            vec!["recordCall".into()],
+            RpcPayload::from_app_params(CapnwebValue::Array(vec![CapnwebValue::Number(id)])),
+        ))
+    });
+    futures::future::try_join_all(calls)
+        .await
+        .expect("ordered calls");
+    assert_eq!(
+        *order.lock().expect("order mutex poisoned"),
+        [1.0, 2.0, 3.0, 4.0]
+    );
+}
 
 skipped_test!(
     js_095_index_maintains_e_order_for_promise_pipelined_calls_line_1935,
@@ -815,12 +846,138 @@ skipped_test!(
     "the JavaScript behavior exercised by this case is not implemented in the Rust parity slice"
 );
 
-skipped_test!(
-    js_102_index_signals_when_the_connection_is_lost_line_2117,
-    "__tests__/index.test.ts:2117",
-    "signals when the connection is lost",
-    "the JavaScript behavior exercised by this case is not implemented in the Rust parity slice"
-);
+#[tokio::test]
+async fn signals_when_the_connection_is_lost() {
+    let (client_transport, client_control, server_transport, _server_control) =
+        controlled_transport_pair();
+    let client = RpcSession::new(client_transport, Arc::new(ParityTarget));
+    let _server = RpcSession::new(server_transport, Arc::new(BrokenTarget));
+    let stub = client.get_remote_main();
+    let empty_args = || RpcPayload::from_app_params(CapnwebValue::Array(Vec::new()));
+
+    let value = TypedRpcPromise::<f64>::new(stub.call(vec!["getValue".into()], empty_args()))
+        .await
+        .expect("initial call");
+    assert_eq!(value, 42.0);
+
+    let errors = Arc::new(Mutex::new(Vec::<String>::new()));
+    stub.on_rpc_broken({
+        let errors = errors.clone();
+        move |_| {
+            errors
+                .lock()
+                .expect("errors mutex poisoned")
+                .push("stub".into())
+        }
+    });
+
+    let counter_one_promise = stub.call(vec!["makeCounter".into()], empty_args());
+    counter_one_promise.on_rpc_broken({
+        let errors = errors.clone();
+        move |_| {
+            errors
+                .lock()
+                .expect("errors mutex poisoned")
+                .push("counter1Promise".into())
+        }
+    });
+
+    let counter_two_value =
+        TypedRpcPromise::<CapnwebValue>::new(stub.call(vec!["makeCounter".into()], empty_args()))
+            .await
+            .expect("second counter");
+    let CapnwebValue::Stub(counter_two) = counter_two_value else {
+        panic!("expected second counter");
+    };
+    counter_two.on_rpc_broken({
+        let errors = errors.clone();
+        move |_| {
+            errors
+                .lock()
+                .expect("errors mutex poisoned")
+                .push("counter2".into())
+        }
+    });
+
+    let counter_one_value = counter_one_promise
+        .pull()
+        .await
+        .expect("first counter")
+        .deliver()
+        .await
+        .expect("deliver first counter");
+    let CapnwebValue::Stub(counter_one) = counter_one_value else {
+        panic!("expected first counter");
+    };
+    counter_one.on_rpc_broken({
+        let errors = errors.clone();
+        move |_| {
+            errors
+                .lock()
+                .expect("errors mutex poisoned")
+                .push("counter1".into())
+        }
+    });
+
+    let hanging = stub.call(vec!["hangingCall".into()], empty_args());
+    hanging.on_rpc_broken({
+        let errors = errors.clone();
+        move |_| {
+            errors
+                .lock()
+                .expect("errors mutex poisoned")
+                .push("hangingCall".into())
+        }
+    });
+
+    let throwing = stub.call(vec!["throwError".into()], empty_args());
+    throwing.on_rpc_broken({
+        let errors = errors.clone();
+        move |_| {
+            errors
+                .lock()
+                .expect("errors mutex poisoned")
+                .push("throwError".into())
+        }
+    });
+    assert!(throwing.pull().await.is_err());
+    assert_eq!(
+        *errors.lock().expect("errors mutex poisoned"),
+        ["throwError"]
+    );
+
+    throwing.on_rpc_broken({
+        let errors = errors.clone();
+        move |_| {
+            errors
+                .lock()
+                .expect("errors mutex poisoned")
+                .push("throwError2".into())
+        }
+    });
+    assert_eq!(
+        *errors.lock().expect("errors mutex poisoned"),
+        ["throwError", "throwError2"]
+    );
+
+    client_control
+        .0
+        .send(Err(capnweb::Error::Io("test disconnect".into())))
+        .expect("inject disconnect");
+    assert!(hanging.pull().await.is_err());
+    assert_eq!(
+        *errors.lock().expect("errors mutex poisoned"),
+        [
+            "throwError",
+            "throwError2",
+            "stub",
+            "counter1Promise",
+            "counter2",
+            "counter1",
+            "hangingCall",
+        ]
+    );
+}
 
 skipped_test!(
     js_103_index_disposes_copied_call_arguments_when_the_backing_promise_rejects_line_2196,

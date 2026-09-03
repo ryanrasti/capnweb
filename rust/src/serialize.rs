@@ -191,10 +191,11 @@ impl<'a> Devaluator<'a> {
     }
 
     fn devaluate_stub(&self, stub: &RpcStub) -> Result<Json> {
-        if let Some(id) = self.exporter.get_import(&stub.hook) {
+        let hook = stub.current_hook();
+        if let Some(id) = self.exporter.get_import(&hook) {
             Ok(json!(["import", id]))
         } else {
-            let id = self.exporter.export_stub(stub.hook.dup())?;
+            let id = self.exporter.export_stub(hook.dup())?;
             Ok(json!(["export", id]))
         }
     }
