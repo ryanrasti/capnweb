@@ -1,3 +1,5 @@
+//! Rust-specific newline-delimited transport with no direct JS counterpart.
+
 use async_trait::async_trait;
 use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncWrite, AsyncWriteExt, BufReader};
 

@@ -3,6 +3,9 @@
 //! Internal names and state transitions intentionally follow the JavaScript
 //! implementation. Generated macros replace only JavaScript proxy method
 //! interception and `RpcTarget` prototype reflection.
+//!
+//! Parity status is tracked explicitly in `rust/PARITY-AUDIT.md`; partial
+//! counterparts are not treated as complete.
 
 extern crate self as capnweb;
 

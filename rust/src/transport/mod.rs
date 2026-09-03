@@ -1,4 +1,6 @@
 //! Rust framing boundary corresponding to the transport interfaces in `rpc.ts`.
+//!
+//! Parity status: partial; custom encoding levels and abort hooks remain.
 
 mod io;
 mod memory;

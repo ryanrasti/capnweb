@@ -1,3 +1,7 @@
+//! String-frame portion of `src/websocket.ts`.
+//!
+//! Parity status: partial; session helpers and close lifecycle remain.
+
 use async_trait::async_trait;
 use futures::{SinkExt, StreamExt};
 use tokio::io::{AsyncRead, AsyncWrite};

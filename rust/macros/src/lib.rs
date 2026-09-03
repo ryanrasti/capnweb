@@ -3,6 +3,9 @@
 //! `rpc_interface` replaces `RpcStub` proxy method interception, while
 //! `rpc_target` replaces `RpcTarget` prototype reflection. Everything behind
 //! these macros uses the same hook operations as the JavaScript runtime.
+//!
+//! Parity status: partial. Generated getters and complete descriptor/type
+//! conformance remain; see `rust/PARITY-AUDIT.md`.
 
 use proc_macro::TokenStream;
 use quote::quote;

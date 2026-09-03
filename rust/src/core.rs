@@ -1,4 +1,7 @@
 //! Direct structural translation of `src/core.ts`.
+//!
+//! Parity status: partial. See `rust/PARITY-AUDIT.md`; omitted methods are not
+//! considered complete merely because Rust supplies an ownership primitive.
 
 use std::collections::BTreeMap;
 use std::future::Future;
@@ -807,6 +810,24 @@ impl Clone for RpcPromise {
 }
 
 impl RpcPromise {
+    /// Constructs an RPC promise from an eager Rust future.
+    ///
+    /// Difference from JS: Rust has no thenable assimilation protocol. The
+    /// future is spawned immediately and its resolved Rust value is converted
+    /// with application-return ownership semantics.
+    pub fn from_future<F, V>(future: F) -> Self
+    where
+        F: Future<Output = Result<V>> + Send + 'static,
+        V: IntoCapnwebValue + Send + 'static,
+    {
+        let hook = PromiseStubHook::create(async move {
+            let value = future.await?.into_capnweb_value()?;
+            Ok(PayloadStubHook::create(RpcPayload::from_app_return(value)))
+        });
+        hook.ignore_unhandled_rejections();
+        Self::new(hook, Vec::new())
+    }
+
     /// Constructs a promise from a hook and property path.
     pub(crate) fn new(hook: StubHook, path: PropertyPath) -> Self {
         Self {

@@ -1,3 +1,8 @@
+//! In-memory transport used by Rust-to-Rust parity tests.
+//!
+//! Parity status relative to the JS `TestTransport`: basic delivery only;
+//! fencing, logs, pending counts, and injected receive failures live in tests.
+
 use async_trait::async_trait;
 use tokio::sync::mpsc;
 

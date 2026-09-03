@@ -1,4 +1,7 @@
 //! Direct structural translation of `src/rpc.ts`.
+//!
+//! Parity status: partial. Non-stream lifecycle gaps are tracked method by
+//! method in `rust/PARITY-AUDIT.md`.
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};

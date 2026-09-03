@@ -1,4 +1,7 @@
 //! Direct structural translation of `src/serialize.ts`.
+//!
+//! Parity status: partial. Unsupported non-Web built-ins and exact validation
+//! gaps are listed in `rust/PARITY-AUDIT.md`.
 
 use std::collections::BTreeMap;
 use std::str::FromStr;

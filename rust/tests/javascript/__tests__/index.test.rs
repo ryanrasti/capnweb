@@ -440,12 +440,23 @@ skipped_test!(
     "the JavaScript behavior exercised by this case is not implemented in the Rust parity slice"
 );
 
-skipped_test!(
-    js_056_index_disposes_nested_stubs_and_rpctargets_when_wrapping_an_object_line_1006,
-    "__tests__/index.test.ts:1006",
-    "disposes nested stubs and RpcTargets when wrapping an object",
-    "the JavaScript behavior exercised by this case is not implemented in the Rust parity slice"
-);
+#[test]
+fn disposes_nested_stubs_and_rpc_targets_when_wrapping_an_object() {
+    let stub_disposed = Arc::new(AtomicBool::new(false));
+    let target_disposed = Arc::new(AtomicBool::new(false));
+    let inner = RpcStub::from_target(Arc::new(DisposableTarget(stub_disposed.clone())));
+    let outer = RpcStub::from_value(CapnwebValue::Object(BTreeMap::from([
+        ("stub".into(), CapnwebValue::Stub(inner)),
+        (
+            "target".into(),
+            CapnwebValue::Target(Arc::new(DisposableTarget(target_disposed.clone()))),
+        ),
+        ("value".into(), CapnwebValue::Number(42.0)),
+    ])));
+    outer.dispose();
+    assert!(stub_disposed.load(Ordering::Acquire));
+    assert!(target_disposed.load(Ordering::Acquire));
+}
 
 skipped_test!(
     js_057_index_only_calls_rpctarget_disposer_when_wrapping_an_rpctarget_with_nested_stubs_line_1031,
@@ -468,12 +479,17 @@ fn only_disposes_rpc_target_when_all_dups_are_disposed() {
     assert!(disposed.load(Ordering::Acquire));
 }
 
-skipped_test!(
-    js_059_index_makes_disposal_idempotent_duplicate_dispose_calls_don_t_affect_refcount_line_1076,
-    "__tests__/index.test.ts:1076",
-    "makes disposal idempotent - duplicate dispose calls don't affect refcount",
-    "the JavaScript behavior exercised by this case is not implemented in the Rust parity slice"
-);
+#[test]
+fn makes_disposal_idempotent_duplicate_dispose_calls_do_not_affect_refcount() {
+    let disposed = Arc::new(AtomicBool::new(false));
+    let original = RpcStub::from_target(Arc::new(DisposableTarget(disposed.clone())));
+    let duplicate = original.dup();
+    duplicate.dispose();
+    duplicate.dispose();
+    assert!(!disposed.load(Ordering::Acquire));
+    original.dispose();
+    assert!(disposed.load(Ordering::Acquire));
+}
 
 #[tokio::test]
 async fn supports_calls() {
@@ -1070,12 +1086,35 @@ skipped_test!(
     "the JavaScript behavior exercised by this case is not implemented in the Rust parity slice"
 );
 
-skipped_test!(
-    js_116_index_queues_calls_made_before_resolution_and_delivers_them_in_order_line_2402,
-    "__tests__/index.test.ts:2402",
-    "queues calls made before resolution and delivers them in order",
-    "the JavaScript behavior exercised by this case is not implemented in the Rust parity slice"
-);
+#[tokio::test]
+async fn queues_calls_made_before_resolution_and_delivers_them_in_order() {
+    let calls = Arc::new(Mutex::new(Vec::new()));
+    let (resolve, resolution) = tokio::sync::oneshot::channel();
+    let promise = RpcPromise::from_future(async move {
+        resolution
+            .await
+            .map_err(|_| capnweb::Error::Remote("resolution canceled".into()))
+    });
+
+    let results = [1.0, 2.0, 3.0].map(|id| {
+        TypedRpcPromise::<f64>::new(promise.call(
+            vec!["recordCall".into()],
+            RpcPayload::from_app_params(CapnwebValue::Array(vec![CapnwebValue::Number(id)])),
+        ))
+    });
+    assert!(calls.lock().expect("calls mutex poisoned").is_empty());
+    assert!(resolve.send(Arc::new(OrderTarget(calls.clone()))).is_ok());
+    assert_eq!(
+        futures::future::try_join_all(results)
+            .await
+            .expect("queued calls"),
+        [1.0, 2.0, 3.0]
+    );
+    assert_eq!(
+        *calls.lock().expect("calls mutex poisoned"),
+        [1.0, 2.0, 3.0]
+    );
+}
 
 skipped_test!(
     js_117_index_accepts_a_promise_for_a_target_a_remote_stub_or_a_plain_value_line_2419,
@@ -1091,19 +1130,52 @@ skipped_test!(
     "the JavaScript behavior exercised by this case is not implemented in the Rust parity slice"
 );
 
-skipped_test!(
-    js_119_index_reports_rejection_to_queued_calls_await_and_onrpcbroken_line_2442,
-    "__tests__/index.test.ts:2442",
-    "reports rejection to queued calls, await, and onRpcBroken",
-    "the JavaScript behavior exercised by this case is not implemented in the Rust parity slice"
-);
+#[tokio::test]
+async fn reports_rejection_to_queued_calls_await_and_on_rpc_broken() {
+    let promise = RpcPromise::from_future(async {
+        Err::<CapnwebValue, _>(capnweb::Error::Remote("nope".into()))
+    });
+    let broken = Arc::new(Mutex::new(Vec::new()));
+    promise.on_rpc_broken({
+        let broken = broken.clone();
+        move |error| {
+            broken
+                .lock()
+                .expect("broken mutex poisoned")
+                .push(error.to_string())
+        }
+    });
+    let queued = promise.call(
+        vec!["increment".into()],
+        RpcPayload::from_app_params(CapnwebValue::Array(Vec::new())),
+    );
+    assert!(
+        queued
+            .pull()
+            .await
+            .expect_err("queued rejection")
+            .to_string()
+            .contains("nope")
+    );
+    assert!(
+        promise
+            .pull()
+            .await
+            .expect_err("promise rejection")
+            .to_string()
+            .contains("nope")
+    );
+    tokio::task::yield_now().await;
+    assert_eq!(broken.lock().expect("broken mutex poisoned").len(), 1);
+}
 
-skipped_test!(
-    js_120_index_does_not_report_an_unhandled_rejection_for_an_unused_promise_line_2454,
-    "__tests__/index.test.ts:2454",
-    "does not report an unhandled rejection for an unused promise",
-    "the JavaScript behavior exercised by this case is not implemented in the Rust parity slice"
-);
+#[tokio::test]
+async fn does_not_report_an_unhandled_rejection_for_an_unused_promise() {
+    let _promise = RpcPromise::from_future(async {
+        Err::<CapnwebValue, _>(capnweb::Error::Remote("ignored".into()))
+    });
+    tokio::task::yield_now().await;
+}
 
 skipped_test!(
     js_121_index_does_not_report_an_unhandled_rejection_for_a_disposed_unawaited_queued_cal_line_2459,
@@ -1119,12 +1191,26 @@ skipped_test!(
     "the JavaScript behavior exercised by this case is not implemented in the Rust parity slice"
 );
 
-skipped_test!(
-    js_123_index_disposes_the_eventual_target_when_disposed_before_resolution_line_2471,
-    "__tests__/index.test.ts:2471",
-    "disposes the eventual target when disposed before resolution",
-    "the JavaScript behavior exercised by this case is not implemented in the Rust parity slice"
-);
+#[tokio::test]
+async fn disposes_the_eventual_target_when_disposed_before_resolution() {
+    let disposed = Arc::new(AtomicBool::new(false));
+    let (resolve, resolution) = tokio::sync::oneshot::channel();
+    let promise = RpcPromise::from_future(async move {
+        resolution
+            .await
+            .map_err(|_| capnweb::Error::Remote("resolution canceled".into()))
+    });
+    promise.dispose();
+    assert!(
+        resolve
+            .send(Arc::new(DisposableTarget(disposed.clone())))
+            .is_ok()
+    );
+    for _ in 0..8 {
+        tokio::task::yield_now().await;
+    }
+    assert!(disposed.load(Ordering::Acquire));
+}
 
 skipped_test!(
     js_124_index_delivers_a_call_initiated_before_disposal_line_2486,
