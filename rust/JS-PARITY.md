@@ -200,7 +200,7 @@ machine and ordering.
 | discriminated union                | enum                                                       |
 | nullable value                     | `Option<T>`                                                |
 | dynamic RPC value                  | `CapnwebValue`                                             |
-| microtask ordering                 | explicit ordered state or queue                            |
+| per-promise e-order               | operations start in registration order                    |
 | callback registered before resolve | callback registered before resolution in Rust as well      |
 | synchronous fast path              | immediate enum branch, not an always-async future          |
 
@@ -208,13 +208,18 @@ Rust futures are lazy while JavaScript promises are eager. Therefore constructin
 counterpart must start or poll a future at the exact point where JavaScript constructs the promise.
 Execution may not be deferred until `pull()` unless the JavaScript implementation also defers it.
 
-The runtime uses an eager task-backed promise representation. Construction polls the future once
-synchronously, matching execution of a JavaScript async function through its first `await`. If the
-future is pending, subsequent polls are scheduled immediately on Tokio. Resolution callbacks are
-stored and invoked in registration order rather than relying on incidental Tokio task order. An
-immediately-ready result remains available through the synchronous fast path. Creating pending work
-without an active Tokio runtime produces a rejected RPC promise instead of silently leaving a lazy
-future dormant.
+The final eager-promise runtime model needs more inspection before implementation. In particular,
+e-order only requires operations registered on the same unresolved promise to *start* in
+registration order; an operation need not complete before the next starts, and independent promises
+do not need a shared microtask queue. The provisional `EagerPromise<T>` interface lives in
+`rust/src/eager_promise.rs` so mechanically translated promise hot spots can use an idiomatic API
+without embedding a speculative scheduler in each hook.
+
+The intended construction behavior remains: poll the originating future once synchronously, then
+drive a pending future on the selected Rust executor. After resolution, registered operations must
+be initially polled in registration order. The implementation and cancellation details remain a
+localized `RUST-DEFERRED(JS built-in: Promise/e-order scheduler)` boundary until focused tests settle
+the simplest correct model.
 
 ## In-scope source files
 

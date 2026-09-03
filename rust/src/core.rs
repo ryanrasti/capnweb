@@ -7,13 +7,15 @@
 // JS:
 
 // JS: import type { RpcTargetBranded, __RPC_TARGET_BRAND } from "./types.js";
-use std::collections::{BTreeMap, VecDeque};
+use std::collections::BTreeMap;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::{Arc, Mutex};
 
 use num_bigint::BigInt;
 use thiserror::Error as ThisError;
+
+use crate::eager_promise::EagerPromise;
 
 /// An error raised at an RPC boundary.
 #[derive(Clone, Debug, ThisError)]
@@ -3162,381 +3164,213 @@ impl StubHookInner for TargetStubHook {
 // JS: // StubHook derived from a Promise for some other StubHook. Waits for the promise and then
 // JS: // forward calls, being careful to honor e-order.
 // JS: export class PromiseStubHook extends StubHook {
-// JS:   private promise: Promise<StubHook>;
-// JS:   private resolution: StubHook | undefined;
-// JS:
-// JS:   constructor(promise: Promise<StubHook>) {
-// JS:     super();
-// JS:
-// JS:     this.promise = promise.then(res => { this.resolution = res; return res; });
-// JS:   }
-// JS:
-// JS:   call(path: PropertyPath, args: RpcPayload): StubHook {
-// JS:     // Note: We can't use `resolution` even if it's available because it could technically break
-// JS:     //   e-order: A call() that arrives just after the resolution could be delivered faster than
-// JS:     //   a call() that arrives just before. Keeping the promise around and always waiting on it
-// JS:     //   avoids the problem.
-// JS:     // TODO: Is there a way around this?
-// JS:
-// JS:     // Once call() returns (synchronously), we can no longer touch the original args. Since we
-// JS:     // can't serialize them yet, we have to deep-copy them now.
-// JS:     args.ensureDeepCopied();
-// JS:
-// JS:     return new PromiseStubHook(this.promise.then(
-// JS:         hook => hook.call(path, args),
-// JS:         err => {
-// JS:           // The backing promise rejected, so no callee ever existed to take ownership of `args`.
-// JS:           args.dispose();
-// JS:           throw err;
-// JS:         }));
-// JS:   }
-// JS:
-// JS:   stream(path: PropertyPath, args: RpcPayload): {promise: Promise<void>, size?: number} {
-// JS:     // Not yet resolved — we don't know if this will be local or remote. Deep-copy args and wait.
-// JS:     // No size is returned because we can't know yet; this means the caller will await the promise,
-// JS:     // which is the safe default (serialized writes).
-// JS:     args.ensureDeepCopied();
-// JS:     let promise = this.promise.then(
-// JS:         hook => hook.stream(path, args).promise,
-// JS:         err => {
-// JS:           // The backing promise rejected, so no callee ever existed to take ownership of `args`.
-// JS:           args.dispose();
-// JS:           throw err;
-// JS:         });
-// JS:     return { promise };
-// JS:   }
-// JS:
-// JS:   map(path: PropertyPath, captures: StubHook[], instructions: unknown[]): StubHook {
-// JS:     return new PromiseStubHook(this.promise.then(
-// JS:         hook => hook.map(path, captures, instructions),
-// JS:         err => {
-// JS:           // The backing promise rejected, so no callee ever existed to take ownership of the
-// JS:           // captures.
-// JS:           for (let cap of captures) {
-// JS:             cap.dispose();
-// JS:           }
-// JS:           throw err;
-// JS:         }));
-// JS:   }
-// JS:
-// JS:   get(path: PropertyPath): StubHook {
-// JS:     // Note: e-order matters for get(), just like call(), in case the property has a getter.
-// JS:     return new PromiseStubHook(this.promise.then(hook => hook.get(path)));
-// JS:   }
-// JS:
-// JS:   dup(): StubHook {
-// JS:     if (this.resolution) {
-// JS:       return this.resolution.dup();
-// JS:     } else {
-// JS:       return new PromiseStubHook(this.promise.then(hook => hook.dup()));
-// JS:     }
-// JS:   }
-// JS:
-// JS:   pull(): RpcPayload | Promise<RpcPayload> {
-// JS:     // Luckily, resolutions are not subject to e-order, so it's safe to use `this.resolution`
-// JS:     // here. In fact, it is required to maintain e-order elsewhere: If this promise is being used
-// JS:     // as the input to some other local call (via promise pipelining), we need to make sure that
-// JS:     // other call is not delayed at all when this promise is already resolved.
-// JS:     if (this.resolution) {
-// JS:       return this.resolution.pull();
-// JS:     } else {
-// JS:       return this.promise.then(hook => hook.pull());
-// JS:     }
-// JS:   }
-// JS:
-// JS:   ignoreUnhandledRejections(): void {
-// JS:     if (this.resolution) {
-// JS:       this.resolution.ignoreUnhandledRejections();
-// JS:     } else {
-// JS:       this.promise.then(res => {
-// JS:         res.ignoreUnhandledRejections();
-// JS:       }, err => {
-// JS:         // Ignore the error!
-// JS:       });
-// JS:     }
-// JS:   }
-// JS:
-// JS:   dispose(): void {
-// JS:     // We can't take the fast path here when this.resolution is available because if the resolution
-// JS:     // was just recently delivered, promise waiters may not have had a chance to consume it yet,
-// JS:     // and disposing it would preempt them. If we always wait on `this.promise` then we'll
-// JS:     // run after anything that was queued before us.
-// JS:     this.promise.then(hook => hook.dispose(), () => {});
-// JS:   }
-// JS:
-// JS:   onBroken(callback: (error: any) => void): void {
-// JS:     if (this.resolution) {
-// JS:       this.resolution.onBroken(callback);
-// JS:     } else {
-// JS:       this.promise.then(hook => {
-// JS:         hook.onBroken(callback);
-// JS:       }, callback);
-// JS:     }
-// JS:   }
-// JS: }
-type PromiseOperation = Box<dyn FnOnce(Result<StubHook>) + Send + 'static>;
-
 #[derive(Clone)]
 pub struct PromiseStubHook {
-    shared: Arc<PromiseShared>,
+    // JS:   private promise: Promise<StubHook>;
+    promise: EagerPromise<StubHook>,
+    // JS:   private resolution: StubHook | undefined;
+    // Settled inspection is provided by `EagerPromise::peek()`.
 }
-
-struct PromiseShared {
-    state: Mutex<PromiseState>,
-}
-
-struct PromiseState {
-    resolution: Option<Result<StubHook>>,
-    operations: VecDeque<PromiseOperation>,
-    drain_scheduled: bool,
-}
-
-impl PromiseShared {
-    fn pending() -> Arc<Self> {
-        Arc::new(Self {
-            state: Mutex::new(PromiseState {
-                resolution: None,
-                operations: VecDeque::new(),
-                drain_scheduled: false,
-            }),
-        })
-    }
-
-    fn resolution(&self) -> Option<Result<StubHook>> {
-        self.state
-            .lock()
-            .expect("promise state mutex poisoned")
-            .resolution
-            .clone()
-    }
-
-    fn resolve(self: &Arc<Self>, resolution: Result<StubHook>) {
-        {
-            let mut state = self.state.lock().expect("promise state mutex poisoned");
-            if state.resolution.is_some() {
-                return;
-            }
-            state.resolution = Some(resolution);
-        }
-        Self::schedule_drain(self);
-    }
-
-    fn enqueue(self: &Arc<Self>, operation: PromiseOperation) {
-        self.state
-            .lock()
-            .expect("promise state mutex poisoned")
-            .operations
-            .push_back(operation);
-        Self::schedule_drain(self);
-    }
-
-    fn schedule_drain(shared: &Arc<Self>) {
-        {
-            let mut state = shared.state.lock().expect("promise state mutex poisoned");
-            if state.resolution.is_none() || state.operations.is_empty() || state.drain_scheduled {
-                return;
-            }
-            state.drain_scheduled = true;
-        }
-
-        let Ok(runtime) = tokio::runtime::Handle::try_current() else {
-            let operations = {
-                let mut state = shared.state.lock().expect("promise state mutex poisoned");
-                state.drain_scheduled = false;
-                std::mem::take(&mut state.operations)
-            };
-            let error = Error::Message(
-                "pending RPC promise operation requires an active Tokio runtime".to_owned(),
-            );
-            for operation in operations {
-                operation(Err(error.clone()));
-            }
-            return;
-        };
-
-        let shared = Arc::clone(shared);
-        runtime.spawn(async move {
-            loop {
-                let next = {
-                    let mut state = shared.state.lock().expect("promise state mutex poisoned");
-                    let Some(operation) = state.operations.pop_front() else {
-                        state.drain_scheduled = false;
-                        return;
-                    };
-                    let resolution = state
-                        .resolution
-                        .clone()
-                        .expect("drain starts only after resolution");
-                    (operation, resolution)
-                };
-                next.0(next.1);
-            }
-        });
-    }
-}
-
+// JS:
+// JS:   constructor(promise: Promise<StubHook>) {
 impl PromiseStubHook {
-    fn pending() -> Self {
-        Self {
-            shared: PromiseShared::pending(),
-        }
+    fn from_eager(promise: EagerPromise<StubHook>) -> StubHook {
+        // JS:     super();
+        // The Rust trait implementation is below.
+        // JS:
+        // JS:     this.promise = promise.then(res => { this.resolution = res; return res; });
+        Arc::new(Self { promise })
+        // JS:   }
     }
 
     #[doc(hidden)]
     pub fn from_future(
         future: impl Future<Output = Result<StubHook>> + Send + 'static,
     ) -> StubHook {
-        let result = Self::pending();
-        let shared = Arc::clone(&result.shared);
-        let mut future: Pin<Box<dyn Future<Output = Result<StubHook>> + Send + 'static>> =
-            Box::pin(future);
-        let first_poll = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            let mut context = std::task::Context::from_waker(futures::task::noop_waker_ref());
-            future.as_mut().poll(&mut context)
-        }));
-
-        match first_poll {
-            Ok(std::task::Poll::Ready(resolution)) => shared.resolve(resolution),
-            Ok(std::task::Poll::Pending) => match tokio::runtime::Handle::try_current() {
-                Ok(runtime) => {
-                    runtime.spawn(async move {
-                        shared.resolve(future.await);
-                    });
-                }
-                Err(_) => shared.resolve(Err(Error::Message(
-                    "pending RPC promise requires an active Tokio runtime".to_owned(),
-                ))),
-            },
-            Err(_) => shared.resolve(Err(Error::Message(
-                "RPC promise future panicked during its first poll".to_owned(),
-            ))),
-        }
-
-        Arc::new(result)
-    }
-
-    fn chain(
-        &self,
-        operation: impl FnOnce(StubHook) -> Result<StubHook> + Send + 'static,
-    ) -> StubHook {
-        let child = Self::pending();
-        let child_shared = Arc::clone(&child.shared);
-        self.shared.enqueue(Box::new(move |resolution| {
-            child_shared.resolve(resolution.and_then(operation));
-        }));
-        Arc::new(child)
+        Self::from_eager(EagerPromise::new(future))
     }
 }
-
+// JS:
+// JS:   call(path: PropertyPath, args: RpcPayload): StubHook {
 impl StubHookInner for PromiseStubHook {
     fn call(&self, path: PropertyPath, args: RpcPayload) -> Result<StubHook> {
-        Ok(self.chain(move |hook| hook.call(path, args)))
+        // JS:     // Note: We can't use `resolution` even if it's available because it could technically break
+        // JS:     //   e-order: A call() that arrives just after the resolution could be delivered faster than
+        // JS:     //   a call() that arrives just before. Keeping the promise around and always waiting on it
+        // JS:     //   avoids the problem.
+        // JS:     // TODO: Is there a way around this?
+        // JS:
+        // JS:     // Once call() returns (synchronously), we can no longer touch the original args. Since we
+        // JS:     // can't serialize them yet, we have to deep-copy them now.
+        // JS:     args.ensureDeepCopied();
+        // Moving owned arguments into the operation is the Rust deep-copy/lifetime equivalent.
+        // JS:
+        // JS:     return new PromiseStubHook(this.promise.then(
+        let promise = self.promise.then(move |hook| {
+            // JS:         hook => hook.call(path, args),
+            hook.call(path, args)
+            // JS:         err => {
+            // JS:           // The backing promise rejected, so no callee ever existed to take ownership of `args`.
+            // JS:           args.dispose();
+            // Rejection drops the operation closure and its owned arguments.
+            // JS:           throw err;
+            // JS:         }));
+        });
+        Ok(Self::from_eager(promise))
+        // JS:   }
     }
-
+    // JS:
+    // JS:   stream(path: PropertyPath, args: RpcPayload): {promise: Promise<void>, size?: number} {
     fn stream(&self, path: PropertyPath, args: RpcPayload) -> Result<StreamCall> {
-        let (sender, receiver) = tokio::sync::oneshot::channel();
-        self.shared.enqueue(Box::new(move |resolution| {
-            let stream = resolution.and_then(|hook| hook.stream(path, args));
-            match stream {
-                Ok(stream) => match tokio::runtime::Handle::try_current() {
-                    Ok(runtime) => {
-                        runtime.spawn(async move {
-                            let _ = sender.send(stream.promise.await);
-                        });
-                    }
-                    Err(_) => {
-                        let _ = sender.send(Err(Error::Message(
-                            "pending stream call requires an active Tokio runtime".to_owned(),
-                        )));
-                    }
-                },
-                Err(error) => {
-                    let _ = sender.send(Err(error));
-                }
-            }
-        }));
+        // JS:     // Not yet resolved — we don't know if this will be local or remote. Deep-copy args and wait.
+        // JS:     // No size is returned because we can't know yet; this means the caller will await the promise,
+        // JS:     // which is the safe default (serialized writes).
+        // JS:     args.ensureDeepCopied();
+        // Moving owned arguments into the operation keeps them alive until it starts.
+        // JS:     let promise = this.promise.then(
+        let promise = self.promise.then_async(move |hook| {
+            Box::pin(async move {
+                // JS:         hook => hook.stream(path, args).promise,
+                hook.stream(path, args)?.promise.await
+                // JS:         err => {
+                // JS:           // The backing promise rejected, so no callee ever existed to take ownership of `args`.
+                // JS:           args.dispose();
+                // Rejection drops the operation and its owned arguments.
+                // JS:           throw err;
+                // JS:         });
+            })
+        });
+        // JS:     return { promise };
         Ok(StreamCall {
-            promise: Box::pin(async move {
-                receiver.await.map_err(|_| {
-                    Error::Message("pending stream operation was canceled".to_owned())
-                })?
-            }),
+            promise: promise.into_future(),
             size: None,
         })
+        // JS:   }
     }
-
+    // JS:
+    // JS:   map(path: PropertyPath, captures: StubHook[], instructions: unknown[]): StubHook {
     fn map(
         &self,
         path: PropertyPath,
         captures: Vec<StubHook>,
         instructions: MapInstructions,
     ) -> Result<StubHook> {
-        Ok(self.chain(move |hook| hook.map(path, captures, instructions)))
+        // JS:     return new PromiseStubHook(this.promise.then(
+        let promise = self.promise.then(move |hook| {
+            // JS:         hook => hook.map(path, captures, instructions),
+            hook.map(path, captures, instructions)
+            // JS:         err => {
+            // JS:           // The backing promise rejected, so no callee ever existed to take ownership of the
+            // JS:           // captures.
+            // JS:           for (let cap of captures) {
+            // JS:             cap.dispose();
+            // JS:           }
+            // Rejection drops the operation closure and its owned captures.
+            // JS:           throw err;
+            // JS:         }));
+        });
+        Ok(Self::from_eager(promise))
+        // JS:   }
     }
-
+    // JS:
+    // JS:   get(path: PropertyPath): StubHook {
     fn get(&self, path: PropertyPath) -> Result<StubHook> {
-        Ok(self.chain(move |hook| hook.get(path)))
+        // JS:     // Note: e-order matters for get(), just like call(), in case the property has a getter.
+        // JS:     return new PromiseStubHook(this.promise.then(hook => hook.get(path)));
+        Ok(Self::from_eager(
+            self.promise.then(move |hook| hook.get(path)),
+        ))
+        // JS:   }
     }
-
+    // JS:
+    // JS:   dup(): StubHook {
+    // JS:     if (this.resolution) {
+    // JS:       return this.resolution.dup();
+    // JS:     } else {
+    // JS:       return new PromiseStubHook(this.promise.then(hook => hook.dup()));
+    // JS:     }
+    // JS:   }
+    // RUST-DIFF(local refcount): cloning the outer hook `Arc` duplicates this promise capability.
+    // JS:
+    // JS:   pull(): RpcPayload | Promise<RpcPayload> {
     fn pull(&self) -> Result<MaybePromise<RpcPayload>> {
-        if let Some(resolution) = self.shared.resolution() {
+        // JS:     // Luckily, resolutions are not subject to e-order, so it's safe to use `this.resolution`
+        // JS:     // here. In fact, it is required to maintain e-order elsewhere: If this promise is being used
+        // JS:     // as the input to some other local call (via promise pipelining), we need to make sure that
+        // JS:     // other call is not delayed at all when this promise is already resolved.
+        // JS:     if (this.resolution) {
+        if let Some(resolution) = self.promise.peek() {
+            // JS:       return this.resolution.pull();
             return resolution?.pull();
+            // JS:     } else {
         }
-
-        let (sender, receiver) = tokio::sync::oneshot::channel();
-        self.shared.enqueue(Box::new(move |resolution| {
-            let pulled = resolution.and_then(|hook| hook.pull());
-            match pulled {
-                Ok(MaybePromise::Immediate(payload)) => {
-                    let _ = sender.send(Ok(payload));
+        // JS:       return this.promise.then(hook => hook.pull());
+        let promise = self.promise.then_async(|hook| {
+            Box::pin(async move {
+                match hook.pull()? {
+                    MaybePromise::Immediate(payload) => Ok(payload),
+                    MaybePromise::Pending(payload) => payload.await,
                 }
-                Ok(MaybePromise::Pending(payload)) => {
-                    if let Ok(runtime) = tokio::runtime::Handle::try_current() {
-                        runtime.spawn(async move {
-                            let _ = sender.send(payload.await);
-                        });
-                    } else {
-                        let _ = sender.send(Err(Error::Message(
-                            "pending pull requires an active Tokio runtime".to_owned(),
-                        )));
-                    }
-                }
-                Err(error) => {
-                    let _ = sender.send(Err(error));
-                }
-            }
-        }));
-        Ok(MaybePromise::Pending(Box::pin(async move {
-            receiver
-                .await
-                .map_err(|_| Error::Message("pending pull was canceled".to_owned()))?
-        })))
+            })
+        });
+        Ok(MaybePromise::Pending(promise.into_future()))
+        // JS:     }
+        // JS:   }
     }
-
+    // JS:
+    // JS:   ignoreUnhandledRejections(): void {
     fn ignore_unhandled_rejections(&self) {
-        if let Some(Ok(hook)) = self.shared.resolution() {
+        // JS:     if (this.resolution) {
+        if let Some(Ok(hook)) = self.promise.peek() {
+            // JS:       this.resolution.ignoreUnhandledRejections();
             hook.ignore_unhandled_rejections();
+        // JS:     } else {
         } else {
-            self.shared.enqueue(Box::new(|resolution| {
+            // JS:       this.promise.then(res => {
+            self.promise.observe(|resolution| {
                 if let Ok(hook) = resolution {
+                    // JS:         res.ignoreUnhandledRejections();
                     hook.ignore_unhandled_rejections();
+                    // JS:       }, err => {
+                    // JS:         // Ignore the error!
                 }
-            }));
+                // JS:       });
+            });
+            // JS:     }
         }
+        // JS:   }
     }
-
+    // JS:
+    // JS:   dispose(): void {
+    // JS:     // We can't take the fast path here when this.resolution is available because if the resolution
+    // JS:     // was just recently delivered, promise waiters may not have had a chance to consume it yet,
+    // JS:     // and disposing it would preempt them. If we always wait on `this.promise` then we'll
+    // JS:     // run after anything that was queued before us.
+    // JS:     this.promise.then(hook => hook.dispose(), () => {});
+    // JS:   }
+    // RUST-DIFF(local refcount): final `Drop` releases the shared promise and eventual hook.
+    // JS:
+    // JS:   onBroken(callback: (error: any) => void): void {
     fn on_broken(&self, callback: Box<dyn FnOnce(Error) + Send + 'static>) {
-        if let Some(resolution) = self.shared.resolution() {
+        // JS:     if (this.resolution) {
+        if let Some(resolution) = self.promise.peek() {
+            // JS:       this.resolution.onBroken(callback);
             match resolution {
                 Ok(hook) => hook.on_broken(callback),
                 Err(error) => callback(error),
             }
+        // JS:     } else {
         } else {
-            self.shared
-                .enqueue(Box::new(move |resolution| match resolution {
-                    Ok(hook) => hook.on_broken(callback),
-                    Err(error) => callback(error),
-                }));
+            // JS:       this.promise.then(hook => {
+            self.promise.observe(move |resolution| match resolution {
+                // JS:         hook.onBroken(callback);
+                Ok(hook) => hook.on_broken(callback),
+                // JS:       }, callback);
+                Err(error) => callback(error),
+            });
+            // JS:     }
         }
+        // JS:   }
     }
+    // JS: }
 }
