@@ -2981,18 +2981,29 @@ impl StubHookInner for PayloadStubHook {
 // JS: // pointing at an RpcTarget whereas there can be several TargetStubHooks pointing at it. Also,
 // JS: // TargetStubHook cannot be pull()ed, because it always backs an RpcStub, not an RpcPromise.
 // JS: class TargetStubHook extends ValueStubHook {
+#[derive(Clone)]
+struct TargetStubHook {
+    // Rust fields are contiguous; they correspond to `target` and `parent` below.
+    target: Arc<dyn RpcTargetInner>,
+    callable: bool,
+}
 // JS:   // Constructs a TargetStubHook that is not duplicated from an existing hook.
 // JS:   //
 // JS:   // If `value` is a function, `parent` is bound as its "this".
 // JS:   static create(value: RpcTarget | Function, parent: object | undefined) {
-// JS:     if (typeof value !== "function") {
-// JS:       // If the target isn't callable, we don't need to pass a `this` to it, so drop `parent`.
-// JS:       // NOTE: `typeof value === "function"` checks if the value is callable. This technically
-// JS:       //   works even for `RpcTarget` implementations that are callable, not just plain functions.
-// JS:       parent = undefined;
-// JS:     }
-// JS:     return new TargetStubHook(value, parent);
-// JS:   }
+impl TargetStubHook {
+    fn create(target: Arc<dyn RpcTargetInner>, callable: bool) -> StubHook {
+        // JS:     if (typeof value !== "function") {
+        // JS:       // If the target isn't callable, we don't need to pass a `this` to it, so drop `parent`.
+        // JS:       // NOTE: `typeof value === "function"` checks if the value is callable. This technically
+        // JS:       //   works even for `RpcTarget` implementations that are callable, not just plain functions.
+        // JS:       parent = undefined;
+        // JS:     }
+        // JS:     return new TargetStubHook(value, parent);
+        Arc::new(Self { target, callable })
+        // JS:   }
+    }
+}
 // JS:
 // JS:   private constructor(target: RpcTarget | Function,
 // JS:                       parent?: object | undefined,
@@ -3014,6 +3025,7 @@ impl StubHookInner for PayloadStubHook {
 // JS:   private target?: RpcTarget | Function;  // cleared when disposed
 // JS:   private parent?: object | undefined;  // `this` parameter when calling `target`
 // JS:   private refcount?: BoxedRefcount;  // undefined if not needed (because target has no disposer)
+// RUST-DIFF(local refcount): `Arc<dyn RpcTargetInner>` stores target lifetime and clone state.
 // JS:
 // JS:   private getTarget(): RpcTarget | Function {
 // JS:     if (this.target) {
@@ -3024,77 +3036,25 @@ impl StubHookInner for PayloadStubHook {
 // JS:   }
 // JS:
 // JS:   protected getValue() {
-// JS:     return {value: this.getTarget(), owner: null};
-// JS:   }
-// JS:
-// JS:   dup(): StubHook {
-// JS:     return new TargetStubHook(this.getTarget(), this.parent, this);
-// JS:   }
-// JS:
-// JS:   pull(): RpcPayload | Promise<RpcPayload> {
-// JS:     let target = this.getTarget();
-// JS:     if ("then" in target) {
-// JS:       // If the target is itself thenable, we allow it to be treated as a promise. This is used
-// JS:       // in particular to support wrapping a workerd-native RpcPromise or RpcProperty.
-// JS:       return Promise.resolve(target).then(resolution => {
-// JS:         return RpcPayload.fromAppReturn(resolution);
-// JS:       });
-// JS:     } else {
-// JS:       // This shouldn't be called since RpcTarget always becomes RpcStub, not RpcPromise, and you
-// JS:       // can only pull a promise.
-// JS:       return Promise.reject(new Error("Tried to resolve a non-promise stub."));
-// JS:     }
-// JS:   }
-// JS:
-// JS:   ignoreUnhandledRejections(): void {
-// JS:     // Nothing to do.
-// JS:   }
-// JS:
-// JS:   dispose(): void {
-// JS:     if (this.target) {
-// JS:       if (this.refcount) {
-// JS:         if (--this.refcount.count == 0) {
-// JS:           disposeRpcTarget(this.target);
-// JS:         }
-// JS:       }
-// JS:
-// JS:       this.target = undefined;
-// JS:     }
-// JS:   }
-// JS:
-// JS:   onBroken(callback: (error: any) => void): void {
-// JS:     let target = this.target;
-// JS:     if (target && "then" in target) {
-// JS:       // The target is thenable (e.g. a workerd-native RpcPromise), so it backs a promise, which
-// JS:       // becomes broken if it rejects.
-// JS:       Promise.resolve(target).then(() => {}, callback);
-// JS:     }
-// JS:     // TODO: Should non-thenable RpcTargets be able to implement onRpcBroken?
-// JS:   }
-// JS: }
-#[derive(Clone)]
-struct TargetStubHook {
-    target: Arc<dyn RpcTargetInner>,
-    callable: bool,
-}
-
-impl TargetStubHook {
-    fn create(target: Arc<dyn RpcTargetInner>, callable: bool) -> StubHook {
-        Arc::new(Self { target, callable })
-    }
-}
-
 impl ValueStubHook for TargetStubHook {
     fn get_value(&self) -> (CapnwebValue, Option<RpcPayload>) {
+        // JS:     return {value: this.getTarget(), owner: null};
         let value = if self.callable {
             CapnwebValue::Function(Arc::clone(&self.target))
         } else {
             CapnwebValue::Target(Arc::clone(&self.target))
         };
         (value, None)
+        // JS:   }
     }
 }
-
+// JS:
+// JS:   dup(): StubHook {
+// JS:     return new TargetStubHook(this.getTarget(), this.parent, this);
+// JS:   }
+// RUST-DIFF(local refcount): cloning the hook clones its target `Arc`.
+// JS:
+// JS:   pull(): RpcPayload | Promise<RpcPayload> {
 impl StubHookInner for TargetStubHook {
     fn call(&self, path: PropertyPath, args: RpcPayload) -> Result<StubHook> {
         Arc::clone(&self.target).call(path, args)
@@ -3115,16 +3075,57 @@ impl StubHookInner for TargetStubHook {
     }
 
     fn pull(&self) -> Result<MaybePromise<RpcPayload>> {
+        // JS:     let target = this.getTarget();
+        // JS:     if ("then" in target) {
+        // JS:       // If the target is itself thenable, we allow it to be treated as a promise. This is used
+        // JS:       // in particular to support wrapping a workerd-native RpcPromise or RpcProperty.
+        // JS:       return Promise.resolve(target).then(resolution => {
+        // JS:         return RpcPayload.fromAppReturn(resolution);
+        // JS:       });
+        // JS:     } else {
+        // JS:       // This shouldn't be called since RpcTarget always becomes RpcStub, not RpcPromise, and you
+        // JS:       // can only pull a promise.
+        // JS:       return Promise.reject(new Error("Tried to resolve a non-promise stub."));
         Ok(MaybePromise::Pending(Box::pin(async {
             Err(Error::Message(
                 "Tried to resolve a non-promise stub.".to_owned(),
             ))
         })))
+        // JS:     }
+        // JS:   }
     }
-
-    fn ignore_unhandled_rejections(&self) {}
-
-    fn on_broken(&self, _callback: Box<dyn FnOnce(Error) + Send + 'static>) {}
+    // JS:
+    // JS:   ignoreUnhandledRejections(): void {
+    fn ignore_unhandled_rejections(&self) {
+        // JS:     // Nothing to do.
+        // JS:   }
+    }
+    // JS:
+    // JS:   dispose(): void {
+    // JS:     if (this.target) {
+    // JS:       if (this.refcount) {
+    // JS:         if (--this.refcount.count == 0) {
+    // JS:           disposeRpcTarget(this.target);
+    // JS:         }
+    // JS:       }
+    // JS:
+    // JS:       this.target = undefined;
+    // JS:     }
+    // JS:   }
+    // RUST-DIFF(local refcount): final `Arc` drop runs the concrete target destructor.
+    // JS:
+    // JS:   onBroken(callback: (error: any) => void): void {
+    fn on_broken(&self, _callback: Box<dyn FnOnce(Error) + Send + 'static>) {
+        // JS:     let target = this.target;
+        // JS:     if (target && "then" in target) {
+        // JS:       // The target is thenable (e.g. a workerd-native RpcPromise), so it backs a promise, which
+        // JS:       // becomes broken if it rejects.
+        // JS:       Promise.resolve(target).then(() => {}, callback);
+        // JS:     }
+        // JS:     // TODO: Should non-thenable RpcTargets be able to implement onRpcBroken?
+        // JS:   }
+    }
+    // JS: }
 }
 // JS:
 // JS: // StubHook derived from a Promise for some other StubHook. Waits for the promise and then
