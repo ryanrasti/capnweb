@@ -2624,194 +2624,202 @@ fn is_object_prototype_property(property: &str) -> bool {
 // JS:
 // JS: // Shared base class for PayloadStubHook and TargetStubHook.
 // JS: abstract class ValueStubHook extends StubHook {
-// JS:   protected abstract getValue(): {value: unknown, owner: RpcPayload | null};
-// JS:
-// JS:   call(path: PropertyPath, args: RpcPayload): StubHook {
-// JS:     let followResult: FollowPathResult;
-// JS:     try {
-// JS:       let {value, owner} = this.getValue();
-// JS:       followResult = followPath(value, undefined, path, owner);
-// JS:     } catch (err) {
-// JS:       // We took ownership of `args`, and there is no callee left to consume them.
-// JS:       args.dispose();
-// JS:       return new ErrorStubHook(err);
-// JS:     }
-// JS:
-// JS:     if (followResult.hook) {
-// JS:       // The delegate's call() takes ownership of `args`, per the StubHook contract.
-// JS:       return followResult.hook.call(followResult.remainingPath, args);
-// JS:     }
-// JS:
-// JS:     // It's a local function.
-// JS:     if (typeof followResult.value != "function") {
-// JS:       args.dispose();
-// JS:       return new ErrorStubHook(new TypeError(`'${path.join('.')}' is not a function.`));
-// JS:     }
-// JS:
-// JS:     // deliverCall() is async and disposes `args` itself when the call completes, so it never
-// JS:     // needs a guard here.
-// JS:     let promise = args.deliverCall(followResult.value, followResult.parent);
-// JS:     return new PromiseStubHook(promise.then(payload => {
-// JS:       return new PayloadStubHook(payload);
-// JS:     }));
-// JS:   }
-// JS:
-// JS:   map(path: PropertyPath, captures: StubHook[], instructions: unknown[]): StubHook {
-// JS:     try {
-// JS:       let followResult: FollowPathResult;
-// JS:       try {
-// JS:         let {value, owner} = this.getValue();
-// JS:         followResult = followPath(value, undefined, path, owner);
-// JS:       } catch (err) {
-// JS:         // We took ownership of the captures, and there is no callee left to consume them.
-// JS:         for (let cap of captures) {
-// JS:           cap.dispose();
-// JS:         }
-// JS:         throw err;
-// JS:       }
-// JS:
-// JS:       if (followResult.hook) {
-// JS:         return followResult.hook.map(followResult.remainingPath, captures, instructions);
-// JS:       }
-// JS:
-// JS:       return mapImpl.applyMap(
-// JS:           followResult.value, followResult.parent, followResult.owner, captures, instructions);
-// JS:     } catch (err) {
-// JS:       // Past the inner catch, ownership of the captures has been transferred to the delegate's
-// JS:       // map() or to applyMap(), so it would be incorrect to dispose them here.
-// JS:       return new ErrorStubHook(err);
-// JS:     }
-// JS:   }
-// JS:
-// JS:   get(path: PropertyPath): StubHook {
-// JS:     try {
-// JS:       let {value, owner} = this.getValue();
-// JS:
-// JS:       if (path.length === 0 && owner === null) {
-// JS:         if (value instanceof Object && "then" in value) {
-// JS:           // The hook wraps a thenable (e.g. a workerd-native RpcPromise or RpcProperty), so it
-// JS:           // really does back a promise. get([]) asks for an independent hook aliasing the same
-// JS:           // promise, which is exactly dup().
-// JS:           return this.dup();
-// JS:         }
-// JS:
-// JS:         // The only way this happens is if someone sends "pipeline" and references a
-// JS:         // TargetStubHook wrapping a non-thenable, but they shouldn't do that, because such a
-// JS:         // hook never backs a promise, and a non-promise cannot be converted to a promise.
-// JS:         throw new Error("Can't dup an RpcTarget stub as a promise.");
-// JS:       }
-// JS:
-// JS:       let followResult = followPath(value, undefined, path, owner);
-// JS:
-// JS:       if (followResult.hook) {
-// JS:         return followResult.hook.get(followResult.remainingPath);
-// JS:       }
-// JS:
-// JS:       // Note that if `followResult.owner` is null, then we've descended into the contents of an
-// JS:       // RpcTarget. In that case, if this deep copy discovers an RpcTarget embedded in the result,
-// JS:       // it will create a new stub for it. If that RpcTarget has a disposer, it'll be disposed when
-// JS:       // that stub is disposed. If the same RpcTarget is returned in *another* get(), it create
-// JS:       // *another* stub, which calls the disposer *another* time. This can be quite weird -- the
-// JS:       // disposer may be called any number of times, including zero if the property is never read
-// JS:       // at all. Unfortunately, that's just the way it is. The application can avoid this problem by
-// JS:       // wrapping the RpcTarget in an RpcStub itself, proactively, and using that as the property --
-// JS:       // then, each time the property is get()ed, a dup() of that stub is returned.
-// JS:       return new PayloadStubHook(RpcPayload.deepCopyFrom(
-// JS:           followResult.value, followResult.parent, followResult.owner));
-// JS:     } catch (err) {
-// JS:       return new ErrorStubHook(err);
-// JS:     }
-// JS:   }
-// JS: }
 trait ValueStubHook: Send + Sync + 'static {
+    // JS:   protected abstract getValue(): {value: unknown, owner: RpcPayload | null};
     fn get_value(&self) -> (CapnwebValue, Option<RpcPayload>);
-
+    // JS:
+    // JS:   call(path: PropertyPath, args: RpcPayload): StubHook {
     fn call_value(&self, path: PropertyPath, args: RpcPayload) -> Result<StubHook> {
+        // JS:     let followResult: FollowPathResult;
+        // The successful traversal is bound after translating the catch below.
+        // JS:     try {
+        // JS:       let {value, owner} = this.getValue();
         let (value, owner) = self.get_value();
+        // JS:       followResult = followPath(value, undefined, path, owner);
         let followed = match follow_path(value, path.clone(), owner) {
             Ok(followed) => followed,
+            // JS:     } catch (err) {
             Err(error) => {
+                // JS:       // We took ownership of `args`, and there is no callee left to consume them.
+                // JS:       args.dispose();
                 drop(args);
+                // JS:       return new ErrorStubHook(err);
                 return Ok(Arc::new(ErrorStubHook::new(error)));
+                // JS:     }
             }
         };
-
-        match followed {
+        // JS:
+        // JS:     if (followResult.hook) {
+        let followed = match followed {
             FollowPathResult::Hook {
                 hook,
                 remaining_path,
-            } => hook.call(remaining_path, args),
-            FollowPathResult::Value {
-                value: CapnwebValue::Function(target),
-                ..
-            } => target.call(Vec::new(), args),
-            FollowPathResult::Value { .. } => {
-                drop(args);
-                let path = path
-                    .iter()
-                    .map(|part| match part {
-                        PropertyKey::String(value) => value.clone(),
-                        PropertyKey::Number(value) => value.to_string(),
-                    })
-                    .collect::<Vec<_>>()
-                    .join(".");
-                Ok(Arc::new(ErrorStubHook::new(Error::Type(format!(
-                    "'{path}' is not a function."
-                )))))
+            } => {
+                // JS:       // The delegate's call() takes ownership of `args`, per the StubHook contract.
+                // JS:       return followResult.hook.call(followResult.remainingPath, args);
+                return hook.call(remaining_path, args);
             }
-        }
+            value => value,
+            // JS:     }
+        };
+        // JS:
+        // JS:     // It's a local function.
+        // JS:     if (typeof followResult.value != "function") {
+        let FollowPathResult::Value { value, .. } = followed else {
+            unreachable!()
+        };
+        let CapnwebValue::Function(target) = value else {
+            // JS:       args.dispose();
+            drop(args);
+            // JS:       return new ErrorStubHook(new TypeError(`'${path.join('.')}' is not a function.`));
+            let path = path
+                .iter()
+                .map(|part| match part {
+                    PropertyKey::String(value) => value.clone(),
+                    PropertyKey::Number(value) => value.to_string(),
+                })
+                .collect::<Vec<_>>()
+                .join(".");
+            return Ok(Arc::new(ErrorStubHook::new(Error::Type(format!(
+                "'{path}' is not a function."
+            )))));
+            // JS:     }
+        };
+        // JS:
+        // JS:     // deliverCall() is async and disposes `args` itself when the call completes, so it never
+        // JS:     // needs a guard here.
+        // JS:     let promise = args.deliverCall(followResult.value, followResult.parent);
+        // Generated target dispatch performs the local call and owns `args`.
+        // JS:     return new PromiseStubHook(promise.then(payload => {
+        // JS:       return new PayloadStubHook(payload);
+        target.call(Vec::new(), args)
+        // JS:     }));
+        // JS:   }
     }
-
+    // JS:
+    // JS:   map(path: PropertyPath, captures: StubHook[], instructions: unknown[]): StubHook {
     fn map_value(
         &self,
         path: PropertyPath,
         captures: Vec<StubHook>,
         instructions: MapInstructions,
     ) -> Result<StubHook> {
+        // JS:     try {
+        // The outer catch is translated by normalizing `result` below.
+        // JS:       let followResult: FollowPathResult;
+        // JS:       try {
+        // JS:         let {value, owner} = this.getValue();
         let (value, owner) = self.get_value();
+        // JS:         followResult = followPath(value, undefined, path, owner);
         let followed = match follow_path(value, path, owner) {
             Ok(followed) => followed,
+            // JS:       } catch (err) {
             Err(error) => {
+                // JS:         // We took ownership of the captures, and there is no callee left to consume them.
+                // JS:         for (let cap of captures) {
+                // JS:           cap.dispose();
+                // JS:         }
                 drop(captures);
+                // JS:         throw err;
                 return Ok(Arc::new(ErrorStubHook::new(error)));
+                // JS:       }
             }
         };
-
+        // JS:
+        // JS:       if (followResult.hook) {
         let result = match followed {
             FollowPathResult::Hook {
                 hook,
                 remaining_path,
-            } => hook.map(remaining_path, captures, instructions),
+            } => {
+                // JS:         return followResult.hook.map(followResult.remainingPath, captures, instructions);
+                hook.map(remaining_path, captures, instructions)
+            }
+            // JS:       }
+            // JS:
+            // JS:       return mapImpl.applyMap(
             FollowPathResult::Value { value, owner } => {
-                loaded_map_impl()?.apply_map(value, None, owner.as_ref(), captures, instructions)
+                // JS:           followResult.value, followResult.parent, followResult.owner, captures, instructions);
+                loaded_map_impl().and_then(|map_impl| {
+                    map_impl.apply_map(value, None, owner.as_ref(), captures, instructions)
+                })
             }
         };
-
+        // JS:     } catch (err) {
+        // JS:       // Past the inner catch, ownership of the captures has been transferred to the delegate's
+        // JS:       // map() or to applyMap(), so it would be incorrect to dispose them here.
+        // JS:       return new ErrorStubHook(err);
         match result {
             Ok(hook) => Ok(hook),
             Err(error) => Ok(Arc::new(ErrorStubHook::new(error))),
         }
+        // JS:     }
+        // JS:   }
     }
-
+    // JS:
+    // JS:   get(path: PropertyPath): StubHook {
     fn get_value_at(&self, path: PropertyPath) -> Result<StubHook> {
+        // JS:     try {
+        // JS:       let {value, owner} = this.getValue();
         let (value, owner) = self.get_value();
+        // JS:
+        // JS:       if (path.length === 0 && owner === null) {
         if path.is_empty() && owner.is_none() {
+            // JS:         if (value instanceof Object && "then" in value) {
+            // JS:           // The hook wraps a thenable (e.g. a workerd-native RpcPromise or RpcProperty), so it
+            // JS:           // really does back a promise. get([]) asks for an independent hook aliasing the same
+            // JS:           // promise, which is exactly dup().
+            // JS:           return this.dup();
+            // JS:         }
+            // JS:
+            // JS:         // The only way this happens is if someone sends "pipeline" and references a
+            // JS:         // TargetStubHook wrapping a non-thenable, but they shouldn't do that, because such a
+            // JS:         // hook never backs a promise, and a non-promise cannot be converted to a promise.
+            // JS:         throw new Error("Can't dup an RpcTarget stub as a promise.");
             return Ok(Arc::new(ErrorStubHook::new(Error::Message(
                 "Can't clone an RpcTarget stub as a promise.".to_owned(),
             ))));
+            // JS:       }
         }
-
-        match follow_path(value, path, owner) {
+        // JS:
+        // JS:       let followResult = followPath(value, undefined, path, owner);
+        let followed = follow_path(value, path, owner);
+        // JS:
+        // JS:       if (followResult.hook) {
+        match followed {
             Ok(FollowPathResult::Hook {
                 hook,
                 remaining_path,
-            }) => hook.get(remaining_path),
+            }) => {
+                // JS:         return followResult.hook.get(followResult.remainingPath);
+                hook.get(remaining_path)
+            }
+            // JS:       }
+            // JS:
+            // JS:       // Note that if `followResult.owner` is null, then we've descended into the contents of an
+            // JS:       // RpcTarget. In that case, if this deep copy discovers an RpcTarget embedded in the result,
+            // JS:       // it will create a new stub for it. If that RpcTarget has a disposer, it'll be disposed when
+            // JS:       // that stub is disposed. If the same RpcTarget is returned in *another* get(), it create
+            // JS:       // *another* stub, which calls the disposer *another* time. This can be quite weird -- the
+            // JS:       // disposer may be called any number of times, including zero if the property is never read
+            // JS:       // at all. Unfortunately, that's just the way it is. The application can avoid this problem by
+            // JS:       // wrapping the RpcTarget in an RpcStub itself, proactively, and using that as the property --
+            // JS:       // then, each time the property is get()ed, a dup() of that stub is returned.
+            // JS:       return new PayloadStubHook(RpcPayload.deepCopyFrom(
             Ok(FollowPathResult::Value { value, owner }) => Ok(Arc::new(PayloadStubHook::new(
+                // JS:           followResult.value, followResult.parent, followResult.owner));
                 RpcPayload::deep_copy_from(&value, None, owner.as_ref()),
             ))),
-            Err(error) => Ok(Arc::new(ErrorStubHook::new(error))),
+            // JS:     } catch (err) {
+            Err(error) => {
+                // JS:       return new ErrorStubHook(err);
+                Ok(Arc::new(ErrorStubHook::new(error)))
+            }
         }
+        // JS:     }
+        // JS:   }
     }
+    // JS: }
 }
 // JS:
 // JS: // StubHook wrapping an RpcPayload in local memory.
@@ -2823,10 +2831,23 @@ trait ValueStubHook: Send + Sync + 'static {
 // JS: // - Implementing RpcTargets, on the server side.
 // JS: //   - Since the payload's root is an RpcTarget, pull()ing it will just duplicate the stub.
 // JS: export class PayloadStubHook extends ValueStubHook {
+/// A hook backed by an immutable, locally-owned payload.
+#[derive(Clone, Debug)]
+pub struct PayloadStubHook {
+    // Rust fields must be contiguous; this corresponds to `payload` below.
+    payload: RpcPayload,
+}
 // JS:   constructor(payload: RpcPayload) {
-// JS:     super();
-// JS:     this.payload = payload;
-// JS:   }
+impl PayloadStubHook {
+    /// Wraps a locally-owned payload.
+    pub fn new(payload: RpcPayload) -> Self {
+        // JS:     super();
+        // The Rust type implements `ValueStubHook` below.
+        // JS:     this.payload = payload;
+        Self { payload }
+        // JS:   }
+    }
+}
 // JS:
 // JS:   private payload?: RpcPayload;  // cleared when disposed
 // JS:
@@ -2839,9 +2860,15 @@ trait ValueStubHook: Send + Sync + 'static {
 // JS:   }
 // JS:
 // JS:   protected getValue() {
-// JS:     let payload = this.getPayload();
-// JS:     return {value: payload.value, owner: payload};
-// JS:   }
+impl ValueStubHook for PayloadStubHook {
+    fn get_value(&self) -> (CapnwebValue, Option<RpcPayload>) {
+        // JS:     let payload = this.getPayload();
+        let payload = self.payload.clone();
+        // JS:     return {value: payload.value, owner: payload};
+        (payload.value.clone(), Some(payload))
+        // JS:   }
+    }
+}
 // JS:
 // JS:   dup(): StubHook {
 // JS:     // Although dup() is documented as not copying the payload, what this really means is that
@@ -2855,59 +2882,9 @@ trait ValueStubHook: Send + Sync + 'static {
 // JS:     return new PayloadStubHook(RpcPayload.deepCopyFrom(
 // JS:         thisPayload.value, undefined, thisPayload));
 // JS:   }
+// RUST-DIFF(local refcount): `Clone` duplicates the locally-owned payload hook.
 // JS:
 // JS:   pull(): RpcPayload | Promise<RpcPayload> {
-// JS:     // Reminder: pull() intentionally returns the hook's own payload and not a clone. The caller
-// JS:     // only needs to dispose one of the hook or the payload. It is the caller's responsibility
-// JS:     // to not dispose the payload if they intend to keep the hook around.
-// JS:     return this.getPayload();
-// JS:   }
-// JS:
-// JS:   ignoreUnhandledRejections(): void {
-// JS:     if (this.payload) {
-// JS:       this.payload.ignoreUnhandledRejections();
-// JS:     }
-// JS:   }
-// JS:
-// JS:   dispose(): void {
-// JS:     if (this.payload) {
-// JS:       this.payload.dispose();
-// JS:       this.payload = undefined;
-// JS:     }
-// JS:   }
-// JS:
-// JS:   onBroken(callback: (error: any) => void): void {
-// JS:     if (this.payload) {
-// JS:       if (this.payload.value instanceof RpcStub) {
-// JS:         // Payload is a single stub, we should forward onRpcBroken to it.
-// JS:         // TODO: Consider prohibiting PayloadStubHook created around a single stub; should always
-// JS:         //   use the underlying stub's hook instead?
-// JS:         this.payload.value.onRpcBroken(callback);
-// JS:       }
-// JS:
-// JS:       // TODO: Should native stubs be able to implement onRpcBroken?
-// JS:     }
-// JS:   }
-// JS: }
-/// A hook backed by an immutable, locally-owned payload.
-#[derive(Clone, Debug)]
-pub struct PayloadStubHook {
-    payload: RpcPayload,
-}
-
-impl PayloadStubHook {
-    /// Wraps a locally-owned payload.
-    pub fn new(payload: RpcPayload) -> Self {
-        Self { payload }
-    }
-}
-
-impl ValueStubHook for PayloadStubHook {
-    fn get_value(&self) -> (CapnwebValue, Option<RpcPayload>) {
-        (self.payload.value.clone(), Some(self.payload.clone()))
-    }
-}
-
 impl StubHookInner for PayloadStubHook {
     fn call(&self, path: PropertyPath, args: RpcPayload) -> Result<StubHook> {
         self.call_value(path, args)
@@ -2927,20 +2904,53 @@ impl StubHookInner for PayloadStubHook {
     }
 
     fn pull(&self) -> Result<MaybePromise<RpcPayload>> {
+        // JS:     // Reminder: pull() intentionally returns the hook's own payload and not a clone. The caller
+        // JS:     // only needs to dispose one of the hook or the payload. It is the caller's responsibility
+        // JS:     // to not dispose the payload if they intend to keep the hook around.
+        // JS:     return this.getPayload();
         Ok(MaybePromise::Immediate(self.payload.clone()))
+        // JS:   }
     }
-
+    // JS:
+    // JS:   ignoreUnhandledRejections(): void {
     fn ignore_unhandled_rejections(&self) {
+        // JS:     if (this.payload) {
+        // Rust ownership guarantees that the payload is present.
+        // JS:       this.payload.ignoreUnhandledRejections();
         self.payload.ignore_unhandled_rejections();
+        // JS:     }
+        // JS:   }
     }
-
+    // JS:
+    // JS:   dispose(): void {
+    // JS:     if (this.payload) {
+    // JS:       this.payload.dispose();
+    // JS:       this.payload = undefined;
+    // JS:     }
+    // JS:   }
+    // RUST-DIFF(local refcount): final `Drop` releases the payload.
+    // JS:
+    // JS:   onBroken(callback: (error: any) => void): void {
     fn on_broken(&self, callback: Box<dyn FnOnce(Error) + Send + 'static>) {
+        // JS:     if (this.payload) {
+        // Rust ownership guarantees that the payload is present.
+        // JS:       if (this.payload.value instanceof RpcStub) {
         match &self.payload.value {
+            // JS:         // Payload is a single stub, we should forward onRpcBroken to it.
+            // JS:         // TODO: Consider prohibiting PayloadStubHook created around a single stub; should always
+            // JS:         //   use the underlying stub's hook instead?
+            // JS:         this.payload.value.onRpcBroken(callback);
             CapnwebValue::Stub(stub) => stub.hook.on_broken(callback),
             CapnwebValue::RpcPromise(promise) => promise.stub.hook.on_broken(callback),
+            // JS:       }
             _ => drop(callback),
         }
+        // JS:
+        // JS:       // TODO: Should native stubs be able to implement onRpcBroken?
+        // JS:     }
+        // JS:   }
     }
+    // JS: }
 }
 // JS:
 // JS: function disposeRpcTarget(target: RpcTarget | Function) {
