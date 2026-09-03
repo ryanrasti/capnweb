@@ -92,16 +92,18 @@ Protocol-neutral values are not excluded merely because JavaScript represents th
 Rust equivalents remain required for null, booleans, numbers, strings, arrays, records, arbitrary
 integers, byte strings, errors, capabilities, promises, limits, and malformed-wire handling.
 
-### `undefined` mapping
+### `undefined` is an alias for `null`
 
-At the public Rust application boundary, JavaScript `undefined` is represented as `None` when a
-nullable type is known and as `CapnwebValue::Null` for a dynamic value. This deliberately conflates
-`undefined` and `null` in the initial Rust API.
+The initial Rust implementation makes no distinction between JavaScript `undefined` and `null`:
 
-The wire decoder must still accept the JavaScript `undefined` expression. The runtime may retain an
-internal distinction when required to reproduce protocol control flow, method `void` behavior, or
-interoperability, but it must expose the value to initial Rust application code using the lossy
-mapping above. This is an explicit language mapping, not an omitted JavaScript built-in.
+- JSON `null` decodes as `CapnwebValue::Null`;
+- the wire expression `["undefined"]` also decodes as `CapnwebValue::Null`;
+- `CapnwebValue::Null` always encodes as JSON `null`;
+- `Option::None` and `()` encode as JSON `null`;
+- there is no internal `Undefined` variant.
+
+The original representation cannot be recovered after decoding. This unconditional, intentionally
+lossy alias is an explicit language mapping rather than a deferred JavaScript built-in.
 
 ### 2. Local JavaScript reference counting
 
