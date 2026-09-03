@@ -234,7 +234,7 @@ pub trait Exporter {
     fn export_promise(&mut self, hook: StubHook) -> Result<ExportId>;
     // JS:   getImport(hook: StubHook): ImportId | undefined;
     /// Returns the import ID when this hook came from the same peer.
-    fn get_import(&self, hook: &StubHook) -> Option<ImportId>;
+    fn get_import(&mut self, hook: &StubHook) -> Option<ImportId>;
     // JS:
     // JS:   // If a serialization error occurs after having exported some capabilities, this will be called
     // JS:   // to roll back the exports.
@@ -276,7 +276,7 @@ impl Exporter for NullExporter {
         // JS:   }
     }
     // JS:   getImport(hook: StubHook): ImportId | undefined {
-    fn get_import(&self, _hook: &StubHook) -> Option<ImportId> {
+    fn get_import(&mut self, _hook: &StubHook) -> Option<ImportId> {
         // JS:     return undefined;
         None
         // JS:   }
@@ -317,6 +317,13 @@ const NULL_EXPORTER: NullExporter = NullExporter;
 // JS: const ERROR_TYPES: Record<string, any> = {
 // JS:   __proto__: null,
 // JS:   Error, EvalError, RangeError, ReferenceError, SyntaxError, TypeError, URIError, AggregateError,
+fn received_error_name(name: &str) -> &str {
+    match name {
+        "Error" | "EvalError" | "RangeError" | "ReferenceError" | "SyntaxError" | "TypeError"
+        | "URIError" | "AggregateError" => name,
+        _ => "Error",
+    }
+}
 // JS:   // TODO: DOMError? Others?
 // JS: };
 // JS:
@@ -1478,10 +1485,12 @@ impl<'a> Evaluator<'a> {
                     // JS:           }
                     // JS:           break;
                     "error" if expression.len() >= 3 => {
-                        let name = expression[1]
-                            .as_str()
-                            .ok_or_else(|| unknown_special(&expression))?
-                            .to_owned();
+                        let name = received_error_name(
+                            expression[1]
+                                .as_str()
+                                .ok_or_else(|| unknown_special(&expression))?,
+                        )
+                        .to_owned();
                         let message = expression[2]
                             .as_str()
                             .ok_or_else(|| unknown_special(&expression))?

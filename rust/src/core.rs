@@ -594,6 +594,11 @@ pub struct StreamCall {
 
 /// Inner interface backing an [`RpcStub`] or [`RpcPromise`].
 pub trait StubHookInner: Send + Sync {
+    /// Identifies a symbolic map variable without JavaScript `instanceof` reflection.
+    fn map_variable(&self) -> Option<(u64, i64)> {
+        None
+    }
+
     // JS:   // Call a function at the given property path with the given arguments. Returns a hook for the
     // JS:   // promise for the result.
     // JS:   //
