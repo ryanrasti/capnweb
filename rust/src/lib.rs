@@ -21,7 +21,11 @@ pub use core::{
     PromiseStubHook, PropertyPath, RpcPayload, RpcPromise, RpcStub, RpcTarget, RpcTargetInner,
     StubHook, StubHookInner, TargetStubHook, TypedRpcPromise,
 };
+pub use num_bigint::BigInt;
 pub use rpc::RpcSession;
+pub use serialize::{
+    DEFAULT_MAX_DEPTH, RpcLimits, deserialize, deserialize_with_limits, serialize,
+};
 
 /// Runtime result type used behind the generated application boundary.
 pub type Result<T> = std::result::Result<T, Error>;
@@ -94,6 +98,18 @@ impl From<CapnwebValue> for Argument {
     }
 }
 
+impl From<BigInt> for Argument {
+    fn from(value: BigInt) -> Self {
+        Self(CapnwebValue::BigInt(value))
+    }
+}
+
+impl From<Vec<u8>> for Argument {
+    fn from(value: Vec<u8>) -> Self {
+        Self(CapnwebValue::Bytes(value))
+    }
+}
+
 impl From<RpcStub> for Argument {
     fn from(value: RpcStub) -> Self {
         Self(CapnwebValue::Stub(value))
@@ -127,8 +143,21 @@ where
     T: transport::Transport,
     M: RpcTargetInner,
 {
+    start_session_with_limits(transport, local_main, RpcLimits::default())
+}
+
+/// Starts a session with explicit receive-side resource limits.
+pub fn start_session_with_limits<T, M>(
+    transport: T,
+    local_main: Arc<M>,
+    limits: RpcLimits,
+) -> RpcStub
+where
+    T: transport::Transport,
+    M: RpcTargetInner,
+{
     let main: RpcTarget = local_main;
-    RpcSession::new(transport, main).get_remote_main()
+    RpcSession::new_with_limits(transport, main, limits).get_remote_main()
 }
 
 /// The crate version supplied by Cargo.

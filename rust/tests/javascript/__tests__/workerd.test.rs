@@ -1,4 +1,5 @@
-// @generated from __tests__/workerd.test.ts; do not edit by hand.
+// Copyright (c) 2026 Cloudflare, Inc.
+// Licensed under the MIT license found in the LICENSE.txt file.
 //! One-for-one Rust counterpart of `__tests__/workerd.test.ts`.
 
 skipped_test!(

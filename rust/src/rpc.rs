@@ -4,6 +4,7 @@ use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
 use std::sync::{Arc, Mutex, Weak};
 
+use serde::Deserialize;
 use serde_json::{Value as Json, json};
 use tokio::sync::{Notify, mpsc};
 
@@ -11,7 +12,7 @@ use crate::core::{
     ErrorStubHook, MaybePromise, PayloadStubHook, PropertyPath, RpcPayload, RpcStub, RpcTarget,
     StubHook, StubHookInner, TargetStubHook, as_import_hook,
 };
-use crate::serialize::{Devaluator, Evaluator, ExportId, Exporter, ImportId, Importer};
+use crate::serialize::{Devaluator, Evaluator, ExportId, Exporter, ImportId, Importer, RpcLimits};
 use crate::transport::Transport;
 use crate::{Error, Result};
 
@@ -213,6 +214,7 @@ struct RpcSessionState {
 /// Direct translation of JS `RpcSessionImpl`.
 pub(crate) struct RpcSessionInner {
     self_weak: Weak<RpcSessionInner>,
+    limits: RpcLimits,
     state: Mutex<RpcSessionState>,
     next_import_id: AtomicI64,
     outbound: mpsc::UnboundedSender<Json>,
@@ -354,7 +356,8 @@ impl RpcSessionInner {
                     .get(1)
                     .cloned()
                     .ok_or_else(|| Error::Protocol("push is missing its expression".into()))?;
-                let payload = Evaluator::new(self.as_ref()).evaluate(expression)?;
+                let payload = Evaluator::with_limits(self.as_ref(), self.limits.clone())
+                    .evaluate(expression)?;
                 let hook = PayloadStubHook::create(payload);
                 let mut state = self.state.lock().expect("session mutex poisoned");
                 let id = state.next_incoming_push_id;
@@ -383,7 +386,7 @@ impl RpcSessionInner {
                     .and_then(Weak::upgrade);
                 if let Some(entry) = entry {
                     let hook = if tag == "resolve" {
-                        let payload = Evaluator::new(self.as_ref())
+                        let payload = Evaluator::with_limits(self.as_ref(), self.limits.clone())
                             .evaluate(message.get(2).cloned().unwrap_or(Json::Null))?;
                         PayloadStubHook::create(payload)
                     } else {
@@ -482,6 +485,14 @@ impl RpcSession {
     where
         T: Transport,
     {
+        Self::new_with_limits(transport, local_main, RpcLimits::default())
+    }
+
+    /// Constructs a session with explicit receive-side resource limits.
+    pub fn new_with_limits<T>(transport: T, local_main: RpcTarget, limits: RpcLimits) -> Self
+    where
+        T: Transport,
+    {
         let (mut writer, mut reader) = transport.split();
         let (outbound, mut outgoing) = mpsc::unbounded_channel::<Json>();
         let main_hook = TargetStubHook::create(local_main);
@@ -496,6 +507,7 @@ impl RpcSession {
         );
         let inner = Arc::new_cyclic(|self_weak| RpcSessionInner {
             self_weak: self_weak.clone(),
+            limits: limits.clone(),
             state: Mutex::new(RpcSessionState {
                 exports,
                 reverse_exports: HashMap::new(),
@@ -522,7 +534,13 @@ impl RpcSession {
                     Ok(Some(raw)) => raw,
                     Ok(None) | Err(_) => break,
                 };
-                let message = match serde_json::from_str(&raw) {
+                if raw.len() > read_session.limits.max_message_size {
+                    let _ = read_session.send(json!(["abort", "message exceeds maximum size"]));
+                    break;
+                }
+                let mut deserializer = serde_json::Deserializer::from_str(&raw);
+                deserializer.disable_recursion_limit();
+                let message = match Json::deserialize(&mut deserializer) {
                     Ok(message) => message,
                     Err(error) => {
                         let _ = read_session.send(json!(["abort", error.to_string()]));

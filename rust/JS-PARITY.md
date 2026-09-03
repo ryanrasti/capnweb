@@ -56,12 +56,13 @@ These apply throughout and are not repeated on every method:
 
 These source areas have not been translated yet rather than replaced with new abstractions:
 
-- `StubHook.map()` and `map.ts`
+- the wire-level `StubHook.map()` instruction protocol from `map.ts` (Rust currently has a
+  pull-then-map compatibility fallback)
 - stream calls, `pipe`, readable/writable expressions, and `streams.ts`
-- bytes, bigint, date, URL, headers, request, response, blob, and rich errors
+- typed-array identity, headers, request, response, blob, and rich errors
 - HTTP batch transport
-- numeric property-path components
-- full session abort propagation, limits, and all rollback paths
+- numeric property-path components on the wire
+- full session abort propagation and all rollback paths
 - loopback defensive-copy details which Rust ownership may make unnecessary
 
 The omission list is the next translation queue. New runtime concepts should not be introduced for

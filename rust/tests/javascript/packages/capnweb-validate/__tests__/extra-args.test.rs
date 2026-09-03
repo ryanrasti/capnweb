@@ -1,4 +1,5 @@
-// @generated from packages/capnweb-validate/__tests__/extra-args.test.ts; do not edit by hand.
+// Copyright (c) 2026 Cloudflare, Inc.
+// Licensed under the MIT license found in the LICENSE.txt file.
 //! One-for-one Rust counterpart of `packages/capnweb-validate/__tests__/extra-args.test.ts`.
 
 skipped_test!(

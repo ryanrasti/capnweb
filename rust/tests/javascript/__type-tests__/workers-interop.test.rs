@@ -1,4 +1,5 @@
-// @generated from __type-tests__/workers-interop.test.ts; do not edit by hand.
+// Copyright (c) 2026 Cloudflare, Inc.
+// Licensed under the MIT license found in the LICENSE.txt file.
 //! One-for-one Rust counterpart of `__type-tests__/workers-interop.test.ts`.
 
 // This suite consists of TypeScript compile-time assertions. Keep a visible skipped

@@ -1,75 +1,117 @@
-// @generated from __tests__/limits.test.ts; do not edit by hand.
+// Copyright (c) 2026 Cloudflare, Inc.
+// Licensed under the MIT license found in the LICENSE.txt file.
 //! One-for-one Rust counterpart of `__tests__/limits.test.ts`.
 
-skipped_test!(
-    js_001_limits_accepts_a_decimal_bigint_at_the_default_digit_limit_line_83,
-    "__tests__/limits.test.ts:83",
-    "accepts a decimal bigint at the default digit limit",
-    "configurable receive-side limits are not implemented in Rust"
-);
+use super::*;
 
-skipped_test!(
-    js_002_limits_rejects_a_bigint_over_the_default_digit_limit_line_89,
-    "__tests__/limits.test.ts:89",
-    "rejects a bigint over the default digit limit",
-    "configurable receive-side limits are not implemented in Rust"
-);
+#[test]
+fn accepts_a_decimal_bigint_at_the_default_digit_limit() {
+    let digits = "9".repeat(RpcLimits::default().max_bigint_digits);
+    assert!(matches!(
+        deserialize(&format!(r#"["bigint","{digits}"]"#)),
+        Ok(CapnwebValue::BigInt(_))
+    ));
+}
 
-skipped_test!(
-    js_003_limits_round_trips_bigints_through_the_decimal_wire_format_line_95,
-    "__tests__/limits.test.ts:95",
-    "round-trips bigints through the decimal wire format",
-    "configurable receive-side limits are not implemented in Rust"
-);
+#[test]
+fn rejects_a_bigint_over_the_default_digit_limit() {
+    let digits = "9".repeat(RpcLimits::default().max_bigint_digits + 1);
+    let error = deserialize(&format!(r#"["bigint","{digits}"]"#)).expect_err("oversized bigint");
+    assert!(error.to_string().contains("bigint exceeds maximum length"));
+}
 
-skipped_test!(
-    js_004_limits_accepts_decimal_bigint_strings_line_111,
-    "__tests__/limits.test.ts:111",
-    "accepts decimal bigint strings",
-    "configurable receive-side limits are not implemented in Rust"
-);
+#[test]
+fn round_trips_bigints_through_the_decimal_wire_format() {
+    let large: BigInt = (BigInt::from(1_u8) << 4096_usize) + BigInt::from(123_456_789_u64);
+    for value in [
+        BigInt::from(0),
+        BigInt::from(255),
+        BigInt::from(-255),
+        large.clone(),
+        -large,
+    ] {
+        let wire = serialize(&CapnwebValue::BigInt(value.clone())).expect("serialize bigint");
+        let CapnwebValue::BigInt(result) = deserialize(&wire).expect("deserialize bigint") else {
+            panic!("expected bigint");
+        };
+        assert_eq!(result, value);
+    }
+}
 
-skipped_test!(
-    js_005_limits_honors_a_per_session_override_of_maxbigintdigits_line_116,
-    "__tests__/limits.test.ts:116",
-    "honors a per-session override of maxBigIntDigits",
-    "configurable receive-side limits are not implemented in Rust"
-);
+#[test]
+fn accepts_decimal_bigint_strings() {
+    assert!(
+        matches!(deserialize(r#"["bigint","123"]"#), Ok(CapnwebValue::BigInt(value)) if value == BigInt::from(123))
+    );
+    assert!(
+        matches!(deserialize(r#"["bigint","-123"]"#), Ok(CapnwebValue::BigInt(value)) if value == BigInt::from(-123))
+    );
+}
 
-skipped_test!(
-    js_006_limits_accepts_nesting_just_under_the_default_depth_limit_line_136,
-    "__tests__/limits.test.ts:136",
-    "accepts nesting just under the default depth limit",
-    "configurable receive-side limits are not implemented in Rust"
-);
+#[tokio::test]
+async fn honors_a_per_session_override_of_max_bigint_digits() {
+    let limits = RpcLimits {
+        max_bigint_digits: 4,
+        ..RpcLimits::default()
+    };
+    assert!(
+        !session_reaction(r#"["bigint","1234"]"#, limits.clone())
+            .await
+            .iter()
+            .any(|m| m.contains("abort"))
+    );
+    assert!(
+        session_reaction(r#"["bigint","12345"]"#, limits)
+            .await
+            .iter()
+            .any(|m| m.contains("bigint exceeds maximum length"))
+    );
+}
 
-skipped_test!(
-    js_007_limits_rejects_nesting_over_the_default_depth_limit_line_142,
-    "__tests__/limits.test.ts:142",
-    "rejects nesting over the default depth limit",
-    "configurable receive-side limits are not implemented in Rust"
-);
+#[test]
+fn accepts_nesting_just_under_the_default_depth_limit() {
+    assert!(deserialize(&nested_escaped_arrays(DEFAULT_MAX_DEPTH - 1)).is_ok());
+}
 
-skipped_test!(
-    js_008_limits_honors_a_per_session_override_of_maxdepth_line_147,
-    "__tests__/limits.test.ts:147",
-    "honors a per-session override of maxDepth",
-    "configurable receive-side limits are not implemented in Rust"
-);
+#[test]
+fn rejects_nesting_over_the_default_depth_limit() {
+    let error = deserialize(&nested_escaped_arrays(DEFAULT_MAX_DEPTH + 5)).expect_err("deep value");
+    assert!(error.to_string().contains("maximum allowed message depth"));
+}
 
-skipped_test!(
-    js_009_limits_does_not_reset_depth_across_nested_call_arguments_line_157,
-    "__tests__/limits.test.ts:157",
-    "does not reset depth across nested call arguments",
-    "configurable receive-side limits are not implemented in Rust"
-);
+#[tokio::test]
+async fn honors_a_per_session_override_of_max_depth() {
+    let limits = RpcLimits {
+        max_depth: 4,
+        ..RpcLimits::default()
+    };
+    let messages = session_reaction(&nested_escaped_arrays(10), limits).await;
+    assert!(
+        messages
+            .iter()
+            .any(|message| message.contains("maximum allowed message depth"))
+    );
+}
 
-skipped_test!(
-    js_010_limits_accepts_nested_call_arguments_within_the_default_depth_limit_line_162,
-    "__tests__/limits.test.ts:162",
-    "accepts nested call arguments within the default depth limit",
-    "configurable receive-side limits are not implemented in Rust"
-);
+#[tokio::test]
+async fn does_not_reset_depth_across_nested_call_arguments() {
+    let limits = RpcLimits {
+        max_depth: 8,
+        ..RpcLimits::default()
+    };
+    let messages = session_reaction(&nested_call_args(8), limits).await;
+    assert!(
+        messages
+            .iter()
+            .any(|message| message.contains("maximum allowed message depth"))
+    );
+}
+
+#[tokio::test]
+async fn accepts_nested_call_arguments_within_the_default_depth_limit() {
+    let messages = session_reaction(&nested_call_args(64), RpcLimits::default()).await;
+    assert!(!messages.iter().any(|message| message.contains("abort")));
+}
 
 skipped_test!(
     js_011_limits_accepts_near_limit_call_arguments_that_the_default_sender_can_serialize_line_166,
@@ -78,26 +120,39 @@ skipped_test!(
     "configurable receive-side limits are not implemented in Rust"
 );
 
-skipped_test!(
-    js_012_limits_aborts_the_session_on_a_message_over_the_size_limit_line_174,
-    "__tests__/limits.test.ts:174",
-    "aborts the session on a message over the size limit",
-    "configurable receive-side limits are not implemented in Rust"
-);
+#[tokio::test]
+async fn aborts_the_session_on_a_message_over_the_size_limit() {
+    let limits = RpcLimits {
+        max_message_size: 64,
+        ..RpcLimits::default()
+    };
+    let expression = format!("\"{}\"", "a".repeat(200));
+    let messages = session_reaction(&expression, limits).await;
+    assert!(
+        messages
+            .iter()
+            .any(|message| message.contains("exceeds maximum size"))
+    );
+}
 
-skipped_test!(
-    js_013_limits_does_not_abort_on_a_message_under_the_size_limit_line_182,
-    "__tests__/limits.test.ts:182",
-    "does not abort on a message under the size limit",
-    "configurable receive-side limits are not implemented in Rust"
-);
+#[tokio::test]
+async fn does_not_abort_on_a_message_under_the_size_limit() {
+    let limits = RpcLimits {
+        max_message_size: 1024,
+        ..RpcLimits::default()
+    };
+    let messages = session_reaction(r#""small""#, limits).await;
+    assert!(!messages.iter().any(|message| message.contains("abort")));
+}
 
-skipped_test!(
-    js_014_limits_default_limits_has_the_documented_values_line_188,
-    "__tests__/limits.test.ts:188",
-    "DEFAULT_LIMITS has the documented values",
-    "configurable receive-side limits are not implemented in Rust"
-);
+#[test]
+fn default_limits_has_the_documented_values() {
+    let limits = RpcLimits::default();
+    assert_eq!(DEFAULT_MAX_DEPTH, 256);
+    assert_eq!(limits.max_bigint_digits, 16_384);
+    assert_eq!(limits.max_depth, DEFAULT_MAX_DEPTH);
+    assert_eq!(limits.max_message_size, 32 * 1024 * 1024);
+}
 
 skipped_test!(
     js_015_limits_standalone_deserialize_round_trips_normal_values_unchanged_with_no_config_line_197,

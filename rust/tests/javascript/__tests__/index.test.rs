@@ -1,4 +1,5 @@
-// @generated from __tests__/index.test.ts; do not edit by hand.
+// Copyright (c) 2026 Cloudflare, Inc.
+// Licensed under the MIT license found in the LICENSE.txt file.
 //! One-for-one Rust counterpart of `__tests__/index.test.ts`.
 
 use super::*;
@@ -38,40 +39,51 @@ skipped_test!(
     "the JavaScript behavior exercised by this case is not implemented in the Rust parity slice"
 );
 
-skipped_test!(
-    js_006_index_throws_errors_for_malformed_deserialization_data_line_134,
-    "__tests__/index.test.ts:134",
-    "throws errors for malformed deserialization data",
-    "the JavaScript behavior exercised by this case is not implemented in the Rust parity slice"
-);
+#[test]
+fn throws_errors_for_malformed_deserialization_data() {
+    assert!(deserialize(r#"{"unclosed": "#).is_err());
+    assert!(deserialize(r#"["unknown_type","param"]"#).is_err());
+    assert!(deserialize(r#"["date"]"#).is_err());
+    assert!(deserialize(r#"["error"]"#).is_err());
+}
 
-skipped_test!(
-    js_007_index_can_serialize_large_uint8array_without_stack_overflow_line_141,
-    "__tests__/index.test.ts:141",
-    "can serialize large Uint8Array without stack overflow",
-    "the JavaScript behavior exercised by this case is not implemented in the Rust parity slice"
-);
+#[test]
+fn can_serialize_large_uint8array_without_stack_overflow() {
+    let bytes = (0..200_000)
+        .map(|index| (index & 0xff) as u8)
+        .collect::<Vec<_>>();
+    let encoded = serialize(&CapnwebValue::Bytes(bytes.clone())).expect("serialize bytes");
+    let CapnwebValue::Bytes(decoded) = deserialize(&encoded).expect("deserialize bytes") else {
+        panic!("expected bytes");
+    };
+    assert_eq!(decoded, bytes);
+}
 
-skipped_test!(
-    js_008_index_correctly_serializes_uint8array_with_trailing_byte_value_61_line_152,
-    "__tests__/index.test.ts:152",
-    "correctly serializes Uint8Array with trailing byte value 61",
-    "the JavaScript behavior exercised by this case is not implemented in the Rust parity slice"
-);
+#[test]
+fn correctly_serializes_uint8array_with_trailing_byte_value_61() {
+    let bytes = b"Hello=".to_vec();
+    let encoded = serialize(&CapnwebValue::Bytes(bytes.clone())).expect("serialize bytes");
+    let CapnwebValue::Bytes(decoded) = deserialize(&encoded).expect("deserialize bytes") else {
+        panic!("expected bytes");
+    };
+    assert_eq!(decoded, bytes);
+}
 
-skipped_test!(
-    js_009_index_strips_base64_padding_from_serialized_bytes_line_162,
-    "__tests__/index.test.ts:162",
-    "strips base64 padding from serialized bytes",
-    "the JavaScript behavior exercised by this case is not implemented in the Rust parity slice"
-);
+#[test]
+fn strips_base64_padding_from_serialized_bytes() {
+    let encoded = serialize(&CapnwebValue::Bytes(vec![1, 2, 3, 4, 5])).expect("serialize bytes");
+    assert!(!encoded.contains('='));
+}
 
-skipped_test!(
-    js_010_index_can_serialize_uint8array_as_legacy_bytes_without_a_type_marker_line_172,
-    "__tests__/index.test.ts:172",
-    "can serialize Uint8Array as legacy bytes without a type marker",
-    "the JavaScript behavior exercised by this case is not implemented in the Rust parity slice"
-);
+#[test]
+fn can_serialize_uint8array_as_legacy_bytes_without_a_type_marker() {
+    let encoded = serialize(&CapnwebValue::Bytes(b"Hello".to_vec())).expect("serialize bytes");
+    assert_eq!(encoded, r#"["bytes","SGVsbG8"]"#);
+    let CapnwebValue::Bytes(decoded) = deserialize(&encoded).expect("deserialize bytes") else {
+        panic!("expected bytes");
+    };
+    assert_eq!(decoded, b"Hello");
+}
 
 skipped_test!(
     js_011_index_can_serialize_node_js_buffer_as_bytes_line_188,
@@ -115,19 +127,28 @@ skipped_test!(
     "the JavaScript behavior exercised by this case is not implemented in the Rust parity slice"
 );
 
-skipped_test!(
-    js_017_index_throws_for_unknown_bytes_type_markers_line_295,
-    "__tests__/index.test.ts:295",
-    "throws for unknown bytes type markers",
-    "the JavaScript behavior exercised by this case is not implemented in the Rust parity slice"
-);
+#[test]
+fn throws_for_unknown_bytes_type_markers() {
+    let error =
+        deserialize(r#"["bytes","SGVsbG8","invalidUint8Array"]"#).expect_err("unknown marker");
+    assert!(
+        error
+            .to_string()
+            .contains("unknown bytes type marker: invalidUint8Array")
+    );
+    let error = deserialize(r#"["bytes","SGVsbG8",123]"#).expect_err("non-string marker");
+    assert!(error.to_string().contains("unknown bytes type marker type"));
+}
 
-skipped_test!(
-    js_018_index_preserves_invalid_date_values_through_serialization_line_302,
-    "__tests__/index.test.ts:302",
-    "preserves Invalid Date values through serialization",
-    "the JavaScript behavior exercised by this case is not implemented in the Rust parity slice"
-);
+#[test]
+fn preserves_invalid_date_values_through_serialization() {
+    let encoded = serialize(&CapnwebValue::Date(None)).expect("serialize invalid date");
+    assert_eq!(encoded, r#"["date",null]"#);
+    assert!(matches!(
+        deserialize(&encoded),
+        Ok(CapnwebValue::Date(None))
+    ));
+}
 
 skipped_test!(
     js_019_index_rejects_malformed_blob_wire_values_line_316,
@@ -269,12 +290,15 @@ skipped_test!(
     "the JavaScript behavior exercised by this case is not implemented in the Rust parity slice"
 );
 
-skipped_test!(
-    js_039_index_supports_wrapping_an_rpctarget_line_781,
-    "__tests__/index.test.ts:781",
-    "supports wrapping an RpcTarget",
-    "the JavaScript behavior exercised by this case is not implemented in the Rust parity slice"
-);
+#[tokio::test]
+async fn supports_wrapping_an_rpc_target() {
+    let stub = RpcStub::from_target(Arc::new(ParityTarget));
+    let result = TypedRpcPromise::<f64>::new(stub.call(
+        vec!["square".into()],
+        RpcPayload::from_app_params(CapnwebValue::Array(vec![CapnwebValue::Number(3.0)])),
+    ));
+    assert_eq!(result.await.expect("local square"), 9.0);
+}
 
 skipped_test!(
     js_040_index_supports_wrapping_a_function_line_786,
@@ -290,26 +314,54 @@ skipped_test!(
     "the JavaScript behavior exercised by this case is not implemented in the Rust parity slice"
 );
 
-skipped_test!(
-    js_042_index_supports_wrapping_an_arbitrary_object_line_798,
-    "__tests__/index.test.ts:798",
-    "supports wrapping an arbitrary object",
-    "the JavaScript behavior exercised by this case is not implemented in the Rust parity slice"
-);
+#[tokio::test]
+async fn supports_wrapping_an_arbitrary_object() {
+    let stub = RpcStub::from_value(CapnwebValue::Object(BTreeMap::from([(
+        "abc".into(),
+        CapnwebValue::String("hello".into()),
+    )])));
+    let value = TypedRpcPromise::<String>::new(stub.get(vec!["abc".into()]));
+    assert_eq!(value.await.expect("object property"), "hello");
+}
 
-skipped_test!(
-    js_043_index_supports_wrapping_an_object_with_nested_stubs_line_803,
-    "__tests__/index.test.ts:803",
-    "supports wrapping an object with nested stubs",
-    "the JavaScript behavior exercised by this case is not implemented in the Rust parity slice"
-);
+#[tokio::test]
+async fn supports_wrapping_an_object_with_nested_stubs() {
+    let inner = RpcStub::from_target(Arc::new(ParityTarget));
+    let outer = RpcStub::from_value(CapnwebValue::Object(BTreeMap::from([
+        ("inner".into(), CapnwebValue::Stub(inner)),
+        ("value".into(), CapnwebValue::Number(42.0)),
+    ])));
+    assert_eq!(
+        TypedRpcPromise::<f64>::new(outer.get(vec!["value".into()]))
+            .await
+            .expect("value"),
+        42.0
+    );
+    let result = TypedRpcPromise::<f64>::new(outer.call(
+        vec!["inner".into(), "square".into()],
+        RpcPayload::from_app_params(CapnwebValue::Array(vec![CapnwebValue::Number(4.0)])),
+    ));
+    assert_eq!(result.await.expect("nested call"), 16.0);
+}
 
-skipped_test!(
-    js_044_index_supports_wrapping_an_object_with_nested_rpctargets_line_813,
-    "__tests__/index.test.ts:813",
-    "supports wrapping an object with nested RpcTargets",
-    "the JavaScript behavior exercised by this case is not implemented in the Rust parity slice"
-);
+#[tokio::test]
+async fn supports_wrapping_an_object_with_nested_rpc_targets() {
+    let outer = RpcStub::from_value(CapnwebValue::Object(BTreeMap::from([
+        ("inner".into(), CapnwebValue::Target(Arc::new(ParityTarget))),
+        ("value".into(), CapnwebValue::Number(42.0)),
+    ])));
+    assert_eq!(
+        TypedRpcPromise::<f64>::new(outer.get(vec!["value".into()]))
+            .await
+            .expect("value"),
+        42.0
+    );
+    let result = TypedRpcPromise::<f64>::new(outer.call(
+        vec!["inner".into(), "square".into()],
+        RpcPayload::from_app_params(CapnwebValue::Array(vec![CapnwebValue::Number(4.0)])),
+    ));
+    assert_eq!(result.await.expect("nested target call"), 16.0);
+}
 
 skipped_test!(
     js_045_index_supports_wrapping_an_object_with_nested_functions_line_822,
@@ -402,12 +454,19 @@ skipped_test!(
     "the JavaScript behavior exercised by this case is not implemented in the Rust parity slice"
 );
 
-skipped_test!(
-    js_058_index_only_disposes_rpctarget_when_all_dups_are_disposed_line_1056,
-    "__tests__/index.test.ts:1056",
-    "only disposes RpcTarget when all dups are disposed",
-    "the JavaScript behavior exercised by this case is not implemented in the Rust parity slice"
-);
+#[test]
+fn only_disposes_rpc_target_when_all_dups_are_disposed() {
+    let disposed = Arc::new(AtomicBool::new(false));
+    let original = RpcStub::from_target(Arc::new(DisposableTarget(disposed.clone())));
+    let duplicate_one = original.dup();
+    let duplicate_two = original.dup();
+    drop(original);
+    assert!(!disposed.load(Ordering::Acquire));
+    drop(duplicate_one);
+    assert!(!disposed.load(Ordering::Acquire));
+    drop(duplicate_two);
+    assert!(disposed.load(Ordering::Acquire));
+}
 
 skipped_test!(
     js_059_index_makes_disposal_idempotent_duplicate_dispose_calls_don_t_affect_refcount_line_1076,
@@ -581,19 +640,61 @@ skipped_test!(
     "the JavaScript behavior exercised by this case is not implemented in the Rust parity slice"
 );
 
-skipped_test!(
-    js_083_index_supports_map_on_nulls_line_1581,
-    "__tests__/index.test.ts:1581",
-    "supports map() on nulls",
-    "the JavaScript behavior exercised by this case is not implemented in the Rust parity slice"
-);
+#[tokio::test]
+async fn supports_map_on_nulls_over_rpc() {
+    let stub = parity_stub();
+    let counter = RpcStub::from_target(Arc::new(Counter(std::sync::Mutex::new(0.0))));
 
-skipped_test!(
-    js_084_index_supports_map_on_arrays_line_1608,
-    "__tests__/index.test.ts:1608",
-    "supports map() on arrays",
-    "the JavaScript behavior exercised by this case is not implemented in the Rust parity slice"
-);
+    let untouched = stub.return_null().into_untyped().map({
+        let counter = counter.dup();
+        move |value| {
+            Ok(increment(
+                &counter,
+                FromCapnwebValue::from_capnweb_value(value)?,
+            ))
+        }
+    });
+    assert!(matches!(
+        untouched.pull().await.expect("mapped null").deliver().await,
+        Ok(CapnwebValue::Null)
+    ));
+
+    let mapped = stub.return_number(4.0).into_untyped().map({
+        let counter = counter.dup();
+        move |value| {
+            Ok(increment(
+                &counter,
+                FromCapnwebValue::from_capnweb_value(value)?,
+            ))
+        }
+    });
+    let value = mapped
+        .pull()
+        .await
+        .expect("mapped scalar")
+        .deliver()
+        .await
+        .expect("deliver scalar");
+    assert!(matches!(value, CapnwebValue::Number(4.0)));
+}
+
+#[tokio::test]
+async fn supports_map_on_arrays_over_rpc() {
+    let stub = parity_stub();
+    let mapped = stub.generate_fibonacci(6.0).into_untyped().map(|value| {
+        let value = f64::from_capnweb_value(value)?;
+        Ok(value + 3.0)
+    });
+    let value = mapped
+        .pull()
+        .await
+        .expect("mapped array")
+        .deliver()
+        .await
+        .expect("deliver array");
+    let result = Vec::<f64>::from_capnweb_value(value).expect("number array");
+    assert_eq!(result, vec![3.0, 4.0, 4.0, 5.0, 6.0, 8.0]);
+}
 
 skipped_test!(
     js_085_index_supports_nested_map_line_1630,

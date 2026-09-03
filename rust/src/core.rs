@@ -7,6 +7,7 @@ use std::sync::Arc;
 use std::task::{Context, Poll};
 
 use futures::future::BoxFuture;
+use num_bigint::BigInt;
 use tokio::sync::{Notify, OnceCell};
 
 use crate::rpc::RpcImportHook;
@@ -26,6 +27,14 @@ pub enum CapnwebValue {
     Number(f64),
     /// A string.
     String(String),
+    /// A JavaScript bigint, represented without a size limit locally.
+    BigInt(BigInt),
+    /// A byte string (`Uint8Array` in JavaScript).
+    Bytes(Vec<u8>),
+    /// A JavaScript `Date` timestamp in milliseconds; `None` is Invalid Date.
+    Date(Option<f64>),
+    /// A serialized absolute URL.
+    Url(String),
     /// An array.
     Array(Vec<Self>),
     /// A plain object.
@@ -45,6 +54,10 @@ impl std::fmt::Debug for CapnwebValue {
             Self::Bool(value) => formatter.debug_tuple("Bool").field(value).finish(),
             Self::Number(value) => formatter.debug_tuple("Number").field(value).finish(),
             Self::String(value) => formatter.debug_tuple("String").field(value).finish(),
+            Self::BigInt(value) => formatter.debug_tuple("BigInt").field(value).finish(),
+            Self::Bytes(value) => formatter.debug_tuple("Bytes").field(value).finish(),
+            Self::Date(value) => formatter.debug_tuple("Date").field(value).finish(),
+            Self::Url(value) => formatter.debug_tuple("Url").field(value).finish(),
             Self::Array(value) => formatter.debug_tuple("Array").field(value).finish(),
             Self::Object(value) => formatter.debug_tuple("Object").field(value).finish(),
             Self::Target(_) => formatter.write_str("Target(..)"),
@@ -114,6 +127,21 @@ impl IntoCapnwebValue for &str {
     }
 }
 
+impl FromCapnwebValue for BigInt {
+    fn from_capnweb_value(value: CapnwebValue) -> Result<Self> {
+        match value {
+            CapnwebValue::BigInt(value) => Ok(value),
+            other => Err(Error::Type(format!("expected bigint, got {other:?}"))),
+        }
+    }
+}
+
+impl IntoCapnwebValue for BigInt {
+    fn into_capnweb_value(self) -> Result<CapnwebValue> {
+        Ok(CapnwebValue::BigInt(self))
+    }
+}
+
 impl FromCapnwebValue for bool {
     fn from_capnweb_value(value: CapnwebValue) -> Result<Self> {
         match value {
@@ -126,6 +154,54 @@ impl FromCapnwebValue for bool {
 impl IntoCapnwebValue for bool {
     fn into_capnweb_value(self) -> Result<CapnwebValue> {
         Ok(CapnwebValue::Bool(self))
+    }
+}
+
+impl<T: FromCapnwebValue> FromCapnwebValue for Option<T> {
+    fn from_capnweb_value(value: CapnwebValue) -> Result<Self> {
+        match value {
+            CapnwebValue::Null => Ok(None),
+            value => T::from_capnweb_value(value).map(Some),
+        }
+    }
+}
+
+impl<T: IntoCapnwebValue> IntoCapnwebValue for Option<T> {
+    fn into_capnweb_value(self) -> Result<CapnwebValue> {
+        match self {
+            Some(value) => value.into_capnweb_value(),
+            None => Ok(CapnwebValue::Null),
+        }
+    }
+}
+
+impl<T: FromCapnwebValue> FromCapnwebValue for Vec<T> {
+    fn from_capnweb_value(value: CapnwebValue) -> Result<Self> {
+        match value {
+            CapnwebValue::Array(values) => values.into_iter().map(T::from_capnweb_value).collect(),
+            other => Err(Error::Type(format!("expected array, got {other:?}"))),
+        }
+    }
+}
+
+impl<T: IntoCapnwebValue> IntoCapnwebValue for Vec<T> {
+    fn into_capnweb_value(self) -> Result<CapnwebValue> {
+        self.into_iter()
+            .map(IntoCapnwebValue::into_capnweb_value)
+            .collect::<Result<Vec<_>>>()
+            .map(CapnwebValue::Array)
+    }
+}
+
+impl IntoCapnwebValue for RpcStub {
+    fn into_capnweb_value(self) -> Result<CapnwebValue> {
+        Ok(CapnwebValue::Stub(self))
+    }
+}
+
+impl IntoCapnwebValue for RpcPromise {
+    fn into_capnweb_value(self) -> Result<CapnwebValue> {
+        Ok(CapnwebValue::Promise(self))
     }
 }
 
@@ -343,11 +419,33 @@ impl PayloadStubHook {
 }
 
 impl StubHookInner for PayloadStubHook {
-    fn call(&self, path: PropertyPath, args: RpcPayload) -> StubHook {
+    fn call(&self, mut path: PropertyPath, args: RpcPayload) -> StubHook {
         match &self.payload.value {
             CapnwebValue::Promise(promise) => promise.hook().call(path, args),
             CapnwebValue::Stub(stub) => stub.hook.call(path, args),
             CapnwebValue::Target(target) => TargetStubHook::create(target.clone()).call(path, args),
+            CapnwebValue::Object(object) if !path.is_empty() => {
+                let first = path.remove(0);
+                match object.get(&first) {
+                    Some(value) => {
+                        Self::create(RpcPayload::from_app_return(value.clone())).call(path, args)
+                    }
+                    None => ErrorStubHook::create(Error::Type(format!("no property `{first}`"))),
+                }
+            }
+            CapnwebValue::Array(values) if !path.is_empty() => {
+                let first = path.remove(0);
+                match first
+                    .parse::<usize>()
+                    .ok()
+                    .and_then(|index| values.get(index))
+                {
+                    Some(value) => {
+                        Self::create(RpcPayload::from_app_return(value.clone())).call(path, args)
+                    }
+                    None => ErrorStubHook::create(Error::Type(format!("no property `{first}`"))),
+                }
+            }
             _ => ErrorStubHook::create(Error::Type("RPC value is not callable".into())),
         }
     }
@@ -359,12 +457,14 @@ impl StubHookInner for PayloadStubHook {
         let mut value = self.payload.value.clone();
         for part in path {
             value = match value {
-                CapnwebValue::Object(mut object) => match object.remove(&part) {
-                    Some(value) => value,
-                    None => {
-                        return ErrorStubHook::create(Error::Type(format!("no property `{part}`")));
-                    }
-                },
+                CapnwebValue::Object(mut object) => {
+                    object.remove(&part).unwrap_or(CapnwebValue::Null)
+                }
+                CapnwebValue::Array(values) => part
+                    .parse::<usize>()
+                    .ok()
+                    .and_then(|index| values.get(index).cloned())
+                    .unwrap_or(CapnwebValue::Null),
                 CapnwebValue::Promise(promise) => return promise.hook().get(vec![part]),
                 _ => return ErrorStubHook::create(Error::Type("value has no properties".into())),
             };
@@ -474,7 +574,6 @@ impl StubHookInner for PromiseStubHook {
 }
 
 /// Rust representation of JS `RpcStub` without proxy interception.
-#[derive(Clone)]
 pub struct RpcStub {
     pub(crate) hook: StubHook,
 }
@@ -485,7 +584,23 @@ impl std::fmt::Debug for RpcStub {
     }
 }
 
+impl Clone for RpcStub {
+    fn clone(&self) -> Self {
+        self.dup()
+    }
+}
+
 impl RpcStub {
+    /// Constructs a local stub around a target.
+    pub fn from_target<T: RpcTargetInner>(target: Arc<T>) -> Self {
+        Self::from_hook(TargetStubHook::create(target))
+    }
+
+    /// Constructs a local stub around a pass-by-value object or array.
+    pub fn from_value(value: CapnwebValue) -> Self {
+        Self::from_hook(PayloadStubHook::create(RpcPayload::from_app_return(value)))
+    }
+
     /// Constructs a stub around a hook.
     pub(crate) fn from_hook(hook: StubHook) -> Self {
         Self { hook }
@@ -494,6 +609,11 @@ impl RpcStub {
     /// Calls a generated method immediately.
     pub fn call(&self, path: PropertyPath, args: RpcPayload) -> RpcPromise {
         RpcPromise::new(do_call(self.hook.clone(), path, args), Vec::new())
+    }
+
+    /// Accesses a property without pulling the containing stub.
+    pub fn get(&self, path: PropertyPath) -> RpcPromise {
+        RpcPromise::new(self.hook.get(path), Vec::new())
     }
 
     /// Duplicates the RPC reference.
@@ -507,7 +627,6 @@ impl RpcStub {
 /// Difference from JS: this untyped provider exposes `pull()` directly;
 /// generated `TypedRpcPromise<T>` implements Rust's `Future` trait and performs
 /// final value conversion.
-#[derive(Clone)]
 pub struct RpcPromise {
     hook: StubHook,
     path: PropertyPath,
@@ -519,6 +638,12 @@ impl std::fmt::Debug for RpcPromise {
             .debug_struct("RpcPromise")
             .field("path", &self.path)
             .finish_non_exhaustive()
+    }
+}
+
+impl Clone for RpcPromise {
+    fn clone(&self) -> Self {
+        Self::new(self.hook.dup(), self.path.clone())
     }
 }
 
@@ -542,6 +667,36 @@ impl RpcPromise {
         let mut full_path = self.path.clone();
         full_path.append(&mut path);
         RpcPromise::new(do_call(self.hook.clone(), full_path, args), Vec::new())
+    }
+
+    /// Applies a synchronous callback to a scalar or each array element.
+    ///
+    /// Difference from JS: this initial implementation applies the map after
+    /// pulling the subject locally. The JavaScript `map.ts` instruction
+    /// protocol will replace this fallback so calls made by the callback can
+    /// be sent without first pulling the subject.
+    pub fn map<F, R>(self, callback: F) -> RpcPromise
+    where
+        F: Fn(CapnwebValue) -> Result<R> + Send + Sync + 'static,
+        R: IntoCapnwebValue,
+    {
+        let callback = Arc::new(callback);
+        let hook = PromiseStubHook::create(async move {
+            let value = self.pull().await?.deliver().await?;
+            let mapped = match value {
+                CapnwebValue::Null => CapnwebValue::Null,
+                CapnwebValue::Array(values) => {
+                    let mut mapped = Vec::with_capacity(values.len());
+                    for value in values {
+                        mapped.push(callback(value)?.into_capnweb_value()?);
+                    }
+                    CapnwebValue::Array(mapped)
+                }
+                value => callback(value)?.into_capnweb_value()?,
+            };
+            Ok(PayloadStubHook::create(RpcPayload::from_app_return(mapped)))
+        });
+        RpcPromise::new(hook, Vec::new())
     }
 
     /// Pulls and recursively delivers this promise.
