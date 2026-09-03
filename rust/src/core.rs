@@ -2338,6 +2338,16 @@ impl RpcPayload {
 // JS:   parent?: never,
 // JS:   owner?: never,
 // JS: };
+enum FollowPathResult {
+    Value {
+        value: CapnwebValue,
+        owner: Option<RpcPayload>,
+    },
+    Hook {
+        hook: StubHook,
+        remaining_path: PropertyPath,
+    },
+}
 // JS:
 // JS: function followPath(value: unknown, parent: object | undefined,
 // JS:                     path: PropertyPath, owner: RpcPayload | null): FollowPathResult {
@@ -2476,6 +2486,96 @@ impl RpcPayload {
 // JS:     owner,
 // JS:   };
 // JS: }
+fn follow_path(
+    mut value: CapnwebValue,
+    path: PropertyPath,
+    owner: Option<RpcPayload>,
+) -> Result<FollowPathResult> {
+    for (index, part) in path.iter().enumerate() {
+        let remainder = || path[index..].to_vec();
+        value = match value {
+            CapnwebValue::Object(mut object) => match part {
+                PropertyKey::String(name) if !is_object_prototype_property(name) => {
+                    object.remove(name).unwrap_or(CapnwebValue::Null)
+                }
+                _ => CapnwebValue::Null,
+            },
+            CapnwebValue::Array(array) => match part {
+                PropertyKey::Number(number)
+                    if number.is_finite()
+                        && *number >= 0.0
+                        && number.fract() == 0.0
+                        && *number <= usize::MAX as f64 =>
+                {
+                    array
+                        .into_iter()
+                        .nth(*number as usize)
+                        .unwrap_or(CapnwebValue::Null)
+                }
+                _ => CapnwebValue::Null,
+            },
+            CapnwebValue::Target(target) | CapnwebValue::Function(target) => {
+                return Ok(FollowPathResult::Hook {
+                    hook: TargetStubHook::create(target, None),
+                    remaining_path: remainder(),
+                });
+            }
+            CapnwebValue::Stub(stub) => {
+                let (hook, promised_path) = unwrap_stub_and_path(&stub);
+                let mut remaining_path = promised_path.unwrap_or_default();
+                remaining_path.extend(remainder());
+                return Ok(FollowPathResult::Hook {
+                    hook,
+                    remaining_path,
+                });
+            }
+            CapnwebValue::RpcPromise(promise) => {
+                let (hook, promised_path) = unwrap_stub_and_path(&promise.stub);
+                let mut remaining_path = promised_path.unwrap_or_default();
+                remaining_path.extend(remainder());
+                return Ok(FollowPathResult::Hook {
+                    hook,
+                    remaining_path,
+                });
+            }
+            CapnwebValue::Null
+            | CapnwebValue::Bool(_)
+            | CapnwebValue::Number(_)
+            | CapnwebValue::String(_)
+            | CapnwebValue::BigInt(_)
+            | CapnwebValue::Bytes(_)
+            | CapnwebValue::Error(_) => CapnwebValue::Null,
+        };
+    }
+
+    if let CapnwebValue::RpcPromise(promise) = value {
+        let (hook, path) = unwrap_stub_and_path(&promise.stub);
+        return Ok(FollowPathResult::Hook {
+            hook,
+            remaining_path: path.unwrap_or_default(),
+        });
+    }
+
+    Ok(FollowPathResult::Value { value, owner })
+}
+
+fn is_object_prototype_property(property: &str) -> bool {
+    matches!(
+        property,
+        "__defineGetter__"
+            | "__defineSetter__"
+            | "hasOwnProperty"
+            | "__lookupGetter__"
+            | "__lookupSetter__"
+            | "isPrototypeOf"
+            | "propertyIsEnumerable"
+            | "toString"
+            | "valueOf"
+            | "__proto__"
+            | "toLocaleString"
+            | "constructor"
+    )
+}
 // JS:
 // JS: // Shared base class for PayloadStubHook and TargetStubHook.
 // JS: abstract class ValueStubHook extends StubHook {
