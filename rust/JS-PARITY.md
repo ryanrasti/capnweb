@@ -208,18 +208,18 @@ Rust futures are lazy while JavaScript promises are eager. Therefore constructin
 counterpart must start or poll a future at the exact point where JavaScript constructs the promise.
 Execution may not be deferred until `pull()` unless the JavaScript implementation also defers it.
 
-The final eager-promise runtime model needs more inspection before implementation. In particular,
-e-order only requires operations registered on the same unresolved promise to *start* in
-registration order; an operation need not complete before the next starts, and independent promises
-do not need a shared microtask queue. The provisional `EagerPromise<T>` interface lives in
-`rust/src/eager_promise.rs` so mechanically translated promise hot spots can use an idiomatic API
-without embedding a speculative scheduler in each hook.
+The eager-promise runtime model needs more inspection and simplification. E-order only requires
+operations registered on the same unresolved promise to *start* in registration order; an operation
+need not complete before the next starts, and independent promises do not need a shared microtask
+queue. The provisional `EagerPromise<T>` implementation lives in `rust/src/eager_promise.rs` so
+mechanically translated promise hot spots use a small idiomatic API instead of embedding scheduling
+machinery in each hook.
 
-The intended construction behavior remains: poll the originating future once synchronously, then
-drive a pending future on the selected Rust executor. After resolution, registered operations must
-be initially polled in registration order. The implementation and cancellation details remain a
-localized `RUST-DEFERRED(JS built-in: Promise/e-order scheduler)` boundary until focused tests settle
-the simplest correct model.
+The initial implementation polls the originating future once synchronously, then drives a pending
+future on Tokio. After resolution, it initially polls registered asynchronous reactions in order and
+does not wait for one reaction to complete before starting the next. Its cancellation, panic, and
+executor-shutdown behavior remains explicitly provisional until focused tests establish the
+simplest correct model.
 
 ## In-scope source files
 

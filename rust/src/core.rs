@@ -3206,9 +3206,9 @@ impl StubHookInner for PromiseStubHook {
         // Moving owned arguments into the operation is the Rust deep-copy/lifetime equivalent.
         // JS:
         // JS:     return new PromiseStubHook(this.promise.then(
-        let promise = self.promise.then(move |hook| {
+        let promise = self.promise.then(move |resolution| {
             // JS:         hook => hook.call(path, args),
-            hook.call(path, args)
+            resolution.and_then(|hook| hook.call(path, args))
             // JS:         err => {
             // JS:           // The backing promise rejected, so no callee ever existed to take ownership of `args`.
             // JS:           args.dispose();
@@ -3228,10 +3228,10 @@ impl StubHookInner for PromiseStubHook {
         // JS:     args.ensureDeepCopied();
         // Moving owned arguments into the operation keeps them alive until it starts.
         // JS:     let promise = this.promise.then(
-        let promise = self.promise.then_async(move |hook| {
+        let promise = self.promise.then_async(move |resolution| {
             Box::pin(async move {
                 // JS:         hook => hook.stream(path, args).promise,
-                hook.stream(path, args)?.promise.await
+                resolution?.stream(path, args)?.promise.await
                 // JS:         err => {
                 // JS:           // The backing promise rejected, so no callee ever existed to take ownership of `args`.
                 // JS:           args.dispose();
@@ -3256,9 +3256,9 @@ impl StubHookInner for PromiseStubHook {
         instructions: MapInstructions,
     ) -> Result<StubHook> {
         // JS:     return new PromiseStubHook(this.promise.then(
-        let promise = self.promise.then(move |hook| {
+        let promise = self.promise.then(move |resolution| {
             // JS:         hook => hook.map(path, captures, instructions),
-            hook.map(path, captures, instructions)
+            resolution.and_then(|hook| hook.map(path, captures, instructions))
             // JS:         err => {
             // JS:           // The backing promise rejected, so no callee ever existed to take ownership of the
             // JS:           // captures.
@@ -3277,9 +3277,9 @@ impl StubHookInner for PromiseStubHook {
     fn get(&self, path: PropertyPath) -> Result<StubHook> {
         // JS:     // Note: e-order matters for get(), just like call(), in case the property has a getter.
         // JS:     return new PromiseStubHook(this.promise.then(hook => hook.get(path)));
-        Ok(Self::from_eager(
-            self.promise.then(move |hook| hook.get(path)),
-        ))
+        Ok(Self::from_eager(self.promise.then(move |resolution| {
+            resolution.and_then(|hook| hook.get(path))
+        })))
         // JS:   }
     }
     // JS:
@@ -3301,13 +3301,13 @@ impl StubHookInner for PromiseStubHook {
         // JS:     if (this.resolution) {
         if let Some(resolution) = self.promise.peek() {
             // JS:       return this.resolution.pull();
-            return resolution?.pull();
+            return resolution.pull();
             // JS:     } else {
         }
         // JS:       return this.promise.then(hook => hook.pull());
-        let promise = self.promise.then_async(|hook| {
+        let promise = self.promise.then_async(|resolution| {
             Box::pin(async move {
-                match hook.pull()? {
+                match resolution?.pull()? {
                     MaybePromise::Immediate(payload) => Ok(payload),
                     MaybePromise::Pending(payload) => payload.await,
                 }
@@ -3321,13 +3321,13 @@ impl StubHookInner for PromiseStubHook {
     // JS:   ignoreUnhandledRejections(): void {
     fn ignore_unhandled_rejections(&self) {
         // JS:     if (this.resolution) {
-        if let Some(Ok(hook)) = self.promise.peek() {
+        if let Some(hook) = self.promise.peek() {
             // JS:       this.resolution.ignoreUnhandledRejections();
             hook.ignore_unhandled_rejections();
         // JS:     } else {
         } else {
             // JS:       this.promise.then(res => {
-            self.promise.observe(|resolution| {
+            let _observation = self.promise.then(|resolution| {
                 if let Ok(hook) = resolution {
                     // JS:         res.ignoreUnhandledRejections();
                     hook.ignore_unhandled_rejections();
@@ -3335,6 +3335,7 @@ impl StubHookInner for PromiseStubHook {
                     // JS:         // Ignore the error!
                 }
                 // JS:       });
+                Ok(())
             });
             // JS:     }
         }
@@ -3355,18 +3356,18 @@ impl StubHookInner for PromiseStubHook {
         // JS:     if (this.resolution) {
         if let Some(resolution) = self.promise.peek() {
             // JS:       this.resolution.onBroken(callback);
-            match resolution {
-                Ok(hook) => hook.on_broken(callback),
-                Err(error) => callback(error),
-            }
+            resolution.on_broken(callback);
         // JS:     } else {
         } else {
             // JS:       this.promise.then(hook => {
-            self.promise.observe(move |resolution| match resolution {
-                // JS:         hook.onBroken(callback);
-                Ok(hook) => hook.on_broken(callback),
-                // JS:       }, callback);
-                Err(error) => callback(error),
+            let _observation = self.promise.then(move |resolution| {
+                match resolution {
+                    // JS:         hook.onBroken(callback);
+                    Ok(hook) => hook.on_broken(callback),
+                    // JS:       }, callback);
+                    Err(error) => callback(error),
+                }
+                Ok(())
             });
             // JS:     }
         }
