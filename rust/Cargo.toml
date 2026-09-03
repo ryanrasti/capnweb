@@ -1,3 +1,7 @@
+[workspace]
+members = ["macros"]
+resolver = "3"
+
 [package]
 name = "capnweb"
 version = "0.1.0"
@@ -9,6 +13,15 @@ repository = "https://github.com/cloudflare/capnweb"
 publish = false
 
 [dependencies]
+async-trait = "0.1"
+capnweb-macros = { path = "macros" }
+futures = "0.3"
+serde_json = "1"
+thiserror = "2"
+tokio = { version = "1", features = ["io-util", "macros", "net", "process", "rt-multi-thread", "sync"] }
+tokio-tungstenite = { version = "0.28", default-features = false, features = ["connect", "handshake"] }
+
+[dev-dependencies]
 
 [lints.rust]
 missing_docs = "warn"

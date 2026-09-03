@@ -1,5 +1,11 @@
 # Rust implementation plan
 
+> **Implementation update:** The runtime is now being translated structurally from the JavaScript
+> implementation rather than built from new provider abstractions. See
+> [`JS-PARITY.md`](JS-PARITY.md) for the authoritative class/module mapping and current parity
+> boundary. The generated public API remains idiomatic Rust; internal runtime names and control flow
+> follow JavaScript.
+
 ## Objective
 
 Implement an idiomatic Rust peer for the existing Cap'n Web wire protocol. The first milestone is a

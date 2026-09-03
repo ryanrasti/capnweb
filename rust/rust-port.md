@@ -1,5 +1,9 @@
 # Proposal: Idiomatic Rust implementation of Cap'n Web
 
+> **Implementation update:** The public API follows this proposal, but the runtime itself is now a
+> direct structural translation of the JavaScript implementation. See
+> [`JS-PARITY.md`](JS-PARITY.md) for the authoritative internal mapping and documented differences.
+
 ## Summary
 
 Build a Rust implementation of the Cap'n Web protocol that interoperates with the existing
