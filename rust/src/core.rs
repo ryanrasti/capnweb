@@ -1457,11 +1457,11 @@ impl RpcPayload {
     // JS:   // touched again after the call returns synchronously (returns a promise) -- by that point,
     // JS:   // the value has either been copied or serialized to the wire.
     // JS:   public static fromAppParams(value: unknown): RpcPayload {
-    // JS:     return new RpcPayload(value, "params");
-    // JS:   }
     /// Takes ownership of application call parameters.
     pub fn from_app_params(value: CapnwebValue) -> Self {
+        // JS:     return new RpcPayload(value, "params");
         Self { value }
+        // JS:   }
     }
     // JS:
     // JS:   // Create a payload from a value return from an RPC implementation by the app.
@@ -1470,49 +1470,53 @@ impl RpcPayload {
     // JS:   // may hold onto `value` for an arbitrarily long time (e.g. to serve pipelined requests). It
     // JS:   // will still avoid modifying `value` and will make a deep copy if it is delivered locally.
     // JS:   public static fromAppReturn(value: unknown): RpcPayload {
-    // JS:     return new RpcPayload(value, "return");
-    // JS:   }
     /// Takes ownership of an application return value.
     pub fn from_app_return(value: CapnwebValue) -> Self {
+        // JS:     return new RpcPayload(value, "return");
         Self { value }
+        // JS:   }
     }
     // JS:
     // JS:   // Combine an array of payloads into a single payload whose value is an array. Ownership of all
     // JS:   // stubs is transferred from the inputs to the outputs, hence if the output is disposed, the
     // JS:   // inputs should not be. (In case of exception, nothing is disposed, though.)
     // JS:   public static fromArray(array: RpcPayload[]): RpcPayload {
-    // JS:     let hooks: StubHook[] = [];
-    // JS:     let promises: LocatedPromise[] = [];
-    // JS:
-    // JS:     let resultArray: unknown[] = [];
-    // JS:
-    // JS:     for (let payload of array) {
-    // JS:       payload.ensureDeepCopied();
-    // JS:       for (let hook of payload.hooks!) {
-    // JS:         hooks.push(hook);
-    // JS:       }
-    // JS:       for (let promise of payload.promises!) {
-    // JS:         if (promise.parent === payload) {
-    // JS:           // This promise is the root of the source payload. We need to reparent it to its proper
-    // JS:           // location in the result array.
-    // JS:           promise = {
-    // JS:             parent: resultArray,
-    // JS:             property: resultArray.length,
-    // JS:             promise: promise.promise
-    // JS:           };
-    // JS:         }
-    // JS:         promises.push(promise);
-    // JS:       }
-    // JS:       resultArray.push(payload.value);
-    // JS:     }
-    // JS:
-    // JS:     return new RpcPayload(resultArray, "owned", hooks, promises);
-    // JS:   }
     /// Combines payloads into an array without additional hook bookkeeping.
     pub fn from_array(array: Vec<Self>) -> Self {
-        Self {
-            value: CapnwebValue::Array(array.into_iter().map(|payload| payload.value).collect()),
+        // JS:     let hooks: StubHook[] = [];
+        // JS:     let promises: LocatedPromise[] = [];
+        // JS:
+        // JS:     let resultArray: unknown[] = [];
+        let mut result_array = Vec::with_capacity(array.len());
+        // JS:
+        // JS:     for (let payload of array) {
+        for payload in array {
+            // JS:       payload.ensureDeepCopied();
+            // JS:       for (let hook of payload.hooks!) {
+            // JS:         hooks.push(hook);
+            // JS:       }
+            // JS:       for (let promise of payload.promises!) {
+            // JS:         if (promise.parent === payload) {
+            // JS:           // This promise is the root of the source payload. We need to reparent it to its proper
+            // JS:           // location in the result array.
+            // JS:           promise = {
+            // JS:             parent: resultArray,
+            // JS:             property: resultArray.length,
+            // JS:             promise: promise.promise
+            // JS:           };
+            // JS:         }
+            // JS:         promises.push(promise);
+            // JS:       }
+            // JS:       resultArray.push(payload.value);
+            result_array.push(payload.value);
+            // JS:     }
         }
+        // JS:
+        // JS:     return new RpcPayload(resultArray, "owned", hooks, promises);
+        Self {
+            value: CapnwebValue::Array(result_array),
+        }
+        // JS:   }
     }
     // JS:
     // JS:   // Create a payload from a value parsed off the wire using Evaluator.evaluate().
@@ -1527,12 +1531,12 @@ impl RpcPayload {
     // JS:   // modify the value in preparation for delivery, and may deliver the value directly to the app
     // JS:   // without copying.
     // JS:   public static forEvaluate(hooks: StubHook[], promises: LocatedPromise[]) {
-    // JS:     return new RpcPayload(null, "owned", hooks, promises);
-    // JS:   }
     pub(crate) fn for_evaluate(_hooks: Vec<StubHook>, _promises: Vec<LocatedPromise>) -> Self {
+        // JS:     return new RpcPayload(null, "owned", hooks, promises);
         Self {
             value: CapnwebValue::Null,
         }
+        // JS:   }
     }
     // JS:
     // JS:   // Deep-copy the given value, including dup()ing all stubs.
@@ -1543,18 +1547,18 @@ impl RpcPayload {
     // JS:   // RpcTargets found within don't get duplicate stubs.
     // JS:   public static deepCopyFrom(
     // JS:       value: unknown, oldParent: object | undefined, owner: RpcPayload | null): RpcPayload {
-    // JS:     let result = new RpcPayload(null, "owned", [], []);
-    // JS:     result.value = result.deepCopy(value, oldParent, "value", result, /*dupStubs=*/true, owner);
-    // JS:     return result;
-    // JS:   }
     pub(crate) fn deep_copy_from(
         value: &CapnwebValue,
         _old_parent: Option<&CapnwebValue>,
         _owner: Option<&RpcPayload>,
     ) -> Self {
-        Self {
-            value: value.clone(),
-        }
+        // JS:     let result = new RpcPayload(null, "owned", [], []);
+        // Rust constructs the owned result directly.
+        // JS:     result.value = result.deepCopy(value, oldParent, "value", result, /*dupStubs=*/true, owner);
+        let value = Self::deep_copy(value);
+        // JS:     return result;
+        Self { value }
+        // JS:   }
     }
     // JS:
     // JS:   // Private constructor; use factory functions above to construct.
@@ -1568,6 +1572,7 @@ impl RpcPayload {
     // JS:     // "owned": This value belongs fully to us, either because it was deserialized from the wire
     // JS:     //   or because we deep-copied a value from the app.
     // JS:     private source: "params" | "return" | "owned",
+    // RUST-DIFF(local refcount): moves and `Clone` encode provenance without a runtime tag.
     // JS:
     // JS:     // `hooks` and `promises` are filled in only if `value` belongs to us (`source` is "owned") and
     // JS:     // so can safely be delivered to the app. If `value` came from then app in the first place,
@@ -1578,10 +1583,12 @@ impl RpcPayload {
     // JS:     // able to dispose them when desired. This intentionally doesn't inculde promises because they
     // JS:     // are already covered by `promises`, below.
     // JS:     private hooks?: StubHook[],
+    // RUST-DIFF(local refcount): capability `Arc`s are owned recursively by `value`.
     // JS:
     // JS:     // All promises found in `value`. The locations of each promise are provided to allow
     // JS:     // substitutions later.
     // JS:     private promises?: LocatedPromise[]
+    // RUST-DIFF(local refcount): recursive delivery discovers dynamic promises in the owned tree.
     // JS:   ) {}
     // JS:
     // JS:   // For `source === "return"` payloads only, this tracks any StubHooks created around RpcTargets
@@ -1590,76 +1597,79 @@ impl RpcPayload {
     // JS:   //
     // JS:   // This is initialized on first use.
     // JS:   private rpcTargets?: Map<RpcTarget | Function | WritableStream | ReadableStream, StubHook>;
+    // RUST-DIFF(local refcount): target identity and lifetime are shared by their `Arc`s.
     // JS:
     // JS:   // Get the StubHook representing the given RpcTarget found inside this payload.
     // JS:   public getHookForRpcTarget(target: RpcTarget | Function, parent: object | undefined,
     // JS:                              dupStubs: boolean = true): StubHook {
-    // JS:     if (this.source === "params") {
-    // JS:       if (dupStubs) {
-    // JS:         // We aren't supposed to take ownership of stubs appearing in params -- we're supposed to
-    // JS:         // dupe them. But an RpcTarget isn't a stub. If we create a stub around it, the stub takes
-    // JS:         // ownership.
-    // JS:         //
-    // JS:         // Usually, people passing raw RpcTargets into functions actually want the call to take
-    // JS:         // ownership -- that is, they want to have the disposer called later.
-    // JS:         //
-    // JS:         // But, if the RpcTarget happens to implement a `dup()` method, we will go ahead and call
-    // JS:         // that method, and wrap whatever it returns instead. This method wouldn't actually be
-    // JS:         // available over RPC anyway (since calling `dup()` on the client-side stub just dupes the
-    // JS:         // stub), so if an `RpcTarget` implements this, it must intend for us to use it.
-    // JS:         //
-    // JS:         // This is particularly important for the case of workerd-native RpcStubs, that is, stubs
-    // JS:         // from the built-in RPC system, rather than the pure-JS implementation of Cap'n Web.
-    // JS:         // We treat those stubs as RpcTargets. But, we do need to dup() them, just like we would
-    // JS:         // our own stubs.
-    // JS:
-    // JS:         let dupable = target as any;
-    // JS:         if (typeof dupable.dup === "function") {
-    // JS:           target = dupable.dup();
-    // JS:         }
-    // JS:       }
-    // JS:
-    // JS:       return TargetStubHook.create(target, parent);
-    // JS:     } else if (this.source === "return") {
-    // JS:       // If dupStubs is true, we want to both make sure the map contains the stub, and also return
-    // JS:       // a dup of that stub.
-    // JS:       //
-    // JS:       // If dupStubs is false, then we are being called as part of ensureDeepCopy(), i.e. replacing
-    // JS:       // ourselves with a deep copy. In this case we actually want the copy to end up owning all
-    // JS:       // the hooks, and the map to be left empty. So what we do in this case is:
-    // JS:       // * If the target is not in the map, we just create it, but don't populate the map.
-    // JS:       // * If the target *is* in the map, we *remove* the hook from the map, and return it.
-    // JS:
-    // JS:       let hook = this.rpcTargets?.get(target);
-    // JS:       if (hook) {
-    // JS:         if (dupStubs) {
-    // JS:           return hook.dup();
-    // JS:         } else {
-    // JS:           this.rpcTargets?.delete(target);
-    // JS:           return hook;
-    // JS:         }
-    // JS:       } else {
-    // JS:         hook = TargetStubHook.create(target, parent);
-    // JS:         if (dupStubs) {
-    // JS:           if (!this.rpcTargets) {
-    // JS:             this.rpcTargets = new Map;
-    // JS:           }
-    // JS:           this.rpcTargets.set(target, hook);
-    // JS:           return hook.dup();
-    // JS:         } else {
-    // JS:           return hook;
-    // JS:         }
-    // JS:       }
-    // JS:     } else {
-    // JS:       throw new Error("owned payload shouldn't contain raw RpcTargets");
-    // JS:     }
-    // JS:   }
     pub(crate) fn get_hook_for_rpc_target(
         &self,
         target: Arc<dyn RpcTargetInner>,
         callable: bool,
     ) -> StubHook {
-        TargetStubHook::create(target, callable)
+        // JS:     if (this.source === "params") {
+        // RUST-DIFF(local refcount): every returned hook shares the target's `Arc` directly.
+        // JS:       if (dupStubs) {
+        // JS:         // We aren't supposed to take ownership of stubs appearing in params -- we're supposed to
+        // JS:         // dupe them. But an RpcTarget isn't a stub. If we create a stub around it, the stub takes
+        // JS:         // ownership.
+        // JS:         //
+        // JS:         // Usually, people passing raw RpcTargets into functions actually want the call to take
+        // JS:         // ownership -- that is, they want to have the disposer called later.
+        // JS:         //
+        // JS:         // But, if the RpcTarget happens to implement a `dup()` method, we will go ahead and call
+        // JS:         // that method, and wrap whatever it returns instead. This method wouldn't actually be
+        // JS:         // available over RPC anyway (since calling `dup()` on the client-side stub just dupes the
+        // JS:         // stub), so if an `RpcTarget` implements this, it must intend for us to use it.
+        // JS:         //
+        // JS:         // This is particularly important for the case of workerd-native RpcStubs, that is, stubs
+        // JS:         // from the built-in RPC system, rather than the pure-JS implementation of Cap'n Web.
+        // JS:         // We treat those stubs as RpcTargets. But, we do need to dup() them, just like we would
+        // JS:         // our own stubs.
+        // JS:
+        // JS:         let dupable = target as any;
+        // JS:         if (typeof dupable.dup === "function") {
+        // JS:           target = dupable.dup();
+        // JS:         }
+        // JS:       }
+        // JS:
+        // JS:       return TargetStubHook.create(target, parent);
+        let hook = TargetStubHook::create(target, callable);
+        // JS:     } else if (this.source === "return") {
+        // JS:       // If dupStubs is true, we want to both make sure the map contains the stub, and also return
+        // JS:       // a dup of that stub.
+        // JS:       //
+        // JS:       // If dupStubs is false, then we are being called as part of ensureDeepCopy(), i.e. replacing
+        // JS:       // ourselves with a deep copy. In this case we actually want the copy to end up owning all
+        // JS:       // the hooks, and the map to be left empty. So what we do in this case is:
+        // JS:       // * If the target is not in the map, we just create it, but don't populate the map.
+        // JS:       // * If the target *is* in the map, we *remove* the hook from the map, and return it.
+        // JS:
+        // JS:       let hook = this.rpcTargets?.get(target);
+        // JS:       if (hook) {
+        // JS:         if (dupStubs) {
+        // JS:           return hook.dup();
+        // JS:         } else {
+        // JS:           this.rpcTargets?.delete(target);
+        // JS:           return hook;
+        // JS:         }
+        // JS:       } else {
+        // JS:         hook = TargetStubHook.create(target, parent);
+        // JS:         if (dupStubs) {
+        // JS:           if (!this.rpcTargets) {
+        // JS:             this.rpcTargets = new Map;
+        // JS:           }
+        // JS:           this.rpcTargets.set(target, hook);
+        // JS:           return hook.dup();
+        // JS:         } else {
+        // JS:           return hook;
+        // JS:         }
+        // JS:       }
+        // JS:     } else {
+        // JS:       throw new Error("owned payload shouldn't contain raw RpcTargets");
+        // JS:     }
+        hook
+        // JS:   }
     }
     // JS:
     // JS:   // Get the StubHook representing the given WritableStream found inside this payload.
@@ -1733,235 +1743,313 @@ impl RpcPayload {
     // JS:   private deepCopy(
     // JS:       value: unknown, oldParent: object | undefined, property: string | number, parent: object,
     // JS:       dupStubs: boolean, owner: RpcPayload | null): unknown {
-    // JS:     let kind = typeForRpc(value);
-    // JS:     switch (kind) {
-    // JS:       case "unsupported":
-    // JS:         // This will throw later on when someone tries to do something with it.
-    // JS:         return value;
-    // JS:
-    // JS:       case "primitive":
-    // JS:       case "bigint":
-    // JS:       case "date":
-    // JS:       case "bytes":
-    // JS:       case "blob":
-    // JS:       case "url":
-    // JS:       case "error":
-    // JS:       case "undefined":
-    // JS:         // immutable, no need to copy
-    // JS:         // TODO: Should errors be copied if they have own properties?
-    // JS:         return value;
-    // JS:
-    // JS:       case "array": {
-    // JS:         // We have to construct the new array first, then fill it in, so we can pass it as the
-    // JS:         // parent.
-    // JS:         let array = <Array<unknown>>value;
-    // JS:         let len = array.length;
-    // JS:         let result = new Array(len);
-    // JS:         for (let i = 0; i < len; i++) {
-    // JS:           result[i] = this.deepCopy(array[i], array, i, result, dupStubs, owner);
-    // JS:         }
-    // JS:         return result;
-    // JS:       }
-    // JS:
-    // JS:       case "object": {
-    // JS:         // Plain object. Unfortunately there's no way to pre-allocate the right shape.
-    // JS:         let result: Record<string, unknown> = {};
-    // JS:         let object = <Record<string, unknown>>value;
-    // JS:         for (let i in object) {
-    // JS:           result[i] = this.deepCopy(object[i], object, i, result, dupStubs, owner);
-    // JS:         }
-    // JS:         return result;
-    // JS:       }
-    // JS:
-    // JS:       case "stub":
-    // JS:       case "rpc-promise": {
-    // JS:         let stub = <RpcStub>value;
-    // JS:         let hook: StubHook;
-    // JS:         if (dupStubs) {
-    // JS:           hook = unwrapStubAndDup(stub);
-    // JS:         } else {
-    // JS:           hook = unwrapStubTakingOwnership(stub);
-    // JS:         }
-    // JS:         if (stub instanceof RpcPromise) {
-    // JS:           let promise = new RpcPromise(hook, []);
-    // JS:           this.promises!.push({parent, property, promise});
-    // JS:           return promise;
-    // JS:         } else {
-    // JS:           this.hooks!.push(hook);
-    // JS:           return new RpcStub(hook);
-    // JS:         }
-    // JS:       }
-    // JS:
-    // JS:       case "function":
-    // JS:       case "rpc-target": {
-    // JS:         let target = <RpcTarget | Function>value;
-    // JS:         let hook: StubHook;
-    // JS:         if (owner) {
-    // JS:           hook = owner.getHookForRpcTarget(target, oldParent, dupStubs);
-    // JS:         } else {
-    // JS:           hook = TargetStubHook.create(target, oldParent);
-    // JS:         }
-    // JS:         this.hooks!.push(hook);
-    // JS:         return new RpcStub(hook);
-    // JS:       }
-    // JS:
-    // JS:       case "rpc-thenable": {
-    // JS:         let target = <RpcTarget>value;
-    // JS:         let promise: RpcPromise;
-    // JS:         if (owner) {
-    // JS:           promise = new RpcPromise(owner.getHookForRpcTarget(target, oldParent, dupStubs), []);
-    // JS:         } else {
-    // JS:           promise = new RpcPromise(TargetStubHook.create(target, oldParent), []);
-    // JS:         }
-    // JS:         this.promises!.push({parent, property, promise});
-    // JS:         return promise;
-    // JS:       }
-    // JS:
-    // JS:       case "writable": {
-    // JS:         let stream = <WritableStream>value;
-    // JS:         let hook: StubHook;
-    // JS:         if (owner) {
-    // JS:           hook = owner.getHookForWritableStream(stream, oldParent, dupStubs);
-    // JS:         } else {
-    // JS:           hook = streamImpl.createWritableStreamHook(stream);
-    // JS:         }
-    // JS:         this.hooks!.push(hook);
-    // JS:         return stream;
-    // JS:       }
-    // JS:
-    // JS:       case "readable": {
-    // JS:         // Note that we don't use tee() here because we treat streams as reference types -- we
-    // JS:         // actually want to share the same body. tee()ing the stream would force the runtime to
-    // JS:         // buffer a copy of the whole body which would usually never be read.
-    // JS:         let stream = <ReadableStream>value;
-    // JS:         let hook: StubHook;
-    // JS:         if (owner) {
-    // JS:           hook = owner.getHookForReadableStream(stream, oldParent, dupStubs);
-    // JS:         } else {
-    // JS:           hook = streamImpl.createReadableStreamHook(stream);
-    // JS:         }
-    // JS:         this.hooks!.push(hook);
-    // JS:         return stream;
-    // JS:       }
-    // JS:
-    // JS:       case "headers":
-    // JS:         return new Headers(<Headers>value);
-    // JS:
-    // JS:       case "request": {
-    // JS:         let req = <Request>value;
-    // JS:         if (req.body) {
-    // JS:           // Note "deep-copy" of a ReadableStream always returns the same stream, but we still
-    // JS:           // need to run it in order to handle refcounting / disposal properly.
-    // JS:           this.deepCopy(req.body, req, "body", req, dupStubs, owner);
-    // JS:         }
-    // JS:
-    // JS:         // Make an actual copy of the object, e.g. so the headers are copied.
-    // JS:         // Note that it would be incorrect to use clone() here since that would tee() the body
-    // JS:         // stream.
-    // JS:         return new Request(req);
-    // JS:       }
-    // JS:
-    // JS:       case "response": {
-    // JS:         let resp = <Response>value;
-    // JS:         if (resp.body) {
-    // JS:           // Note "deep-copy" of a ReadableStream always returns the same stream, but we still
-    // JS:           // need to run it in order to handle refcounting / disposal properly.
-    // JS:           this.deepCopy(resp.body, resp, "body", resp, dupStubs, owner);
-    // JS:         }
-    // JS:
-    // JS:         // Make an actual copy of the object, e.g. so the headers are copied.
-    // JS:         // Note that it would be incorrect to use clone() here since that would tee() the body
-    // JS:         // stream.
-    // JS:         return new Response(resp.body, resp);
-    // JS:       }
-    // JS:
-    // JS:       default:
-    // JS:         kind satisfies never;
-    // JS:         throw new Error("unreachable");
-    // JS:     }
-    // JS:   }
     fn deep_copy(value: &CapnwebValue) -> CapnwebValue {
-        value.clone()
+        // JS:     let kind = typeForRpc(value);
+        // Rust's dynamic enum provides the same classification.
+        // JS:     switch (kind) {
+        match value {
+            // JS:       case "unsupported":
+            // JS:         // This will throw later on when someone tries to do something with it.
+            // JS:         return value;
+            // JS:
+            // JS:       case "primitive":
+            // JS:       case "bigint":
+            // JS:       case "date":
+            // JS:       case "bytes":
+            // JS:       case "blob":
+            // JS:       case "url":
+            // JS:       case "error":
+            // JS:       case "undefined":
+            // JS:         // immutable, no need to copy
+            // JS:         // TODO: Should errors be copied if they have own properties?
+            // JS:         return value;
+            CapnwebValue::Null
+            | CapnwebValue::Undefined
+            | CapnwebValue::Bool(_)
+            | CapnwebValue::Number(_)
+            | CapnwebValue::String(_)
+            | CapnwebValue::BigInt(_)
+            | CapnwebValue::Bytes(_)
+            | CapnwebValue::Error(_) => value.clone(),
+            // JS:
+            // JS:       case "array": {
+            // JS:         // We have to construct the new array first, then fill it in, so we can pass it as the
+            // JS:         // parent.
+            // JS:         let array = <Array<unknown>>value;
+            // JS:         let len = array.length;
+            // JS:         let result = new Array(len);
+            // JS:         for (let i = 0; i < len; i++) {
+            // JS:           result[i] = this.deepCopy(array[i], array, i, result, dupStubs, owner);
+            // JS:         }
+            // JS:         return result;
+            CapnwebValue::Array(values) => {
+                CapnwebValue::Array(values.iter().map(Self::deep_copy).collect())
+            }
+            // JS:       }
+            // JS:
+            // JS:       case "object": {
+            // JS:         // Plain object. Unfortunately there's no way to pre-allocate the right shape.
+            // JS:         let result: Record<string, unknown> = {};
+            // JS:         let object = <Record<string, unknown>>value;
+            // JS:         for (let i in object) {
+            // JS:           result[i] = this.deepCopy(object[i], object, i, result, dupStubs, owner);
+            // JS:         }
+            // JS:         return result;
+            CapnwebValue::Object(values) => CapnwebValue::Object(
+                values
+                    .iter()
+                    .map(|(key, value)| (key.clone(), Self::deep_copy(value)))
+                    .collect(),
+            ),
+            // JS:       }
+            // JS:
+            // JS:       case "stub":
+            // JS:       case "rpc-promise": {
+            // JS:         let stub = <RpcStub>value;
+            // JS:         let hook: StubHook;
+            // JS:         if (dupStubs) {
+            // JS:           hook = unwrapStubAndDup(stub);
+            // JS:         } else {
+            // JS:           hook = unwrapStubTakingOwnership(stub);
+            // JS:         }
+            // JS:         if (stub instanceof RpcPromise) {
+            // JS:           let promise = new RpcPromise(hook, []);
+            // JS:           this.promises!.push({parent, property, promise});
+            // JS:           return promise;
+            // JS:         } else {
+            // JS:           this.hooks!.push(hook);
+            // JS:           return new RpcStub(hook);
+            // JS:         }
+            CapnwebValue::Stub(stub) => CapnwebValue::Stub(stub.clone()),
+            CapnwebValue::RpcPromise(promise) => CapnwebValue::RpcPromise(promise.clone()),
+            // JS:       }
+            // JS:
+            // JS:       case "function":
+            // JS:       case "rpc-target": {
+            // JS:         let target = <RpcTarget | Function>value;
+            // JS:         let hook: StubHook;
+            // JS:         if (owner) {
+            // JS:           hook = owner.getHookForRpcTarget(target, oldParent, dupStubs);
+            // JS:         } else {
+            // JS:           hook = TargetStubHook.create(target, oldParent);
+            // JS:         }
+            // JS:         this.hooks!.push(hook);
+            // JS:         return new RpcStub(hook);
+            CapnwebValue::Function(target) => CapnwebValue::Function(Arc::clone(target)),
+            CapnwebValue::Target(target) => CapnwebValue::Target(Arc::clone(target)),
+            // JS:       }
+            // JS:
+            // JS:       case "rpc-thenable": {
+            // JS:         let target = <RpcTarget>value;
+            // JS:         let promise: RpcPromise;
+            // JS:         if (owner) {
+            // JS:           promise = new RpcPromise(owner.getHookForRpcTarget(target, oldParent, dupStubs), []);
+            // JS:         } else {
+            // JS:           promise = new RpcPromise(TargetStubHook.create(target, oldParent), []);
+            // JS:         }
+            // JS:         this.promises!.push({parent, property, promise});
+            // JS:         return promise;
+            // JS:       }
+            // RUST-DEFERRED(JS built-in: native RPC thenable): no dynamic native-thenable variant exists.
+            // JS:
+            // JS:       case "writable": {
+            // JS:         let stream = <WritableStream>value;
+            // JS:         let hook: StubHook;
+            // JS:         if (owner) {
+            // JS:           hook = owner.getHookForWritableStream(stream, oldParent, dupStubs);
+            // JS:         } else {
+            // JS:           hook = streamImpl.createWritableStreamHook(stream);
+            // JS:         }
+            // JS:         this.hooks!.push(hook);
+            // JS:         return stream;
+            // JS:       }
+            // JS:
+            // JS:       case "readable": {
+            // JS:         // Note that we don't use tee() here because we treat streams as reference types -- we
+            // JS:         // actually want to share the same body. tee()ing the stream would force the runtime to
+            // JS:         // buffer a copy of the whole body which would usually never be read.
+            // JS:         let stream = <ReadableStream>value;
+            // JS:         let hook: StubHook;
+            // JS:         if (owner) {
+            // JS:           hook = owner.getHookForReadableStream(stream, oldParent, dupStubs);
+            // JS:         } else {
+            // JS:           hook = streamImpl.createReadableStreamHook(stream);
+            // JS:         }
+            // JS:         this.hooks!.push(hook);
+            // JS:         return stream;
+            // JS:       }
+            // RUST-DEFERRED(JS built-in: WritableStream/ReadableStream): dynamic stream values are absent.
+            // JS:
+            // JS:       case "headers":
+            // JS:         return new Headers(<Headers>value);
+            // JS:
+            // JS:       case "request": {
+            // JS:         let req = <Request>value;
+            // JS:         if (req.body) {
+            // JS:           // Note "deep-copy" of a ReadableStream always returns the same stream, but we still
+            // JS:           // need to run it in order to handle refcounting / disposal properly.
+            // JS:           this.deepCopy(req.body, req, "body", req, dupStubs, owner);
+            // JS:         }
+            // JS:
+            // JS:         // Make an actual copy of the object, e.g. so the headers are copied.
+            // JS:         // Note that it would be incorrect to use clone() here since that would tee() the body
+            // JS:         // stream.
+            // JS:         return new Request(req);
+            // JS:       }
+            // JS:
+            // JS:       case "response": {
+            // JS:         let resp = <Response>value;
+            // JS:         if (resp.body) {
+            // JS:           // Note "deep-copy" of a ReadableStream always returns the same stream, but we still
+            // JS:           // need to run it in order to handle refcounting / disposal properly.
+            // JS:           this.deepCopy(resp.body, resp, "body", resp, dupStubs, owner);
+            // JS:         }
+            // JS:
+            // JS:         // Make an actual copy of the object, e.g. so the headers are copied.
+            // JS:         // Note that it would be incorrect to use clone() here since that would tee() the body
+            // JS:         // stream.
+            // JS:         return new Response(resp.body, resp);
+            // JS:       }
+            // RUST-DEFERRED(JS built-in: Headers/Request/Response): dynamic Fetch values are absent.
+            // JS:
+            // JS:       default:
+            // JS:         kind satisfies never;
+            // JS:         throw new Error("unreachable");
+            // JS:     }
+        }
+        // JS:   }
     }
     // JS:
     // JS:   // Ensures that if the value originally came from an unowned source, we have replaced it with a
     // JS:   // deep copy.
     // JS:   public ensureDeepCopied() {
-    // JS:     if (this.source !== "owned") {
-    // JS:       // If we came from call params, we need to dupe any stubs. Otherwise (we came from a return),
-    // JS:       // we take ownership of all stubs.
-    // JS:       let dupStubs = this.source === "params";
-    // JS:
-    // JS:       this.hooks = [];
-    // JS:       this.promises = [];
-    // JS:
-    // JS:       // Deep-copy the value.
-    // JS:       try {
-    // JS:         this.value = this.deepCopy(this.value, undefined, "value", this, dupStubs, this);
-    // JS:       } catch (err) {
-    // JS:         // Roll back the change.
-    // JS:         this.hooks = undefined;
-    // JS:         this.promises = undefined;
-    // JS:         throw err;
-    // JS:       }
-    // JS:
-    // JS:       // We now own the value.
-    // JS:       this.source = "owned";
-    // JS:
-    // JS:       // `rpcTargets` should have been left empty. We can throw it out.
-    // JS:       if (this.rpcTargets && this.rpcTargets.size > 0) {
-    // JS:         throw new Error("Not all rpcTargets were accounted for in deep-copy?");
-    // JS:       }
-    // JS:       this.rpcTargets = undefined;
-    // JS:     }
-    // JS:   }
     fn ensure_deep_copied(&mut self) {
+        // JS:     if (this.source !== "owned") {
         // RUST-DIFF(local refcount): application values are moved into an owned tree at construction.
+        // JS:       // If we came from call params, we need to dupe any stubs. Otherwise (we came from a return),
+        // JS:       // we take ownership of all stubs.
+        // JS:       let dupStubs = this.source === "params";
+        // JS:
+        // JS:       this.hooks = [];
+        // JS:       this.promises = [];
+        // JS:
+        // JS:       // Deep-copy the value.
+        // JS:       try {
+        // JS:         this.value = this.deepCopy(this.value, undefined, "value", this, dupStubs, this);
+        // JS:       } catch (err) {
+        // JS:         // Roll back the change.
+        // JS:         this.hooks = undefined;
+        // JS:         this.promises = undefined;
+        // JS:         throw err;
+        // JS:       }
+        // JS:
+        // JS:       // We now own the value.
+        // JS:       this.source = "owned";
+        // JS:
+        // JS:       // `rpcTargets` should have been left empty. We can throw it out.
+        // JS:       if (this.rpcTargets && this.rpcTargets.size > 0) {
+        // JS:         throw new Error("Not all rpcTargets were accounted for in deep-copy?");
+        // JS:       }
+        // JS:       this.rpcTargets = undefined;
+        // JS:     }
+        // JS:   }
     }
     // JS:
     // JS:   // Resolve all promises in this payload and then assign the final value into `parent[property]`.
     // JS:   private deliverTo(parent: object, property: string | number, promises: Promise<any>[]): void {
-    // JS:     this.ensureDeepCopied();
-    // JS:
-    // JS:     if (this.value instanceof RpcPromise) {
-    // JS:       RpcPayload.deliverRpcPromiseTo(this.value, parent, property, promises);
-    // JS:     } else {
-    // JS:       (<any>parent)[property] = this.value;
-    // JS:
-    // JS:       for (let record of this.promises!) {
-    // JS:         // Note that because we already did ensureDeepCopied(), replacing each promise with its
-    // JS:         // resolution does not interfere with disposal later on -- disposal will be based on the
-    // JS:         // `promises` list, so will still properly dispose each promise, which in turn disposes
-    // JS:         // the promise's eventual payload.
-    // JS:         RpcPayload.deliverRpcPromiseTo(record.promise, record.parent, record.property, promises);
-    // JS:       }
-    // JS:     }
-    // JS:   }
+    fn resolve_value(
+        value: CapnwebValue,
+    ) -> Pin<Box<dyn Future<Output = Result<CapnwebValue>> + Send + 'static>> {
+        Box::pin(async move {
+            // JS:     this.ensureDeepCopied();
+            // Values are already owned and recursively cloned before local delivery.
+            // JS:
+            // JS:     if (this.value instanceof RpcPromise) {
+            match value {
+                CapnwebValue::RpcPromise(promise) => {
+                    // JS:       RpcPayload.deliverRpcPromiseTo(this.value, parent, property, promises);
+                    Self::resolve_promise(promise).await
+                }
+                // JS:     } else {
+                // JS:       (<any>parent)[property] = this.value;
+                // Owned Rust reconstruction returns the replacement value rather than mutating its parent.
+                // JS:
+                // JS:       for (let record of this.promises!) {
+                CapnwebValue::Array(values) => {
+                    let resolutions = values.into_iter().map(Self::resolve_value);
+                    let values = futures::future::join_all(resolutions)
+                        .await
+                        .into_iter()
+                        .collect::<Result<Vec<_>>>()?;
+                    Ok(CapnwebValue::Array(values))
+                }
+                CapnwebValue::Object(values) => {
+                    let resolutions = values.into_iter().map(|(key, value)| async move {
+                        Ok((key, Self::resolve_value(value).await?))
+                    });
+                    let values = futures::future::join_all(resolutions)
+                        .await
+                        .into_iter()
+                        .collect::<Result<BTreeMap<_, _>>>()?;
+                    Ok(CapnwebValue::Object(values))
+                }
+                // JS:         // Note that because we already did ensureDeepCopied(), replacing each promise with its
+                // JS:         // resolution does not interfere with disposal later on -- disposal will be based on the
+                // JS:         // `promises` list, so will still properly dispose each promise, which in turn disposes
+                // JS:         // the promise's eventual payload.
+                // JS:         RpcPayload.deliverRpcPromiseTo(record.promise, record.parent, record.property, promises);
+                // Nested Rust promises are recursively resolved by the array/object arms above.
+                // JS:       }
+                // JS:     }
+                value => Ok(value),
+            }
+            // JS:   }
+        })
+    }
     // JS:
     // JS:   private static deliverRpcPromiseTo(
     // JS:       promise: RpcPromise, parent: object, property: string | number,
     // JS:       promises: Promise<unknown>[]) {
-    // JS:     // deepCopy() should have replaced any property stubs with normal promise stubs.
-    // JS:     let hook = unwrapStubNoProperties(promise);
-    // JS:     if (!hook) {
-    // JS:       throw new Error("property promises should have been resolved earlier");
-    // JS:     }
-    // JS:
-    // JS:     let inner = hook.pull();
-    // JS:     if (inner instanceof RpcPayload) {
-    // JS:       // Immediately resolved to payload.
-    // JS:       inner.deliverTo(parent, property, promises);
-    // JS:     } else {
-    // JS:       // It's a promise.
-    // JS:       promises.push(inner.then(payload => {
-    // JS:         let subPromises: Promise<unknown>[] = [];
-    // JS:         payload.deliverTo(parent, property, subPromises);
-    // JS:         if (subPromises.length > 0) {
-    // JS:           return Promise.all(subPromises);
-    // JS:         }
-    // JS:       }));
-    // JS:     }
-    // JS:   }
+    fn resolve_promise(
+        promise: RpcPromise,
+    ) -> Pin<Box<dyn Future<Output = Result<CapnwebValue>> + Send + 'static>> {
+        Box::pin(async move {
+            // JS:     // deepCopy() should have replaced any property stubs with normal promise stubs.
+            // JS:     let hook = unwrapStubNoProperties(promise);
+            let hook = unwrap_stub_no_properties(&promise.stub);
+            // JS:     if (!hook) {
+            let Some(hook) = hook else {
+                // JS:       throw new Error("property promises should have been resolved earlier");
+                return Err(Error::Message(
+                    "property promises should have been resolved earlier".to_owned(),
+                ));
+                // JS:     }
+            };
+            // JS:
+            // JS:     let inner = hook.pull();
+            let inner = hook.pull()?;
+            // JS:     if (inner instanceof RpcPayload) {
+            // JS:       // Immediately resolved to payload.
+            // JS:       inner.deliverTo(parent, property, promises);
+            let payload = match inner {
+                MaybePromise::Immediate(payload) => payload,
+                // JS:     } else {
+                // JS:       // It's a promise.
+                // JS:       promises.push(inner.then(payload => {
+                MaybePromise::Pending(payload) => payload.await?,
+            };
+            // JS:         let subPromises: Promise<unknown>[] = [];
+            // Rust recursion owns nested promise collection implicitly.
+            // JS:         payload.deliverTo(parent, property, subPromises);
+            Self::resolve_value(payload.value).await
+            // JS:         if (subPromises.length > 0) {
+            // JS:           return Promise.all(subPromises);
+            // JS:         }
+            // JS:       }));
+            // JS:     }
+            // JS:   }
+        })
+    }
     // JS:
     // JS:   // Call the given function with the payload as an argument. The call is made synchronously if
     // JS:   // possible, in order to maintain e-order. However, if any RpcPromises exist in the payload,
@@ -2064,47 +2152,50 @@ impl RpcPayload {
     // JS:   // The returned object will have a disposer which disposes the payload. The caller should not
     // JS:   // separately dispose it.
     // JS:   public async deliverResolve(): Promise<unknown> {
-    // JS:     try {
-    // JS:       let promises: Promise<void>[] = [];
-    // JS:       this.deliverTo(this, "value", promises);
-    // JS:
-    // JS:       if (promises.length > 0) {
-    // JS:         await Promise.all(promises);
-    // JS:       }
-    // JS:
-    // JS:       let result = this.value;
-    // JS:
-    // JS:       // Add disposer to result.
-    // JS:       if (result instanceof Object) {
-    // JS:         if (!(Symbol.dispose in result)) {
-    // JS:           // We want the disposer to be non-enumerable as otherwise it gets in the way of things
-    // JS:           // like unit tests trying to deep-compare the result to an object.
-    // JS:           Object.defineProperty(result, Symbol.dispose, {
-    // JS:             // NOTE: Using `this.dispose.bind(this)` here causes Playwright's build of
-    // JS:             //   Chromium 140.0.7339.16 to fail when the object is assigned to a `using` variable,
-    // JS:             //   with the error:
-    // JS:             //       TypeError: Symbol(Symbol.dispose) is not a function
-    // JS:             //   I cannot reproduce this problem in Chrome 140.0.7339.127 nor in Node or workerd,
-    // JS:             //   so maybe it was a short-lived V8 bug or something. To be safe, though, we use
-    // JS:             //   `() => this.dispose()`, which seems to always work.
-    // JS:             value: () => this.dispose(),
-    // JS:             writable: true,
-    // JS:             enumerable: false,
-    // JS:             configurable: true,
-    // JS:           });
-    // JS:         }
-    // JS:       }
-    // JS:
-    // JS:       return result;
-    // JS:     } catch (err) {
-    // JS:       // Automatically dispose since the application will never receive the disposable...
-    // JS:       this.dispose();
-    // JS:       throw err;
-    // JS:     }
-    // JS:   }
     #[doc(hidden)]
     pub async fn deliver_resolve(self) -> Result<CapnwebValue> {
-        Self::resolve_value(self.value).await
+        // JS:     try {
+        // JS:       let promises: Promise<void>[] = [];
+        // Nested pending work is represented by the recursive future itself.
+        // JS:       this.deliverTo(this, "value", promises);
+        let result = Self::resolve_value(self.value).await;
+        // JS:
+        // JS:       if (promises.length > 0) {
+        // JS:         await Promise.all(promises);
+        // JS:       }
+        // JS:
+        // JS:       let result = this.value;
+        // JS:
+        // JS:       // Add disposer to result.
+        // JS:       if (result instanceof Object) {
+        // JS:         if (!(Symbol.dispose in result)) {
+        // JS:           // We want the disposer to be non-enumerable as otherwise it gets in the way of things
+        // JS:           // like unit tests trying to deep-compare the result to an object.
+        // JS:           Object.defineProperty(result, Symbol.dispose, {
+        // JS:             // NOTE: Using `this.dispose.bind(this)` here causes Playwright's build of
+        // JS:             //   Chromium 140.0.7339.16 to fail when the object is assigned to a `using` variable,
+        // JS:             //   with the error:
+        // JS:             //       TypeError: Symbol(Symbol.dispose) is not a function
+        // JS:             //   I cannot reproduce this problem in Chrome 140.0.7339.127 nor in Node or workerd,
+        // JS:             //   so maybe it was a short-lived V8 bug or something. To be safe, though, we use
+        // JS:             //   `() => this.dispose()`, which seems to always work.
+        // JS:             value: () => this.dispose(),
+        // JS:             writable: true,
+        // JS:             enumerable: false,
+        // JS:             configurable: true,
+        // JS:           });
+        // JS:         }
+        // JS:       }
+        // JS:
+        // JS:       return result;
+        result
+        // JS:     } catch (err) {
+        // JS:       // Automatically dispose since the application will never receive the disposable...
+        // JS:       this.dispose();
+        // JS:       throw err;
+        // Errors are retained in `result`; owned values drop during unwinding.
+        // JS:     }
+        // JS:   }
     }
     // JS:
     // JS:   public dispose() {
@@ -2258,117 +2349,101 @@ impl RpcPayload {
     // JS:   // *would* be awaited if this payload were to be delivered. See the similarly-named method of
     // JS:   // StubHook for explanation.
     // JS:   ignoreUnhandledRejections(): void {
-    // JS:     if (this.hooks) {
-    // JS:       // Propagate to all stubs and promises.
-    // JS:       this.hooks.forEach(hook => {
-    // JS:         hook.ignoreUnhandledRejections();
-    // JS:       });
-    // JS:       this.promises!.forEach(
-    // JS:           promise => unwrapStubOrParent(promise.promise).ignoreUnhandledRejections());
-    // JS:     } else {
-    // JS:       // Ugh we have to walk the tree.
-    // JS:       this.ignoreUnhandledRejectionsImpl(this.value);
-    // JS:     }
-    // JS:   }
+    fn ignore_unhandled_rejections(&self) {
+        // JS:     if (this.hooks) {
+        // JS:       // Propagate to all stubs and promises.
+        // JS:       this.hooks.forEach(hook => {
+        // JS:         hook.ignoreUnhandledRejections();
+        // JS:       });
+        // JS:       this.promises!.forEach(
+        // JS:           promise => unwrapStubOrParent(promise.promise).ignoreUnhandledRejections());
+        // JS:     } else {
+        // Rust ownership keeps no separate hook list, so every payload follows this branch.
+        // JS:       // Ugh we have to walk the tree.
+        // JS:       this.ignoreUnhandledRejectionsImpl(this.value);
+        Self::ignore_unhandled_rejections_impl(&self.value);
+        // JS:     }
+        // JS:   }
+    }
     // JS:
     // JS:   private ignoreUnhandledRejectionsImpl(value: unknown) {
-    // JS:     let kind = typeForRpc(value);
-    // JS:     switch (kind) {
-    // JS:       case "unsupported":
-    // JS:       case "primitive":
-    // JS:       case "bigint":
-    // JS:       case "bytes":
-    // JS:       case "blob":
-    // JS:       case "date":
-    // JS:       case "error":
-    // JS:       case "undefined":
-    // JS:       case "function":
-    // JS:       case "rpc-target":
-    // JS:       case "writable":
-    // JS:       case "readable":
-    // JS:       case "url":
-    // JS:       case "headers":
-    // JS:       case "request":
-    // JS:       case "response":
-    // JS:         return;
-    // JS:
-    // JS:       case "array": {
-    // JS:         let array = <Array<unknown>>value;
-    // JS:         let len = array.length;
-    // JS:         for (let i = 0; i < len; i++) {
-    // JS:           this.ignoreUnhandledRejectionsImpl(array[i]);
-    // JS:         }
-    // JS:         return;
-    // JS:       }
-    // JS:
-    // JS:       case "object": {
-    // JS:         let object = <Record<string, unknown>>value;
-    // JS:         for (let i in object) {
-    // JS:           this.ignoreUnhandledRejectionsImpl(object[i]);
-    // JS:         }
-    // JS:         return;
-    // JS:       }
-    // JS:
-    // JS:       case "stub":
-    // JS:       case "rpc-promise":
-    // JS:         unwrapStubOrParent(<RpcStub>value).ignoreUnhandledRejections();
-    // JS:         return;
-    // JS:
-    // JS:       case "rpc-thenable":
-    // JS:         (<any>value).then((_: any) => {}, (_: any) => {});
-    // JS:         return;
-    // JS:
-    // JS:       default:
-    // JS:         kind satisfies never;
-    // JS:         return;
-    // JS:     }
-    // JS:   }
-    fn resolve_value(
-        value: CapnwebValue,
-    ) -> Pin<Box<dyn Future<Output = Result<CapnwebValue>> + Send + 'static>> {
-        Box::pin(async move {
-            match value {
-                CapnwebValue::RpcPromise(promise) => {
-                    let resolution = promise.await?;
-                    Self::resolve_value(resolution).await
-                }
-                CapnwebValue::Array(values) => {
-                    let resolutions = values.into_iter().map(Self::resolve_value);
-                    let values = futures::future::join_all(resolutions)
-                        .await
-                        .into_iter()
-                        .collect::<Result<Vec<_>>>()?;
-                    Ok(CapnwebValue::Array(values))
-                }
-                CapnwebValue::Object(values) => {
-                    let resolutions = values.into_iter().map(|(key, value)| async move {
-                        Ok((key, Self::resolve_value(value).await?))
-                    });
-                    let values = futures::future::join_all(resolutions)
-                        .await
-                        .into_iter()
-                        .collect::<Result<BTreeMap<_, _>>>()?;
-                    Ok(CapnwebValue::Object(values))
-                }
-                value => Ok(value),
+    fn ignore_unhandled_rejections_impl(value: &CapnwebValue) {
+        // JS:     let kind = typeForRpc(value);
+        // Rust's dynamic enum provides the classification.
+        // JS:     switch (kind) {
+        match value {
+            // JS:       case "unsupported":
+            // JS:       case "primitive":
+            // JS:       case "bigint":
+            // JS:       case "bytes":
+            // JS:       case "blob":
+            // JS:       case "date":
+            // JS:       case "error":
+            // JS:       case "undefined":
+            // JS:       case "function":
+            // JS:       case "rpc-target":
+            // JS:       case "writable":
+            // JS:       case "readable":
+            // JS:       case "url":
+            // JS:       case "headers":
+            // JS:       case "request":
+            // JS:       case "response":
+            // JS:         return;
+            CapnwebValue::Null
+            | CapnwebValue::Undefined
+            | CapnwebValue::Bool(_)
+            | CapnwebValue::Number(_)
+            | CapnwebValue::String(_)
+            | CapnwebValue::BigInt(_)
+            | CapnwebValue::Bytes(_)
+            | CapnwebValue::Error(_)
+            | CapnwebValue::Function(_)
+            | CapnwebValue::Target(_) => {}
+            // JS:
+            // JS:       case "array": {
+            // JS:         let array = <Array<unknown>>value;
+            // JS:         let len = array.length;
+            // JS:         for (let i = 0; i < len; i++) {
+            // JS:           this.ignoreUnhandledRejectionsImpl(array[i]);
+            // JS:         }
+            // JS:         return;
+            CapnwebValue::Array(values) => {
+                values
+                    .iter()
+                    .for_each(Self::ignore_unhandled_rejections_impl);
             }
-        })
-    }
-
-    fn ignore_unhandled_rejections(&self) {
-        fn visit(value: &CapnwebValue) {
-            match value {
-                CapnwebValue::Array(values) => values.iter().for_each(visit),
-                CapnwebValue::Object(values) => values.values().for_each(visit),
-                CapnwebValue::Stub(stub) => stub.hook.ignore_unhandled_rejections(),
-                CapnwebValue::RpcPromise(promise) => {
-                    promise.stub.hook.ignore_unhandled_rejections();
-                }
-                _ => {}
+            // JS:       }
+            // JS:
+            // JS:       case "object": {
+            // JS:         let object = <Record<string, unknown>>value;
+            // JS:         for (let i in object) {
+            // JS:           this.ignoreUnhandledRejectionsImpl(object[i]);
+            // JS:         }
+            // JS:         return;
+            CapnwebValue::Object(values) => {
+                values
+                    .values()
+                    .for_each(Self::ignore_unhandled_rejections_impl);
             }
+            // JS:       }
+            // JS:
+            // JS:       case "stub":
+            // JS:       case "rpc-promise":
+            // JS:         unwrapStubOrParent(<RpcStub>value).ignoreUnhandledRejections();
+            CapnwebValue::Stub(stub) => stub.hook.ignore_unhandled_rejections(),
+            CapnwebValue::RpcPromise(promise) => promise.stub.hook.ignore_unhandled_rejections(),
+            // JS:         return;
+            // JS:
+            // JS:       case "rpc-thenable":
+            // JS:         (<any>value).then((_: any) => {}, (_: any) => {});
+            // JS:         return;
+            // JS:
+            // JS:       default:
+            // JS:         kind satisfies never;
+            // JS:         return;
+            // JS:     }
         }
-
-        visit(&self.value);
+        // JS:   }
     }
     // JS: };
 }
