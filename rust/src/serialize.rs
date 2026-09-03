@@ -1,11 +1,20 @@
 // JS: // Copyright (c) 2025 Cloudflare, Inc.
+// Copyright (c) 2025 Cloudflare, Inc.
 // JS: // Licensed under the MIT license found in the LICENSE.txt file or at:
+// Licensed under the MIT license found in the LICENSE.txt file or at:
 // JS: //     https://opensource.org/license/mit
+//     https://opensource.org/license/mit
 // JS:
+
 // JS: import { StubHook, RpcPayload, typeForRpc, RpcStub, RpcPromise, LocatedPromise, RpcTarget, unwrapStubAndPath, streamImpl, PromiseStubHook, PayloadStubHook } from "./core.js";
+use crate::core::{Error, Result, StubHook};
 // JS:
 // JS: export type ImportId = number;
+/// A peer-assigned import-table identifier.
+pub type ImportId = i64;
 // JS: export type ExportId = number;
+/// A local export-table identifier.
+pub type ExportId = i64;
 // JS:
 // JS: /**
 // JS:  * Encoding levels determine what representation the RPC system hands to the transport.
@@ -27,6 +36,19 @@
 // JS:  */
 // JS: export type EncodingLevel = "string" | "jsonCompatible" | "jsonCompatibleWithBytes" |
 // JS:     "structuredClonable";
+/// The representation handed from serialization to a transport.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum EncodingLevel {
+    /// A complete JSON string.
+    #[default]
+    String,
+    /// A JSON-compatible value tree.
+    JsonCompatible,
+    /// A JSON-compatible tree which may contain raw byte strings.
+    JsonCompatibleWithBytes,
+    /// A structured-clone-compatible native tree.
+    StructuredClonable,
+}
 // JS:
 // JS: // =======================================================================================
 // JS: // Resource limits applied while deserializing messages from a peer.
@@ -38,42 +60,61 @@
 // JS: // its message rejected (a TypeError is thrown), which tears down the session via abort().
 // JS:
 // JS: export interface RpcLimits {
-// JS:   // Maximum number of magnitude digits permitted in a ["bigint", "..."] wire value, excluding a
-// JS:   // leading "-" sign.
-// JS:   //
-// JS:   // Bigints are serialized as decimal strings. Decimal parsing via BigInt() is synchronous and
-// JS:   // superlinear in the number of digits, so this cap bounds the worst-case parse cost.
-// JS:   //
-// JS:   // The default is far larger than practical big-integer or cryptographic values, but far below
-// JS:   // the millions of decimal digits needed to cause meaningful blocking.
-// JS:   maxBigIntDigits: number;
-// JS:
-// JS:   // Maximum nesting depth of a single deserialized message. Guards against stack overflow from a
-// JS:   // deeply-nested payload (e.g. [[[[...]]]]). This is enforced uniformly across the whole message,
-// JS:   // including nested call arguments that are delivered as separate RpcPayloads.
-// JS:   maxDepth: number;
-// JS:
-// JS:   // Maximum size of a single incoming message string, measured in UTF-16 code units (JavaScript
-// JS:   // String.length), before it is JSON-parsed. This is not a byte count: a string of N code units
-// JS:   // may occupy more than N bytes when encoded as UTF-8. Enforced in the session read loop, after
-// JS:   // the transport has already returned a complete string, to bound JSON.parse and downstream
-// JS:   // deserialization work. True byte-level enforcement belongs in the transport/socket, so apps
-// JS:   // exposed to untrusted peers should also configure transport/socket-native payload limits where
-// JS:   // available.
-// JS:   maxMessageSize: number;
-// JS: }
+/// Receiver-side limits applied to untrusted messages.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct RpcLimits {
+    // JS:   // Maximum number of magnitude digits permitted in a ["bigint", "..."] wire value, excluding a
+    // JS:   // leading "-" sign.
+    // JS:   //
+    // JS:   // Bigints are serialized as decimal strings. Decimal parsing via BigInt() is synchronous and
+    // JS:   // superlinear in the number of digits, so this cap bounds the worst-case parse cost.
+    // JS:   //
+    // JS:   // The default is far larger than practical big-integer or cryptographic values, but far below
+    // JS:   // the millions of decimal digits needed to cause meaningful blocking.
+    // JS:   maxBigIntDigits: number;
+    /// Maximum decimal magnitude digits in a bigint wire value.
+    pub max_big_int_digits: usize,
+    // JS:
+    // JS:   // Maximum nesting depth of a single deserialized message. Guards against stack overflow from a
+    // JS:   // deeply-nested payload (e.g. [[[[...]]]]). This is enforced uniformly across the whole message,
+    // JS:   // including nested call arguments that are delivered as separate RpcPayloads.
+    // JS:   maxDepth: number;
+    /// Maximum nested message depth.
+    pub max_depth: usize,
+    // JS:
+    // JS:   // Maximum size of a single incoming message string, measured in UTF-16 code units (JavaScript
+    // JS:   // String.length), before it is JSON-parsed. This is not a byte count: a string of N code units
+    // JS:   // may occupy more than N bytes when encoded as UTF-8. Enforced in the session read loop, after
+    // JS:   // the transport has already returned a complete string, to bound JSON.parse and downstream
+    // JS:   // deserialization work. True byte-level enforcement belongs in the transport/socket, so apps
+    // JS:   // exposed to untrusted peers should also configure transport/socket-native payload limits where
+    // JS:   // available.
+    // JS:   maxMessageSize: number;
+    /// Maximum incoming encoded message size.
+    pub max_message_size: usize,
+    // JS: }
+}
 // JS:
 // JS: export const DEFAULT_MAX_DEPTH = 256;
+/// Default maximum message depth.
+pub const DEFAULT_MAX_DEPTH: usize = 256;
 // JS:
 // JS: export const DEFAULT_LIMITS: RpcLimits = {
-// JS:   maxBigIntDigits: 16384,
-// JS:   maxDepth: DEFAULT_MAX_DEPTH,
-// JS:   maxMessageSize: 32 * 1024 * 1024,
-// JS: };
+/// Default receiver-side resource limits.
+pub const DEFAULT_LIMITS: RpcLimits = RpcLimits {
+    // JS:   maxBigIntDigits: 16384,
+    max_big_int_digits: 16_384,
+    // JS:   maxDepth: DEFAULT_MAX_DEPTH,
+    max_depth: DEFAULT_MAX_DEPTH,
+    // JS:   maxMessageSize: 32 * 1024 * 1024,
+    max_message_size: 32 * 1024 * 1024,
+    // JS: };
+};
 // JS:
 // JS: // =======================================================================================
 // JS:
 // JS: const NATIVE_LITTLE_ENDIAN = new Uint8Array(new Uint16Array([1]).buffer)[0] === 1;
+// RUST-DEFERRED(JS built-in: typed-array identity): byte strings have no container subtype.
 // JS:
 // JS: const BYTE_CONTAINER_TYPE_NAMES = [
 // JS:   "ArrayBuffer",
@@ -136,67 +177,120 @@
 // JS: for (let type of Object.keys(BYTE_CONTAINER_PROTOTYPES) as MarkedByteContainerTypeName[]) {
 // JS:   BYTE_CONTAINER_TYPE_BY_PROTOTYPE.set(BYTE_CONTAINER_PROTOTYPES[type], type);
 // JS: }
+// RUST-DEFERRED(JS built-in: typed-array prototypes): Rust serializes one canonical byte-string type.
 // JS:
 // JS: // Reverse each element's bytes in place. Production callers only need this on
 // JS: // big-endian hosts; it is exported solely so the behavior can be tested on
 // JS: // little-endian hosts.
 // JS: export function swapByteOrder(bytes: Uint8Array, elementSize: number): void {
-// JS:   if (elementSize !== 2 && elementSize !== 4 && elementSize !== 8) {
-// JS:     throw new RangeError(`Unsupported element size: ${elementSize}`);
-// JS:   }
-// JS:
-// JS:   let view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
-// JS:   for (let offset = 0; offset < bytes.byteLength; offset += elementSize) {
-// JS:     switch (elementSize) {
-// JS:       case 2:
-// JS:         view.setUint16(offset, view.getUint16(offset, false), true);
-// JS:         break;
-// JS:       case 4:
-// JS:         view.setUint32(offset, view.getUint32(offset, false), true);
-// JS:         break;
-// JS:       case 8:
-// JS:         view.setBigUint64(offset, view.getBigUint64(offset, false), true);
-// JS:         break;
-// JS:     }
-// JS:   }
-// JS: }
+/// Reverses each fixed-width element's bytes in place.
+pub fn swap_byte_order(bytes: &mut [u8], element_size: usize) -> Result<()> {
+    // JS:   if (elementSize !== 2 && elementSize !== 4 && elementSize !== 8) {
+    if !matches!(element_size, 2 | 4 | 8) {
+        // JS:     throw new RangeError(`Unsupported element size: ${elementSize}`);
+        return Err(Error::Message(format!(
+            "Unsupported element size: {element_size}"
+        )));
+        // JS:   }
+    }
+    // JS:
+    // JS:   let view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+    // JS:   for (let offset = 0; offset < bytes.byteLength; offset += elementSize) {
+    // JS:     switch (elementSize) {
+    // JS:       case 2:
+    // JS:         view.setUint16(offset, view.getUint16(offset, false), true);
+    // JS:         break;
+    // JS:       case 4:
+    // JS:         view.setUint32(offset, view.getUint32(offset, false), true);
+    // JS:         break;
+    // JS:       case 8:
+    // JS:         view.setBigUint64(offset, view.getBigUint64(offset, false), true);
+    // JS:         break;
+    // JS:     }
+    // JS:   }
+    for element in bytes.chunks_exact_mut(element_size) {
+        element.reverse();
+    }
+    Ok(())
+    // JS: }
+}
 // JS:
 // JS: export interface Exporter {
-// JS:   exportStub(hook: StubHook): ExportId;
-// JS:   exportPromise(hook: StubHook): ExportId;
-// JS:   getImport(hook: StubHook): ImportId | undefined;
-// JS:
-// JS:   // If a serialization error occurs after having exported some capabilities, this will be called
-// JS:   // to roll back the exports.
-// JS:   unexport(ids: Array<ExportId>): void;
-// JS:
-// JS:   // Creates a pipe by sending a ["pipe"] message, then starts pumping the given ReadableStream
-// JS:   // into the pipe's writable end. Returns the import ID assigned to the pipe. `hook` should be
-// JS:   // disposed when the pipe finishes.
-// JS:   createPipe(readable: ReadableStream, hook: StubHook): ImportId;
-// JS:
-// JS:   onSendError(error: Error): Error | void;
-// JS: }
+/// Session callbacks used while serializing capabilities.
+pub trait Exporter {
+    // JS:   exportStub(hook: StubHook): ExportId;
+    /// Exports a non-promise capability.
+    fn export_stub(&mut self, hook: StubHook) -> Result<ExportId>;
+    // JS:   exportPromise(hook: StubHook): ExportId;
+    /// Exports a promise capability.
+    fn export_promise(&mut self, hook: StubHook) -> Result<ExportId>;
+    // JS:   getImport(hook: StubHook): ImportId | undefined;
+    /// Returns the import ID when this hook came from the same peer.
+    fn get_import(&self, hook: &StubHook) -> Option<ImportId>;
+    // JS:
+    // JS:   // If a serialization error occurs after having exported some capabilities, this will be called
+    // JS:   // to roll back the exports.
+    // JS:   unexport(ids: Array<ExportId>): void;
+    /// Rolls back exports created by a failed serialization.
+    fn unexport(&mut self, ids: Vec<ExportId>) -> Result<()>;
+    // JS:
+    // JS:   // Creates a pipe by sending a ["pipe"] message, then starts pumping the given ReadableStream
+    // JS:   // into the pipe's writable end. Returns the import ID assigned to the pipe. `hook` should be
+    // JS:   // disposed when the pipe finishes.
+    // JS:   createPipe(readable: ReadableStream, hook: StubHook): ImportId;
+    // RUST-DEFERRED(JS built-in: ReadableStream): pipe creation is not part of this trait yet.
+    // JS:
+    // JS:   onSendError(error: Error): Error | void;
+    /// Optionally replaces an error raised while sending.
+    fn on_send_error(&mut self, error: Error) -> Option<Error>;
+    // JS: }
+}
 // JS:
 // JS: class NullExporter implements Exporter {
-// JS:   exportStub(stub: StubHook): never {
-// JS:     throw new Error("Cannot serialize RPC stubs without an RPC session.");
-// JS:   }
-// JS:   exportPromise(stub: StubHook): never {
-// JS:     throw new Error("Cannot serialize RPC stubs without an RPC session.");
-// JS:   }
-// JS:   getImport(hook: StubHook): ImportId | undefined {
-// JS:     return undefined;
-// JS:   }
-// JS:   unexport(ids: Array<ExportId>): void {}
-// JS:   createPipe(readable: ReadableStream): never {
-// JS:     throw new Error("Cannot create pipes without an RPC session.");
-// JS:   }
-// JS:
-// JS:   onSendError(error: Error): Error | void {}
-// JS: }
+#[derive(Clone, Copy, Debug, Default)]
+struct NullExporter;
+
+impl Exporter for NullExporter {
+    // JS:   exportStub(stub: StubHook): never {
+    fn export_stub(&mut self, _stub: StubHook) -> Result<ExportId> {
+        // JS:     throw new Error("Cannot serialize RPC stubs without an RPC session.");
+        Err(Error::Message(
+            "Cannot serialize RPC stubs without an RPC session.".to_owned(),
+        ))
+        // JS:   }
+    }
+    // JS:   exportPromise(stub: StubHook): never {
+    fn export_promise(&mut self, _stub: StubHook) -> Result<ExportId> {
+        // JS:     throw new Error("Cannot serialize RPC stubs without an RPC session.");
+        Err(Error::Message(
+            "Cannot serialize RPC stubs without an RPC session.".to_owned(),
+        ))
+        // JS:   }
+    }
+    // JS:   getImport(hook: StubHook): ImportId | undefined {
+    fn get_import(&self, _hook: &StubHook) -> Option<ImportId> {
+        // JS:     return undefined;
+        None
+        // JS:   }
+    }
+    // JS:   unexport(ids: Array<ExportId>): void {}
+    fn unexport(&mut self, _ids: Vec<ExportId>) -> Result<()> {
+        Ok(())
+    }
+    // JS:   createPipe(readable: ReadableStream): never {
+    // JS:     throw new Error("Cannot create pipes without an RPC session.");
+    // JS:   }
+    // RUST-DEFERRED(JS built-in: ReadableStream): NullExporter has no pipe method.
+    // JS:
+    // JS:   onSendError(error: Error): Error | void {}
+    fn on_send_error(&mut self, _error: Error) -> Option<Error> {
+        None
+    }
+    // JS: }
+}
 // JS:
 // JS: const NULL_EXPORTER = new NullExporter();
+const NULL_EXPORTER: NullExporter = NullExporter;
 // JS:
 // JS: // Collect all bytes from a ReadableStream into a Blob with the given MIME type. Used on the
 // JS: // receive side to assemble a Blob from a pipe stream before delivering to user code.
