@@ -141,6 +141,26 @@ Import/export counts, introduction counts, `release` messages, remote reference 
 serialization of repeated references are translated exactly because they are part of Cap'n Web
 behavior.
 
+#### Experimental owned promise results
+
+The initial implementation will test an ownership-oriented promise API before treating it as a
+permanent compatibility rule:
+
+- `RpcPromise<T>` resolves to an owned `T` and awaiting consumes that promise handle;
+- callers clone the promise before awaiting when they need another handle;
+- the runtime stores one `CapnwebValue` resolution and each awaiting handle decodes a recursive
+  clone of that dynamic value;
+- this does not require application return type `T` itself to implement `Clone`;
+- generated pass-by-value values may still implement `Clone` for normal Rust ergonomics;
+- cloned capabilities share their `Arc`;
+- dynamic arrays and objects clone recursively;
+- pass-by-value results do not preserve JavaScript object identity.
+
+This experiment succeeds only if pipelining remains lazy, calls remain eager, e-order is preserved,
+wire reference counts remain exact, and retained tests do not require shared mutable result identity.
+If it forces pervasive `Arc<T>` into application APIs, weakens cancellation, or makes ordinary
+non-`Clone` Rust return values impractical, revisit it before declaring `RpcPromise` complete.
+
 ### 3. JavaScript Proxy and reflection
 
 JavaScript Proxy call/property interception is replaced by generated Rust methods. JavaScript

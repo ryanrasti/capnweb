@@ -33,6 +33,7 @@ pub enum Error {
 pub type Result<T> = std::result::Result<T, Error>;
 
 /// An owned dynamic value accepted by the Rust RPC boundary.
+#[derive(Clone)]
 pub enum CapnwebValue {
     /// JavaScript `null` or `undefined`.
     Null,
@@ -1041,6 +1042,20 @@ impl std::fmt::Display for RpcStub {
 }
 // JS:
 // JS: export class RpcPromise extends RpcStub {
+/// A lazy, pipeline-capable RPC result.
+pub struct RpcPromise {
+    stub: RpcStub,
+    resolution: Option<Pin<Box<dyn Future<Output = Result<CapnwebValue>> + Send + 'static>>>,
+}
+
+impl Clone for RpcPromise {
+    fn clone(&self) -> Self {
+        Self {
+            stub: self.stub.clone(),
+            resolution: None,
+        }
+    }
+}
 // JS:   // Internally, an `RpcPromise` is constructed from a `StubHook` plus a property path. The
 // JS:   // application may instead pass a promise for the eventual resolution; calls made before it
 // JS:   // settles are queued and delivered, in order, once it does.
@@ -1099,25 +1114,93 @@ impl std::fmt::Display for RpcStub {
 // JS:       }
 // JS:     }
 // JS:   }
+impl RpcPromise {
+    pub(crate) fn from_hook(hook: StubHook, path: PropertyPath) -> Self {
+        Self {
+            stub: RpcStub::from_hook(hook, Some(path)),
+            resolution: None,
+        }
+    }
+
+    /// Adopts an already-dynamic value as an asynchronously delivered promise resolution.
+    pub fn from_value(value: CapnwebValue) -> Self {
+        if let CapnwebValue::RpcPromise(promise) = value {
+            return promise;
+        }
+
+        Self::from_future(async move {
+            tokio::task::yield_now().await;
+            Ok(value)
+        })
+    }
+
+    /// Eagerly starts a future which will provide this promise's resolution.
+    pub fn from_future(
+        future: impl Future<Output = Result<CapnwebValue>> + Send + 'static,
+    ) -> Self {
+        let hook = PromiseStubHook::from_future(async move {
+            let value = future.await?;
+            Ok(Arc::new(PayloadStubHook::new(RpcPayload::from_app_return(value))) as StubHook)
+        });
+        hook.ignore_unhandled_rejections();
+        Self::from_hook(hook, Vec::new())
+    }
+
+    /// Resolves and consumes this promise handle.
+    pub async fn resolve(self) -> Result<CapnwebValue> {
+        pull_promise(self).await
+    }
+}
 // JS:
 // JS:   then(onfulfilled?: ((value: unknown) => unknown) | undefined | null,
 // JS:        onrejected?: ((reason: any) => unknown) | undefined | null)
 // JS:        : Promise<unknown> {
 // JS:     return pullPromise(this).then(...arguments);
 // JS:   }
+// Rust's `Future` implementation and standard future combinators replace `then()`.
 // JS:
 // JS:   catch(onrejected?: ((reason: any) => unknown) | undefined | null): Promise<unknown> {
 // JS:     return pullPromise(this).catch(...arguments);
 // JS:   }
+// Rust handles rejection through the `Result` yielded by `.await`.
 // JS:
 // JS:   finally(onfinally?: (() => void) | undefined | null): Promise<unknown> {
 // JS:     return pullPromise(this).finally(...arguments);
 // JS:   }
+// Rust scope guards and ordinary cleanup after `.await` replace `finally()`.
 // JS:
 // JS:   toString() {
 // JS:     return "[object RpcPromise]";
 // JS:   }
 // JS: }
+impl Future for RpcPromise {
+    type Output = Result<CapnwebValue>;
+
+    fn poll(
+        mut self: Pin<&mut Self>,
+        context: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Self::Output> {
+        if self.resolution.is_none() {
+            let promise = Self {
+                stub: self.stub.clone(),
+                resolution: None,
+            };
+            self.resolution = Some(Box::pin(pull_promise(promise)));
+        }
+
+        self.resolution
+            .as_mut()
+            .expect("resolution future initialized")
+            .as_mut()
+            .poll(context)
+    }
+}
+
+impl std::fmt::Display for RpcPromise {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("[object RpcPromise]")
+    }
+}
 // JS:
 // JS: // Given a stub (still wrapped in a Proxy), extract the underlying `StubHook`.
 // JS: //
