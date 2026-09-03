@@ -156,6 +156,9 @@ impl<T: RpcTargetInner> RpcTarget for T {}
 /// A sequence of string or numeric property keys traversed by an RPC operation.
 pub type PropertyPath = Vec<PropertyKey>;
 
+/// Raw wire expressions interpreted by the map runtime.
+pub type MapInstructions = Vec<serde_json::Value>;
+
 /// One component of an RPC property path.
 #[derive(Clone, Debug, PartialEq)]
 pub enum PropertyKey {
@@ -439,7 +442,7 @@ pub(crate) trait MapImpl: Send + Sync {
         parent: Option<&CapnwebValue>,
         owner: Option<&RpcPayload>,
         captures: Vec<StubHook>,
-        instructions: Vec<CapnwebValue>,
+        instructions: MapInstructions,
     ) -> Result<StubHook>;
     // JS:
 
@@ -597,7 +600,7 @@ pub trait StubHookInner: Send + Sync {
         &self,
         path: PropertyPath,
         captures: Vec<StubHook>,
-        instructions: Vec<CapnwebValue>,
+        instructions: MapInstructions,
     ) -> Result<StubHook>;
     // JS:
     // JS:   // Read the property at the given path. Returns a StubHook representing a promise for that
@@ -697,7 +700,7 @@ impl StubHookInner for ErrorStubHook {
         &self,
         _path: PropertyPath,
         captures: Vec<StubHook>,
-        _instructions: Vec<CapnwebValue>,
+        _instructions: MapInstructions,
     ) -> Result<StubHook> {
         // JS:     for (let cap of captures) {
         for capture in captures {
@@ -2760,7 +2763,7 @@ trait ValueStubHook: Send + Sync + 'static {
         &self,
         path: PropertyPath,
         captures: Vec<StubHook>,
-        instructions: Vec<CapnwebValue>,
+        instructions: MapInstructions,
     ) -> Result<StubHook> {
         let (value, owner) = self.get_value();
         let followed = match follow_path(value, path, owner) {
@@ -2911,7 +2914,7 @@ impl StubHookInner for PayloadStubHook {
         &self,
         path: PropertyPath,
         captures: Vec<StubHook>,
-        instructions: Vec<CapnwebValue>,
+        instructions: MapInstructions,
     ) -> Result<StubHook> {
         self.map_value(path, captures, instructions)
     }
@@ -3088,7 +3091,7 @@ impl StubHookInner for TargetStubHook {
         &self,
         path: PropertyPath,
         captures: Vec<StubHook>,
-        instructions: Vec<CapnwebValue>,
+        instructions: MapInstructions,
     ) -> Result<StubHook> {
         let property = Arc::clone(&self.target).get(path)?;
         property.map(Vec::new(), captures, instructions)
@@ -3421,7 +3424,7 @@ impl StubHookInner for PromiseStubHook {
         &self,
         path: PropertyPath,
         captures: Vec<StubHook>,
-        instructions: Vec<CapnwebValue>,
+        instructions: MapInstructions,
     ) -> Result<StubHook> {
         Ok(self.chain(move |hook| hook.map(path, captures, instructions)))
     }
