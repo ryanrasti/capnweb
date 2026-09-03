@@ -11,7 +11,10 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use base64::Engine as _;
-use serde_json::{Number, Value as WireValue};
+use serde_json::Number;
+
+/// A JSON-compatible wire-expression tree.
+pub type WireValue = serde_json::Value;
 
 use crate::core::{
     CapnwebValue, Error, PropertyKey, Result, RpcPayload, StubHook, unwrap_stub_and_path,
@@ -1090,17 +1093,18 @@ const NULL_IMPORTER: NullImporter = NullImporter;
 // JS: export class Evaluator {
 /// Converts wire expressions into owned dynamic RPC values.
 pub struct Evaluator<'a> {
+    // JS:   private limits: RpcLimits;
+    limits: RpcLimits,
+    // JS:
+    // JS:   constructor(private importer: Importer, private encodingLevel: EncodingLevel = "string") {
     importer: &'a mut dyn Importer,
     encoding_level: EncodingLevel,
-    limits: RpcLimits,
+    // JS:     this.limits = importer.getLimits();
+    // The constructor below initializes `limits` from `importer`.
+    // JS:   }
 }
 
 impl<'a> Evaluator<'a> {
-    // JS:   private limits: RpcLimits;
-    // JS:
-    // JS:   constructor(private importer: Importer, private encodingLevel: EncodingLevel = "string") {
-    // JS:     this.limits = importer.getLimits();
-    // JS:   }
     /// Constructs an evaluator using the importer's receiver-side limits.
     pub fn new(importer: &'a mut dyn Importer, encoding_level: EncodingLevel) -> Self {
         let limits = importer.get_limits();
@@ -1115,36 +1119,39 @@ impl<'a> Evaluator<'a> {
     // JS:   private promises: LocatedPromise[] = [];
     // JS:
     // JS:   public evaluate(value: unknown): RpcPayload {
-    // JS:     return this.evaluateWithDepth(value, 0);
-    // JS:   }
     /// Evaluates a complete wire expression.
     pub fn evaluate(&mut self, value: WireValue) -> Result<RpcPayload> {
+        // JS:     return this.evaluateWithDepth(value, 0);
         self.evaluate_with_depth(value, 0)
+        // JS:   }
     }
     // JS:
     // JS:   private evaluateWithDepth(value: unknown, depth: number): RpcPayload {
-    // JS:     let payload = RpcPayload.forEvaluate(this.hooks, this.promises);
-    // JS:     try {
-    // JS:       payload.value = this.evaluateImpl(value, payload, "value", depth);
-    // JS:       return payload;
-    // JS:     } catch (err) {
-    // JS:       payload.dispose();
-    // JS:       throw err;
-    // JS:     }
-    // JS:   }
     fn evaluate_with_depth(&mut self, value: WireValue, depth: usize) -> Result<RpcPayload> {
-        Ok(RpcPayload::from_app_return(
-            self.evaluate_impl(value, depth)?,
-        ))
+        // JS:     let payload = RpcPayload.forEvaluate(this.hooks, this.promises);
+        // Rust constructs the owned payload after successfully evaluating its value.
+        // JS:     try {
+        // JS:       payload.value = this.evaluateImpl(value, payload, "value", depth);
+        let value = self.evaluate_impl(value, depth)?;
+        // JS:       return payload;
+        Ok(RpcPayload::from_app_return(value))
+        // JS:     } catch (err) {
+        // JS:       payload.dispose();
+        // RUST-DIFF(local refcount): partially evaluated values are released by `Drop` on error.
+        // JS:       throw err;
+        // Error propagation is represented by `?` above.
+        // JS:     }
+        // JS:   }
     }
     // JS:
     // JS:   // Evaluate the value without destroying it.
+    // Evaluate the value without destroying it.
     // JS:   public evaluateCopy(value: unknown): RpcPayload {
-    // JS:     return this.evaluate(structuredClone(value));
-    // JS:   }
     /// Evaluates a cloned wire expression without mutating the caller's tree.
     pub fn evaluate_copy(&mut self, value: &WireValue) -> Result<RpcPayload> {
+        // JS:     return this.evaluate(structuredClone(value));
         self.evaluate(value.clone())
+        // JS:   }
     }
     // JS:
     // JS:   private evaluateImpl(
