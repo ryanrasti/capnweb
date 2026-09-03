@@ -940,20 +940,21 @@ impl<'a> Devaluator<'a> {
     }
     // JS:
     // JS:   private devaluateHook(type: "export" | "promise" | "writable", hook: StubHook): unknown {
-    // JS:     if (!this.exports) this.exports = [];
-    // JS:     let exportId = type === "promise" ? this.exporter.exportPromise(hook)
-    // JS:                                       : this.exporter.exportStub(hook);
-    // JS:     this.exports.push(exportId);
-    // JS:     return [type, exportId];
-    // JS:   }
     fn devaluate_hook(&mut self, kind: &'static str, hook: StubHook) -> Result<WireValue> {
+        // JS:     if (!this.exports) this.exports = [];
+        // `exports` is initialized with the Rust devaluator.
+        // JS:     let exportId = type === "promise" ? this.exporter.exportPromise(hook)
         let export_id = if kind == "promise" {
             self.exporter.export_promise(hook)?
+        // JS:                                       : this.exporter.exportStub(hook);
         } else {
             self.exporter.export_stub(hook)?
         };
+        // JS:     this.exports.push(exportId);
         self.exports.push(export_id);
+        // JS:     return [type, exportId];
         Ok(wire_tag(kind, vec![WireValue::Number(export_id.into())]))
+        // JS:   }
     }
     // JS: }
 }
@@ -1504,132 +1505,213 @@ impl<'a> Evaluator<'a> {
                     // JS:
                     // JS:         case "import":
                     // JS:         case "pipeline": {
-                    // JS:           // It's an "import" from the perspective of the sender, so it's an export from our
-                    // JS:           // side. In other words, the sender is passing our own object back to us.
-                    // JS:
-                    // JS:           if (value.length < 2 || value.length > 4) {
-                    // JS:             break;   // report error below
-                    // JS:           }
-                    // JS:
-                    // JS:           // First parameter is import ID (from the sender's perspective, so export ID from
-                    // JS:           // ours).
-                    // JS:           if (typeof value[1] != "number") {
-                    // JS:             break;   // report error below
-                    // JS:           }
-                    // JS:
-                    // JS:           let hook = this.importer.getExport(value[1]);
-                    // JS:           if (!hook) {
-                    // JS:             throw new Error(`no such entry on exports table: ${value[1]}`);
-                    // JS:           }
-                    // JS:
-                    // JS:           let isPromise = value[0] == "pipeline";
-                    // JS:
-                    // JS:           let addStub = (hook: StubHook) => {
-                    // JS:             if (isPromise) {
-                    // JS:               let promise = new RpcPromise(hook, []);
-                    // JS:               this.promises.push({promise, parent, property});
-                    // JS:               return promise;
-                    // JS:             } else {
-                    // JS:               this.hooks.push(hook);
-                    // JS:               return new RpcPromise(hook, []);
-                    // JS:             }
-                    // JS:           };
-                    // JS:
-                    // JS:           if (value.length == 2) {
-                    // JS:             // Just referencing the export itself.
-                    // JS:             if (isPromise) {
-                    // JS:               // We need to use hook.get([]) to make sure we get a promise hook.
-                    // JS:               return addStub(hook.get([]));
-                    // JS:             } else {
-                    // JS:               // dup() returns a stub hook.
-                    // JS:               return addStub(hook.dup());
-                    // JS:             }
-                    // JS:           }
-                    // JS:
-                    // JS:           // Second parameter, if given, is a property path.
-                    // JS:           let path = value[2];
-                    // JS:           if (!(path instanceof Array)) {
-                    // JS:             break;  // report error below
-                    // JS:           }
-                    // JS:           if (!path.every(
-                    // JS:               part => { return typeof part == "string" || typeof part == "number"; })) {
-                    // JS:             break;  // report error below
-                    // JS:           }
-                    // JS:
-                    // JS:           if (value.length == 3) {
-                    // JS:             // Just referencing the path, not a call.
-                    // JS:             return addStub(hook.get(path));
-                    // JS:           }
-                    // JS:
-                    // JS:           // Third parameter, if given, is call arguments. The sender has identified a function
-                    // JS:           // and wants us to call it.
-                    // JS:           //
-                    // JS:           // Usually this is used with "pipeline", in which case we evaluate to an
-                    // JS:           // RpcPromise. However, this can be used with "import", in which case the caller is
-                    // JS:           // asking that the result be coerced to RpcStub. This distinction matters if the
-                    // JS:           // result of this evaluation is to be passed as arguments to another call -- promises
-                    // JS:           // must be resolved in advance, but stubs can be passed immediately.
-                    // JS:           let args = value[3];
-                    // JS:           if (!(args instanceof Array)) {
-                    // JS:             break;  // report error below
-                    // JS:           }
-                    // JS:
-                    // JS:           // We need a new evaluator for the args, to build a separate payload.
-                    // JS:           let subEval = new Evaluator(this.importer);
-                    // JS:           args = subEval.evaluateWithDepth([args], depth);
-                    // JS:
-                    // JS:           return addStub(hook.call(path, args));
-                    // JS:         }
-                    "import" | "pipeline" => self.evaluate_import_expression(expression, depth),
+                    "import" | "pipeline" => {
+                        // JS:           // It's an "import" from the perspective of the sender, so it's an export from our
+                        // JS:           // side. In other words, the sender is passing our own object back to us.
+                        // JS:
+                        // JS:           if (value.length < 2 || value.length > 4) {
+                        if !(2..=4).contains(&expression.len()) {
+                            // JS:             break;   // report error below
+                            return Err(unknown_special(&expression));
+                            // JS:           }
+                        }
+                        // JS:
+                        // JS:           // First parameter is import ID (from the sender's perspective, so export ID from
+                        // JS:           // ours).
+                        // JS:           if (typeof value[1] != "number") {
+                        let export_id = wire_id(&expression[1])?;
+                        // JS:             break;   // report error below
+                        // `wire_id()` reports the malformed expression.
+                        // JS:           }
+                        // JS:
+                        // JS:           let hook = this.importer.getExport(value[1]);
+                        let mut hook = self.importer.get_export(export_id).ok_or_else(|| {
+                            Error::Message(format!("no such entry on exports table: {export_id}"))
+                        })?;
+                        // JS:           if (!hook) {
+                        // JS:             throw new Error(`no such entry on exports table: ${value[1]}`);
+                        // Missing exports produce the error above.
+                        // JS:           }
+                        // JS:
+                        // JS:           let isPromise = value[0] == "pipeline";
+                        let is_promise = tag == "pipeline";
+                        // JS:
+                        // JS:           let addStub = (hook: StubHook) => {
+                        let add_stub = |hook: StubHook| {
+                            // JS:             if (isPromise) {
+                            if is_promise {
+                                // JS:               let promise = new RpcPromise(hook, []);
+                                // JS:               this.promises.push({promise, parent, property});
+                                // JS:               return promise;
+                                CapnwebValue::RpcPromise(crate::core::RpcPromise::from_hook(
+                                    hook,
+                                    Vec::new(),
+                                ))
+                            // JS:             } else {
+                            } else {
+                                // JS:               this.hooks.push(hook);
+                                // JS:               return new RpcPromise(hook, []);
+                                CapnwebValue::Stub(crate::core::RpcStub::from_hook(hook, None))
+                                // JS:             }
+                            }
+                            // JS:           };
+                        };
+                        // JS:
+                        // JS:           if (value.length == 2) {
+                        if expression.len() == 2 {
+                            // JS:             // Just referencing the export itself.
+                            // JS:             if (isPromise) {
+                            if is_promise {
+                                // JS:               // We need to use hook.get([]) to make sure we get a promise hook.
+                                // JS:               return addStub(hook.get([]));
+                                hook = hook.get(Vec::new())?;
+                                // JS:             } else {
+                            }
+                            // JS:               // dup() returns a stub hook.
+                            // JS:               return addStub(hook.dup());
+                            // `get_export()` already returned a shared hook clone.
+                            // JS:             }
+                            // JS:           }
+                            return Ok(add_stub(hook));
+                        }
+                        // JS:
+                        // JS:           // Second parameter, if given, is a property path.
+                        // JS:           let path = value[2];
+                        let path = property_path_from_wire(&expression[2])?;
+                        // JS:           if (!(path instanceof Array)) {
+                        // JS:             break;  // report error below
+                        // JS:           }
+                        // JS:           if (!path.every(
+                        // JS:               part => { return typeof part == "string" || typeof part == "number"; })) {
+                        // JS:             break;  // report error below
+                        // JS:           }
+                        // JS:
+                        // JS:           if (value.length == 3) {
+                        if expression.len() == 3 {
+                            // JS:             // Just referencing the path, not a call.
+                            // JS:             return addStub(hook.get(path));
+                            return Ok(add_stub(hook.get(path)?));
+                            // JS:           }
+                        }
+                        // JS:
+                        // JS:           // Third parameter, if given, is call arguments. The sender has identified a function
+                        // JS:           // and wants us to call it.
+                        // JS:           //
+                        // JS:           // Usually this is used with "pipeline", in which case we evaluate to an
+                        // JS:           // RpcPromise. However, this can be used with "import", in which case the caller is
+                        // JS:           // asking that the result be coerced to RpcStub. This distinction matters if the
+                        // JS:           // result of this evaluation is to be passed as arguments to another call -- promises
+                        // JS:           // must be resolved in advance, but stubs can be passed immediately.
+                        // JS:           let args = value[3];
+                        let args = expression.pop().expect("four-element import expression");
+                        // JS:           if (!(args instanceof Array)) {
+                        // JS:             break;  // report error below
+                        // JS:           }
+                        // JS:
+                        // JS:           // We need a new evaluator for the args, to build a separate payload.
+                        // JS:           let subEval = new Evaluator(this.importer);
+                        // The same evaluator can recurse because Rust borrows it exclusively.
+                        // JS:           args = subEval.evaluateWithDepth([args], depth);
+                        let args = self.evaluate_with_depth(WireValue::Array(vec![args]), depth)?;
+                        // JS:
+                        // JS:           return addStub(hook.call(path, args));
+                        Ok(add_stub(hook.call(path, args)?))
+                        // JS:         }
+                    }
                     // JS:
                     // JS:         case "remap": {
-                    // JS:           if (value.length !== 5 ||
-                    // JS:               typeof value[1] !== "number" ||
-                    // JS:               !(value[2] instanceof Array) ||
-                    // JS:               !(value[3] instanceof Array) ||
-                    // JS:               !(value[4] instanceof Array)) {
-                    // JS:             break;   // report error below
-                    // JS:           }
-                    // JS:
-                    // JS:           let hook = this.importer.getExport(value[1]);
-                    // JS:           if (!hook) {
-                    // JS:             throw new Error(`no such entry on exports table: ${value[1]}`);
-                    // JS:           }
-                    // JS:
-                    // JS:           let path = value[2];
-                    // JS:           if (!path.every(
-                    // JS:               part => { return typeof part == "string" || typeof part == "number"; })) {
-                    // JS:             break;  // report error below
-                    // JS:           }
-                    // JS:
-                    // JS:           let captures: StubHook[] = value[3].map(cap => {
-                    // JS:             if (!(cap instanceof Array) ||
-                    // JS:                 cap.length !== 2 ||
-                    // JS:                 (cap[0] !== "import" && cap[0] !== "export") ||
-                    // JS:                 typeof cap[1] !== "number") {
-                    // JS:               throw new TypeError(`unknown map capture: ${JSON.stringify(cap)}`);
-                    // JS:             }
-                    // JS:
-                    // JS:             if (cap[0] === "export") {
-                    // JS:               return this.importer.importStub(cap[1]);
-                    // JS:             } else {
-                    // JS:               let exp = this.importer.getExport(cap[1]);
-                    // JS:               if (!exp) {
-                    // JS:                 throw new Error(`no such entry on exports table: ${cap[1]}`);
-                    // JS:               }
-                    // JS:               return exp.dup();
-                    // JS:             }
-                    // JS:           });
-                    // JS:
-                    // JS:           let instructions = value[4];
-                    // JS:
-                    // JS:           let resultHook = hook.map(path, captures, instructions);
-                    // JS:
-                    // JS:           let promise = new RpcPromise(resultHook, []);
-                    // JS:           this.promises.push({promise, parent, property});
-                    // JS:           return promise;
-                    // JS:         }
-                    "remap" => self.evaluate_remap(expression),
+                    "remap" => {
+                        // JS:           if (value.length !== 5 ||
+                        // JS:               typeof value[1] !== "number" ||
+                        // JS:               !(value[2] instanceof Array) ||
+                        // JS:               !(value[3] instanceof Array) ||
+                        // JS:               !(value[4] instanceof Array)) {
+                        if expression.len() != 5 {
+                            // JS:             break;   // report error below
+                            return Err(unknown_special(&expression));
+                            // JS:           }
+                        }
+                        // JS:
+                        // JS:           let hook = this.importer.getExport(value[1]);
+                        let export_id = wire_id(&expression[1])?;
+                        let hook = self.importer.get_export(export_id).ok_or_else(|| {
+                            Error::Message(format!("no such entry on exports table: {export_id}"))
+                        })?;
+                        // JS:           if (!hook) {
+                        // JS:             throw new Error(`no such entry on exports table: ${value[1]}`);
+                        // Missing exports produce the error above.
+                        // JS:           }
+                        // JS:
+                        // JS:           let path = value[2];
+                        let path = property_path_from_wire(&expression[2])?;
+                        // JS:           if (!path.every(
+                        // JS:               part => { return typeof part == "string" || typeof part == "number"; })) {
+                        // JS:             break;  // report error below
+                        // JS:           }
+                        // JS:
+                        // JS:           let captures: StubHook[] = value[3].map(cap => {
+                        let captures = expression[3]
+                            .as_array()
+                            .ok_or_else(|| unknown_special(&expression))?
+                            .iter()
+                            .map(|capture| {
+                                // JS:             if (!(cap instanceof Array) ||
+                                // JS:                 cap.length !== 2 ||
+                                // JS:                 (cap[0] !== "import" && cap[0] !== "export") ||
+                                // JS:                 typeof cap[1] !== "number") {
+                                let capture = capture
+                                    .as_array()
+                                    .filter(|capture| capture.len() == 2)
+                                    .ok_or_else(|| {
+                                        Error::Type(format!("unknown map capture: {capture}"))
+                                    })?;
+                                let id = wire_id(&capture[1])?;
+                                // JS:               throw new TypeError(`unknown map capture: ${JSON.stringify(cap)}`);
+                                // Invalid captures produce the error above.
+                                // JS:             }
+                                // JS:
+                                // JS:             if (cap[0] === "export") {
+                                if capture[0].as_str() == Some("export") {
+                                    // JS:               return this.importer.importStub(cap[1]);
+                                    self.importer.import_stub(id)
+                                // JS:             } else {
+                                } else if capture[0].as_str() == Some("import") {
+                                    // JS:               let exp = this.importer.getExport(cap[1]);
+                                    let exp = self.importer.get_export(id).ok_or_else(|| {
+                                        Error::Message(format!(
+                                            "no such entry on exports table: {id}"
+                                        ))
+                                    })?;
+                                    // JS:               if (!exp) {
+                                    // JS:                 throw new Error(`no such entry on exports table: ${cap[1]}`);
+                                    // JS:               }
+                                    // JS:               return exp.dup();
+                                    Ok(exp)
+                                // JS:             }
+                                } else {
+                                    Err(Error::Type(format!("unknown map capture: {capture:?}")))
+                                }
+                                // JS:           });
+                            })
+                            .collect::<Result<Vec<_>>>()?;
+                        // JS:
+                        // JS:           let instructions = value[4];
+                        let instructions = expression[4]
+                            .as_array()
+                            .ok_or_else(|| unknown_special(&expression))?
+                            .clone();
+                        // JS:
+                        // JS:           let resultHook = hook.map(path, captures, instructions);
+                        let result_hook = hook.map(path, captures, instructions)?;
+                        // JS:
+                        // JS:           let promise = new RpcPromise(resultHook, []);
+                        let promise = crate::core::RpcPromise::from_hook(result_hook, Vec::new());
+                        // JS:           this.promises.push({promise, parent, property});
+                        // Recursive payload delivery discovers the promise in the owned value tree.
+                        // JS:           return promise;
+                        Ok(CapnwebValue::RpcPromise(promise))
+                        // JS:         }
+                    }
                     // JS:
                     // JS:         case "export":
                     // JS:         case "promise":
@@ -1749,81 +1831,6 @@ impl<'a> Evaluator<'a> {
             // JS:     }
         }
         // JS:   }
-    }
-    fn evaluate_import_expression(
-        &mut self,
-        mut expression: Vec<WireValue>,
-        depth: usize,
-    ) -> Result<CapnwebValue> {
-        if !(2..=4).contains(&expression.len()) {
-            return Err(unknown_special(&expression));
-        }
-        let pipeline = expression[0].as_str() == Some("pipeline");
-        let export_id = wire_id(&expression[1])?;
-        let mut hook = self.importer.get_export(export_id).ok_or_else(|| {
-            Error::Message(format!("no such entry on exports table: {export_id}"))
-        })?;
-
-        if expression.len() >= 3 {
-            let path = property_path_from_wire(&expression[2])?;
-            if expression.len() == 4 {
-                let arguments = expression.pop().expect("four-element expression");
-                let payload = self.evaluate_with_depth(WireValue::Array(vec![arguments]), depth)?;
-                hook = hook.call(path, payload)?;
-            } else {
-                hook = hook.get(path)?;
-            }
-        } else if pipeline {
-            hook = hook.get(Vec::new())?;
-        }
-
-        if pipeline {
-            Ok(CapnwebValue::RpcPromise(
-                crate::core::RpcPromise::from_hook(hook, Vec::new()),
-            ))
-        } else {
-            Ok(CapnwebValue::Stub(crate::core::RpcStub::from_hook(
-                hook, None,
-            )))
-        }
-    }
-
-    fn evaluate_remap(&mut self, expression: Vec<WireValue>) -> Result<CapnwebValue> {
-        if expression.len() != 5 {
-            return Err(unknown_special(&expression));
-        }
-        let export_id = wire_id(&expression[1])?;
-        let hook = self.importer.get_export(export_id).ok_or_else(|| {
-            Error::Message(format!("no such entry on exports table: {export_id}"))
-        })?;
-        let path = property_path_from_wire(&expression[2])?;
-        let captures = expression[3]
-            .as_array()
-            .ok_or_else(|| unknown_special(&expression))?
-            .iter()
-            .map(|capture| {
-                let capture = capture
-                    .as_array()
-                    .filter(|capture| capture.len() == 2)
-                    .ok_or_else(|| Error::Type(format!("unknown map capture: {capture}")))?;
-                let id = wire_id(&capture[1])?;
-                match capture[0].as_str() {
-                    Some("export") => self.importer.import_stub(id),
-                    Some("import") => self.importer.get_export(id).ok_or_else(|| {
-                        Error::Message(format!("no such entry on exports table: {id}"))
-                    }),
-                    _ => Err(Error::Type(format!("unknown map capture: {capture:?}"))),
-                }
-            })
-            .collect::<Result<Vec<_>>>()?;
-        let instructions = expression[4]
-            .as_array()
-            .ok_or_else(|| unknown_special(&expression))?
-            .clone();
-        let result = hook.map(path, captures, instructions)?;
-        Ok(CapnwebValue::RpcPromise(
-            crate::core::RpcPromise::from_hook(result, Vec::new()),
-        ))
     }
     // JS: }
 }
