@@ -2387,155 +2387,60 @@ enum FollowPathResult {
 // JS:
 // JS: function followPath(value: unknown, parent: object | undefined,
 // JS:                     path: PropertyPath, owner: RpcPayload | null): FollowPathResult {
-// JS:   for (let i = 0; i < path.length; i++) {
-// JS:     parent = <object>value;
-// JS:
-// JS:     let part = path[i];
-// JS:     if (part in Object.prototype) {
-// JS:       // Don't allow messing with Object.prototype properties over RPC. We block these even if
-// JS:       // the specific object has overridden them for consistency with the deserialization code,
-// JS:       // which will refuse to deserialize an object containing such properties. Anyway, it's
-// JS:       // impossible for a normal client to even request these because accessing Object prototype
-// JS:       // properties on a stub will resolve to the local prototype property, not making an RPC at
-// JS:       // all.
-// JS:       value = undefined;
-// JS:       continue;
-// JS:     }
-// JS:
-// JS:     let kind = typeForRpc(value);
-// JS:     switch (kind) {
-// JS:       case "object":
-// JS:       case "function":
-// JS:         // Must be own property, NOT inherited from a prototype.
-// JS:         if (Object.hasOwn(<object>value, part)) {
-// JS:           value = (<any>value)[part];
-// JS:         } else {
-// JS:           value = undefined;
-// JS:         }
-// JS:         break;
-// JS:
-// JS:       case "array":
-// JS:         // For arrays, restrict specifically to numeric indexes, to be consistent with
-// JS:         // serialization, which only sends a flat list.
-// JS:         if (Number.isInteger(part) && <number>part >= 0) {
-// JS:           value = (<any>value)[part];
-// JS:         } else {
-// JS:           value = undefined;
-// JS:         }
-// JS:         break;
-// JS:
-// JS:       case "rpc-target":
-// JS:       case "rpc-thenable": {
-// JS:         // Must be prototype property, and must NOT be inherited from `Object`.
-// JS:         if (Object.hasOwn(<object>value, part)) {
-// JS:           // We throw an error in this case, rather than return undefined, because otherwise
-// JS:           // people tend to get confused about this. If you don't want it to be possible to
-// JS:           // probe the existence of your instance properties, make them properly private (prefix
-// JS:           // with #).
-// JS:           throw new TypeError(
-// JS:               `Attempted to access property '${part}', which is an instance property of the ` +
-// JS:               `RpcTarget. To avoid leaking private internals, instance properties cannot be ` +
-// JS:               `accessed over RPC. If you want to make this property available over RPC, define ` +
-// JS:               `it as a method or getter on the class, instead of an instance property.`);
-// JS:         } else {
-// JS:           value = (<any>value)[part];
-// JS:         }
-// JS:
-// JS:         // Since we're descending into the RpcTarget, the rest of the path is not "owned" by any
-// JS:         // RpcPayload.
-// JS:         owner = null;
-// JS:         break;
-// JS:       }
-// JS:
-// JS:       case "stub":
-// JS:       case "rpc-promise": {
-// JS:         let {hook: hook, pathIfPromise} = unwrapStubAndPath(<RpcStub>value);
-// JS:         return { hook, remainingPath:
-// JS:             pathIfPromise ? pathIfPromise.concat(path.slice(i)) : path.slice(i) };
-// JS:       }
-// JS:
-// JS:       case "writable":
-// JS:         // TODO: How do we pipeline on WritableStream? We can't expose the literal WritableStream
-// JS:         //   interface because the caller would call getWriter() which would conflict with the
-// JS:         //   RPC system calling it later. Perhaps the caller needs to somehow indicate, on the
-// JS:         //   client side, "this pipelined property is expected to be a WritableStream", and then
-// JS:         //   we can give them a WritableStream, and somehow this correctly pipelines... idk.
-// JS:         value = undefined;
-// JS:         break;
-// JS:
-// JS:       case "readable":
-// JS:         // TODO: Do we want to support pipelining on ReadableStream at all? It doesn't seem like
-// JS:         //   it really makes sense... you might as well just wait for the promise for the
-// JS:         //   ReadableStream to resolve, and then read it, because you'll get bytes just as fast.
-// JS:         value = undefined;
-// JS:         break;
-// JS:
-// JS:       case "primitive":
-// JS:       case "bigint":
-// JS:       case "bytes":
-// JS:       case "blob":
-// JS:       case "date":
-// JS:       case "error":
-// JS:       case "url":
-// JS:       case "headers":
-// JS:       case "request":
-// JS:       case "response":
-// JS:         // These have no properties that can be accessed remotely.
-// JS:         value = undefined;
-// JS:         break;
-// JS:
-// JS:       case "undefined":
-// JS:         // Intentionally produce TypeError.
-// JS:         value = (value as any)[part];
-// JS:         break;
-// JS:
-// JS:       case "unsupported": {
-// JS:         if (i === 0) {
-// JS:           throw new TypeError(`RPC stub points at a non-serializable type.`);
-// JS:         } else {
-// JS:           let prefix = path.slice(0, i).join(".");
-// JS:           let remainder = path.slice(0, i).join(".");
-// JS:           throw new TypeError(
-// JS:               `'${prefix}' is not a serializable type, so property ${remainder} cannot ` +
-// JS:               `be accessed.`);
-// JS:         }
-// JS:       }
-// JS:
-// JS:       default:
-// JS:         kind satisfies never;
-// JS:         throw new TypeError("unreachable");
-// JS:     }
-// JS:   }
-// JS:
-// JS:   // If we reached a promise, we actually want the caller to forward to the promise, not return
-// JS:   // the promise itself.
-// JS:   if (value instanceof RpcPromise) {
-// JS:     let {hook: hook, pathIfPromise} = unwrapStubAndPath(<RpcStub>value);
-// JS:     return { hook, remainingPath: pathIfPromise || [] };
-// JS:   }
-// JS:
-// JS:   // We don't validate the final value itself because we don't know the intended use yet. If it's
-// JS:   // for a call, any callable is valid. If it's for get(), then any serializable value is valid.
-// JS:   return {
-// JS:     value,
-// JS:     parent,
-// JS:     owner,
-// JS:   };
-// JS: }
 fn follow_path(
     mut value: CapnwebValue,
     path: PropertyPath,
     owner: Option<RpcPayload>,
 ) -> Result<FollowPathResult> {
+    // JS:   for (let i = 0; i < path.length; i++) {
     for (index, part) in path.iter().enumerate() {
+        // JS:     parent = <object>value;
+        // Rust values are moved through the traversal, so no separate parent borrow is retained.
+        // JS:
+        // JS:     let part = path[i];
         let remainder = || path[index..].to_vec();
+        // JS:     if (part in Object.prototype) {
+        if matches!(part, PropertyKey::String(name) if is_object_prototype_property(name)) {
+            // JS:       // Don't allow messing with Object.prototype properties over RPC. We block these even if
+            // JS:       // the specific object has overridden them for consistency with the deserialization code,
+            // JS:       // which will refuse to deserialize an object containing such properties. Anyway, it's
+            // JS:       // impossible for a normal client to even request these because accessing Object prototype
+            // JS:       // properties on a stub will resolve to the local prototype property, not making an RPC at
+            // JS:       // all.
+            // JS:       value = undefined;
+            value = CapnwebValue::Null;
+            // JS:       continue;
+            continue;
+            // JS:     }
+        }
+        // JS:
+        // JS:     let kind = typeForRpc(value);
+        // The Rust enum provides the type classification.
+        // JS:     switch (kind) {
         value = match value {
+            // JS:       case "object":
+            // JS:       case "function":
+            // JS:         // Must be own property, NOT inherited from a prototype.
+            // JS:         if (Object.hasOwn(<object>value, part)) {
+            // JS:           value = (<any>value)[part];
+            // JS:         } else {
+            // JS:           value = undefined;
+            // JS:         }
+            // JS:         break;
             CapnwebValue::Object(mut object) => match part {
-                PropertyKey::String(name) if !is_object_prototype_property(name) => {
-                    object.remove(name).unwrap_or(CapnwebValue::Null)
-                }
-                _ => CapnwebValue::Null,
+                PropertyKey::String(name) => object.remove(name).unwrap_or(CapnwebValue::Null),
+                PropertyKey::Number(_) => CapnwebValue::Null,
             },
+            // JS:
+            // JS:       case "array":
+            // JS:         // For arrays, restrict specifically to numeric indexes, to be consistent with
+            // JS:         // serialization, which only sends a flat list.
+            // JS:         if (Number.isInteger(part) && <number>part >= 0) {
+            // JS:           value = (<any>value)[part];
+            // JS:         } else {
+            // JS:           value = undefined;
+            // JS:         }
+            // JS:         break;
             CapnwebValue::Array(array) => match part {
                 PropertyKey::Number(number)
                     if number.is_finite()
@@ -2550,6 +2455,29 @@ fn follow_path(
                 }
                 _ => CapnwebValue::Null,
             },
+            // JS:
+            // JS:       case "rpc-target":
+            // JS:       case "rpc-thenable": {
+            // JS:         // Must be prototype property, and must NOT be inherited from `Object`.
+            // JS:         if (Object.hasOwn(<object>value, part)) {
+            // JS:           // We throw an error in this case, rather than return undefined, because otherwise
+            // JS:           // people tend to get confused about this. If you don't want it to be possible to
+            // JS:           // probe the existence of your instance properties, make them properly private (prefix
+            // JS:           // with #).
+            // JS:           throw new TypeError(
+            // JS:               `Attempted to access property '${part}', which is an instance property of the ` +
+            // JS:               `RpcTarget. To avoid leaking private internals, instance properties cannot be ` +
+            // JS:               `accessed over RPC. If you want to make this property available over RPC, define ` +
+            // JS:               `it as a method or getter on the class, instead of an instance property.`);
+            // JS:         } else {
+            // JS:           value = (<any>value)[part];
+            // JS:         }
+            // JS:
+            // JS:         // Since we're descending into the RpcTarget, the rest of the path is not "owned" by any
+            // JS:         // RpcPayload.
+            // JS:         owner = null;
+            // Generated Rust target dispatch forwards the remaining path directly.
+            // JS:         break;
             CapnwebValue::Target(target) => {
                 return Ok(FollowPathResult::Hook {
                     hook: TargetStubHook::create(target, false),
@@ -2562,6 +2490,13 @@ fn follow_path(
                     remaining_path: remainder(),
                 });
             }
+            // JS:       }
+            // JS:
+            // JS:       case "stub":
+            // JS:       case "rpc-promise": {
+            // JS:         let {hook: hook, pathIfPromise} = unwrapStubAndPath(<RpcStub>value);
+            // JS:         return { hook, remainingPath:
+            // JS:             pathIfPromise ? pathIfPromise.concat(path.slice(i)) : path.slice(i) };
             CapnwebValue::Stub(stub) => {
                 let (hook, promised_path) = unwrap_stub_and_path(&stub);
                 let mut remaining_path = promised_path.unwrap_or_default();
@@ -2580,6 +2515,37 @@ fn follow_path(
                     remaining_path,
                 });
             }
+            // JS:       }
+            // JS:
+            // JS:       case "writable":
+            // JS:         // TODO: How do we pipeline on WritableStream? We can't expose the literal WritableStream
+            // JS:         //   interface because the caller would call getWriter() which would conflict with the
+            // JS:         //   RPC system calling it later. Perhaps the caller needs to somehow indicate, on the
+            // JS:         //   client side, "this pipelined property is expected to be a WritableStream", and then
+            // JS:         //   we can give them a WritableStream, and somehow this correctly pipelines... idk.
+            // JS:         value = undefined;
+            // JS:         break;
+            // JS:
+            // JS:       case "readable":
+            // JS:         // TODO: Do we want to support pipelining on ReadableStream at all? It doesn't seem like
+            // JS:         //   it really makes sense... you might as well just wait for the promise for the
+            // JS:         //   ReadableStream to resolve, and then read it, because you'll get bytes just as fast.
+            // JS:         value = undefined;
+            // JS:         break;
+            // JS:
+            // JS:       case "primitive":
+            // JS:       case "bigint":
+            // JS:       case "bytes":
+            // JS:       case "blob":
+            // JS:       case "date":
+            // JS:       case "error":
+            // JS:       case "url":
+            // JS:       case "headers":
+            // JS:       case "request":
+            // JS:       case "response":
+            // JS:         // These have no properties that can be accessed remotely.
+            // JS:         value = undefined;
+            // JS:         break;
             CapnwebValue::Null
             | CapnwebValue::Bool(_)
             | CapnwebValue::Number(_)
@@ -2587,18 +2553,55 @@ fn follow_path(
             | CapnwebValue::BigInt(_)
             | CapnwebValue::Bytes(_)
             | CapnwebValue::Error(_) => CapnwebValue::Null,
+            // JS:
+            // JS:       case "undefined":
+            // JS:         // Intentionally produce TypeError.
+            // JS:         value = (value as any)[part];
+            // JS:         break;
+            // JS:
+            // JS:       case "unsupported": {
+            // JS:         if (i === 0) {
+            // JS:           throw new TypeError(`RPC stub points at a non-serializable type.`);
+            // JS:         } else {
+            // JS:           let prefix = path.slice(0, i).join(".");
+            // JS:           let remainder = path.slice(0, i).join(".");
+            // JS:           throw new TypeError(
+            // JS:               `'${prefix}' is not a serializable type, so property ${remainder} cannot ` +
+            // JS:               `be accessed.`);
+            // JS:         }
+            // JS:       }
+            // JS:
+            // JS:       default:
+            // JS:         kind satisfies never;
+            // JS:         throw new TypeError("unreachable");
+            // JS:     }
         };
+        // JS:   }
     }
-
+    // JS:
+    // JS:   // If we reached a promise, we actually want the caller to forward to the promise, not return
+    // JS:   // the promise itself.
+    // JS:   if (value instanceof RpcPromise) {
     if let CapnwebValue::RpcPromise(promise) = value {
+        // JS:     let {hook: hook, pathIfPromise} = unwrapStubAndPath(<RpcStub>value);
         let (hook, path) = unwrap_stub_and_path(&promise.stub);
+        // JS:     return { hook, remainingPath: pathIfPromise || [] };
         return Ok(FollowPathResult::Hook {
             hook,
             remaining_path: path.unwrap_or_default(),
         });
+        // JS:   }
     }
-
+    // JS:
+    // JS:   // We don't validate the final value itself because we don't know the intended use yet. If it's
+    // JS:   // for a call, any callable is valid. If it's for get(), then any serializable value is valid.
+    // JS:   return {
+    // JS:     value,
+    // JS:     parent,
+    // JS:     owner,
+    // JS:   };
     Ok(FollowPathResult::Value { value, owner })
+    // JS: }
 }
 
 fn is_object_prototype_property(property: &str) -> bool {
