@@ -1156,517 +1156,71 @@ impl<'a> Evaluator<'a> {
     // JS:
     // JS:   private evaluateImpl(
     // JS:       value: unknown, parent: object, property: string | number, depth: number): unknown {
-    // JS:     let maxDepth = this.limits.maxDepth;
-    // JS:     if (depth >= maxDepth) {
-    // JS:       throw new TypeError(
-    // JS:           `Deserialization exceeded maximum allowed message depth of ${maxDepth}.`);
-    // JS:     }
-    // JS:
-    // JS:     // At structuredClonable level, some native types pass through devaluation unencoded: Date and
-    // JS:     // BigInt (as well as undefined and non-finite numbers, which the generic paths below already
-    // JS:     // handle). Note that bytes and errors are tuple-encoded at every level, so raw `Uint8Array`
-    // JS:     // and `Error` values are intentionally *not* accepted here.
-    // JS:     if (this.encodingLevel === "structuredClonable") {
-    // JS:       if (value instanceof Date || typeof value === "bigint") {
-    // JS:         return value;
-    // JS:       }
-    // JS:     }
-    // JS:
-    // JS:     if (value instanceof Array) {
-    // JS:       if (value.length == 1 && value[0] instanceof Array) {
-    // JS:         // Escaped array. Evaluate the contents.
-    // JS:         let result = value[0];
-    // JS:         for (let i = 0; i < result.length; i++) {
-    // JS:           result[i] = this.evaluateImpl(result[i], result, i, depth + 1);
-    // JS:         }
-    // JS:         return result;
-    // JS:       } else switch (value[0]) {
-    // JS:         case "bigint":
-    // JS:           if (typeof value[1] == "string") {
-    // JS:             let digits = value[1];
-    // JS:             let maxBigIntDigits = this.limits.maxBigIntDigits;
-    // JS:             // Cap the length before the superlinear BigInt() parse (DoS guard).
-    // JS:             if (digits.length > maxBigIntDigits) {
-    // JS:               throw new TypeError(
-    // JS:                   `Deserialized bigint exceeds maximum length of ${maxBigIntDigits} digits.`);
-    // JS:             }
-    // JS:             return BigInt(digits);
-    // JS:           }
-    // JS:           break;
-    // JS:         case "date":
-    // JS:           if (value[1] === null) {
-    // JS:             return new Date(NaN);
-    // JS:           }
-    // JS:           if (typeof value[1] == "number") {
-    // JS:             return new Date(value[1]);
-    // JS:           }
-    // JS:           break;
-    // JS:         case "bytes": {
-    // JS:           let bytes: Uint8Array;
-    // JS:           // At jsonCompatibleWithBytes/structuredClonable level, bytes may already be raw.
-    // JS:           if (value[1] instanceof Uint8Array) {
-    // JS:             bytes = value[1];
-    // JS:           } else if (typeof value[1] == "string") {
-    // JS:             if (typeof Buffer !== "undefined") {
-    // JS:               bytes = Buffer.from(value[1], "base64");
-    // JS:             } else if (Uint8Array.fromBase64) {
-    // JS:               bytes = Uint8Array.fromBase64(value[1]);
-    // JS:             } else {
-    // JS:               let bs = atob(value[1]);
-    // JS:               let len = bs.length;
-    // JS:               bytes = new Uint8Array(len);
-    // JS:               for (let i = 0; i < len; i++) {
-    // JS:                 bytes[i] = bs.charCodeAt(i);
-    // JS:               }
-    // JS:             }
-    // JS:           } else {
-    // JS:             break;
-    // JS:           }
-    // JS:
-    // JS:           if (value.length === 2) {
-    // JS:             return bytes;
-    // JS:           }
-    // JS:           if (typeof value[2] !== "string") {
-    // JS:             throw new TypeError(`Unknown bytes type marker type: ${typeof value[2]}`);
-    // JS:           }
-    // JS:
-    // JS:           if (!isValidByteContainerName(value[2])) {
-    // JS:             let marker = value[2].slice(0, 64);
-    // JS:             throw new TypeError(`Unknown bytes type marker: ${marker}`);
-    // JS:           }
-    // JS:
-    // JS:           let marker = value[2];
-    // JS:           let elementSize = TYPED_ARRAY_ELEMENT_SIZE[marker];
-    // JS:           if (elementSize !== undefined && bytes.byteLength % elementSize !== 0) {
-    // JS:             throw new TypeError(
-    // JS:                 `Invalid byte length ${bytes.byteLength} for ${marker}; ` +
-    // JS:                 `expected a multiple of ${elementSize}`);
-    // JS:           }
-    // JS:
-    // JS:           // Copy exactly the decoded range rather than exposing or aliasing a pooled Buffer.
-    // JS:           let buffer = bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength);
-    // JS:           if (!NATIVE_LITTLE_ENDIAN && elementSize !== undefined) {
-    // JS:             swapByteOrder(new Uint8Array(buffer), elementSize);
-    // JS:           }
-    // JS:           switch (marker) {
-    // JS:             case "ArrayBuffer": return buffer;
-    // JS:             case "DataView": return new DataView(buffer);
-    // JS:             case "Int8Array": return new Int8Array(buffer);
-    // JS:             case "Uint8Array": return new Uint8Array(buffer);
-    // JS:             case "Uint8ClampedArray": return new Uint8ClampedArray(buffer);
-    // JS:             case "Int16Array": return new Int16Array(buffer);
-    // JS:             case "Uint16Array": return new Uint16Array(buffer);
-    // JS:             case "Int32Array": return new Int32Array(buffer);
-    // JS:             case "Uint32Array": return new Uint32Array(buffer);
-    // JS:             case "BigInt64Array": return new BigInt64Array(buffer);
-    // JS:             case "BigUint64Array": return new BigUint64Array(buffer);
-    // JS:             case "Float32Array": return new Float32Array(buffer);
-    // JS:             case "Float64Array": return new Float64Array(buffer);
-    // JS:             default: marker satisfies never;
-    // JS:           }
-    // JS:         }
-    // JS:         case "error":
-    // JS:           if (value.length >= 3 && typeof value[1] === "string" && typeof value[2] === "string") {
-    // JS:             let cls = ERROR_TYPES[value[1]] || Error;
-    // JS:             // AggregateError's constructor takes (errors, message); we pass an empty array
-    // JS:             // and patch `errors` from the props bag below.
-    // JS:             let result = cls === AggregateError ? new cls([], value[2]) : new cls(value[2]);
-    // JS:             if (typeof value[3] === "string") {
-    // JS:               result.stack = value[3];
-    // JS:             }
-    // JS:             // Optional 5th element: own properties bag. Unknown keys are assigned as own
-    // JS:             // enumerable properties so the receiver sees what the sender attached.
-    // JS:             if (value.length >= 5) {
-    // JS:               let props = value[4];
-    // JS:               if (!props || typeof props !== "object" || Array.isArray(props)) {
-    // JS:                 break;  // malformed; fall through to the "unknown special value" throw
-    // JS:               }
-    // JS:               let anyResult = <any>result;
-    // JS:               let propsObj = <Record<string, unknown>>props;
-    // JS:               for (let key of Object.keys(propsObj)) {
-    // JS:                 if (key === "name" || key === "message" || key === "stack") continue;
-    // JS:                 if (key in Object.prototype || key === "toJSON") {
-    // JS:                   // Consistent with the plain-object deserializer below: don't allow error
-    // JS:                   // properties to override Object.prototype members (e.g. __proto__, toString,
-    // JS:                   // valueOf) or toJSON. Still evaluate the inner value so any stubs are released.
-    // JS:                   this.evaluateImpl(propsObj[key], result, key, depth + 1);
-    // JS:                   continue;
-    // JS:                 }
-    // JS:                 anyResult[key] = this.evaluateImpl(propsObj[key], result, key, depth + 1);
-    // JS:               }
-    // JS:             }
-    // JS:             return result;
-    // JS:           }
-    // JS:           break;
-    // JS:         case "undefined":
-    // JS:           if (value.length === 1) {
-    // JS:             return undefined;
-    // JS:           }
-    // JS:           break;
-    // JS:         case "inf":
-    // JS:           return Infinity;
-    // JS:         case "-inf":
-    // JS:           return -Infinity;
-    // JS:         case "nan":
-    // JS:           return NaN;
-    // JS:
-    // JS:         case "url":
-    // JS:           if (value.length === 2 && typeof value[1] === "string") {
-    // JS:             return new URL(value[1]);
-    // JS:           }
-    // JS:           break;
-    // JS:
-    // JS:         case "headers":
-    // JS:           // We only need to validate that the parameter is an array, so as not to invoke an
-    // JS:           // unexpected variant of the Headers constructor. So long as it is an array then we can
-    // JS:           // rely on the constructor to perform type checking.
-    // JS:           if (value.length === 2 && value[1] instanceof Array) {
-    // JS:             return new Headers(value[1] as [string, string][]);
-    // JS:           }
-    // JS:           break;
-    // JS:
-    // JS:         case "request": {
-    // JS:           if (value.length !== 3 || typeof value[1] !== "string") break;
-    // JS:           let url = value[1] as string;
-    // JS:           let init = value[2];
-    // JS:           if (typeof init !== "object" || init === null) break;
-    // JS:
-    // JS:           // Evaluate specific properties which are expected to contain non-trivial types.
-    // JS:           if (init.body) {
-    // JS:             init.body = this.evaluateImpl(init.body, init, "body", depth + 1);
-    // JS:             if (init.body === null ||
-    // JS:                 typeof init.body === "string" ||
-    // JS:                 init.body instanceof Uint8Array ||
-    // JS:                 init.body instanceof ReadableStream) {
-    // JS:               // Acceptable types.
-    // JS:             } else {
-    // JS:               throw new TypeError("Request body must be of type ReadableStream.");
-    // JS:             }
-    // JS:           }
-    // JS:           if (init.signal) {
-    // JS:             init.signal = this.evaluateImpl(init.signal, init, "signal", depth + 1);
-    // JS:             if (!(init.signal instanceof AbortSignal)) {
-    // JS:               throw new TypeError("Request siganl must be of type AbortSignal.");
-    // JS:             }
-    // JS:           }
-    // JS:
-    // JS:           // Type-check `headers` is an array because the constructor allows multiple
-    // JS:           // representations and we don't want to allow the others.
-    // JS:           if (init.headers && !(init.headers instanceof Array)) {
-    // JS:             throw new TypeError("Request headers must be serialized as an array of pairs.");
-    // JS:           }
-    // JS:
-    // JS:           // We assume the `Request` constructor can type-check the remaining properties.
-    // JS:           let result = new Request(url, init as RequestInit);
-    // JS:
-    // JS:           if (init.body instanceof ReadableStream && result.body === undefined) {
-    // JS:             // Oh no! We must be on Firefox where request bodies are not supported, but we had a
-    // JS:             // body.
-    // JS:             let promise = fixBrokenRequestBody(result, init.body);
-    // JS:             this.promises.push({promise, parent, property});
-    // JS:             return promise;
-    // JS:           } else {
-    // JS:             return result;
-    // JS:           }
-    // JS:         }
-    // JS:
-    // JS:         case "response": {
-    // JS:           if (value.length !== 3) break;
-    // JS:
-    // JS:           let body = this.evaluateImpl(value[1], parent, property, depth + 1);
-    // JS:           if (body === null ||
-    // JS:               typeof body === "string" ||
-    // JS:               body instanceof Uint8Array ||
-    // JS:               body instanceof ReadableStream) {
-    // JS:             // Acceptable types.
-    // JS:           } else {
-    // JS:             throw new TypeError("Response body must be of type ReadableStream.");
-    // JS:           }
-    // JS:
-    // JS:           let init = value[2];
-    // JS:           if (typeof init !== "object" || init === null) break;
-    // JS:
-    // JS:           // Evaluate specific properties which are expected to contain non-trivial types.
-    // JS:           if (init.webSocket) {
-    // JS:             // `response.webSocket` is a Cloudflare Workers extension. Not (yet?) supported for
-    // JS:             // serialization.
-    // JS:             throw new TypeError("Can't deserialize a Response containing a webSocket.");
-    // JS:           }
-    // JS:
-    // JS:           // Type-check `headers` is an array because the constructor allows multiple
-    // JS:           // representations and we don't want to allow the others.
-    // JS:           if (init.headers && !(init.headers instanceof Array)) {
-    // JS:             throw new TypeError("Request headers must be serialized as an array of pairs.");
-    // JS:           }
-    // JS:
-    // JS:           return new Response(body as BodyInit | null, init as ResponseInit);
-    // JS:         }
-    // JS:
-    // JS:         case "blob": {
-    // JS:           // Wire format is strictly ["blob", type, ["readable", id]] — the encoder always streams
-    // JS:           // bytes through a pipe, so the content expression must evaluate to a ReadableStream.
-    // JS:           if (value.length !== 3 || typeof value[1] !== "string") break;
-    // JS:           let contentType = value[1] as string;
-    // JS:           let content = this.evaluateImpl(value[2], parent, property, depth + 1);
-    // JS:           if (!(content instanceof ReadableStream)) {
-    // JS:             throw new TypeError("Blob content must be serialized as a ReadableStream.");
-    // JS:           }
-    // JS:           // Reuse the RpcPromise infrastructure (same pattern as fixBrokenRequestBody): the
-    // JS:           // payload-delivery machinery resolves the promise and substitutes the real Blob before
-    // JS:           // user code sees the value.
-    // JS:           let promise = streamToBlobPromise(content, contentType);
-    // JS:           this.promises.push({promise, parent, property});
-    // JS:           return promise;
-    // JS:         }
-    // JS:
-    // JS:         case "import":
-    // JS:         case "pipeline": {
-    // JS:           // It's an "import" from the perspective of the sender, so it's an export from our
-    // JS:           // side. In other words, the sender is passing our own object back to us.
-    // JS:
-    // JS:           if (value.length < 2 || value.length > 4) {
-    // JS:             break;   // report error below
-    // JS:           }
-    // JS:
-    // JS:           // First parameter is import ID (from the sender's perspective, so export ID from
-    // JS:           // ours).
-    // JS:           if (typeof value[1] != "number") {
-    // JS:             break;   // report error below
-    // JS:           }
-    // JS:
-    // JS:           let hook = this.importer.getExport(value[1]);
-    // JS:           if (!hook) {
-    // JS:             throw new Error(`no such entry on exports table: ${value[1]}`);
-    // JS:           }
-    // JS:
-    // JS:           let isPromise = value[0] == "pipeline";
-    // JS:
-    // JS:           let addStub = (hook: StubHook) => {
-    // JS:             if (isPromise) {
-    // JS:               let promise = new RpcPromise(hook, []);
-    // JS:               this.promises.push({promise, parent, property});
-    // JS:               return promise;
-    // JS:             } else {
-    // JS:               this.hooks.push(hook);
-    // JS:               return new RpcPromise(hook, []);
-    // JS:             }
-    // JS:           };
-    // JS:
-    // JS:           if (value.length == 2) {
-    // JS:             // Just referencing the export itself.
-    // JS:             if (isPromise) {
-    // JS:               // We need to use hook.get([]) to make sure we get a promise hook.
-    // JS:               return addStub(hook.get([]));
-    // JS:             } else {
-    // JS:               // dup() returns a stub hook.
-    // JS:               return addStub(hook.dup());
-    // JS:             }
-    // JS:           }
-    // JS:
-    // JS:           // Second parameter, if given, is a property path.
-    // JS:           let path = value[2];
-    // JS:           if (!(path instanceof Array)) {
-    // JS:             break;  // report error below
-    // JS:           }
-    // JS:           if (!path.every(
-    // JS:               part => { return typeof part == "string" || typeof part == "number"; })) {
-    // JS:             break;  // report error below
-    // JS:           }
-    // JS:
-    // JS:           if (value.length == 3) {
-    // JS:             // Just referencing the path, not a call.
-    // JS:             return addStub(hook.get(path));
-    // JS:           }
-    // JS:
-    // JS:           // Third parameter, if given, is call arguments. The sender has identified a function
-    // JS:           // and wants us to call it.
-    // JS:           //
-    // JS:           // Usually this is used with "pipeline", in which case we evaluate to an
-    // JS:           // RpcPromise. However, this can be used with "import", in which case the caller is
-    // JS:           // asking that the result be coerced to RpcStub. This distinction matters if the
-    // JS:           // result of this evaluation is to be passed as arguments to another call -- promises
-    // JS:           // must be resolved in advance, but stubs can be passed immediately.
-    // JS:           let args = value[3];
-    // JS:           if (!(args instanceof Array)) {
-    // JS:             break;  // report error below
-    // JS:           }
-    // JS:
-    // JS:           // We need a new evaluator for the args, to build a separate payload.
-    // JS:           let subEval = new Evaluator(this.importer);
-    // JS:           args = subEval.evaluateWithDepth([args], depth);
-    // JS:
-    // JS:           return addStub(hook.call(path, args));
-    // JS:         }
-    // JS:
-    // JS:         case "remap": {
-    // JS:           if (value.length !== 5 ||
-    // JS:               typeof value[1] !== "number" ||
-    // JS:               !(value[2] instanceof Array) ||
-    // JS:               !(value[3] instanceof Array) ||
-    // JS:               !(value[4] instanceof Array)) {
-    // JS:             break;   // report error below
-    // JS:           }
-    // JS:
-    // JS:           let hook = this.importer.getExport(value[1]);
-    // JS:           if (!hook) {
-    // JS:             throw new Error(`no such entry on exports table: ${value[1]}`);
-    // JS:           }
-    // JS:
-    // JS:           let path = value[2];
-    // JS:           if (!path.every(
-    // JS:               part => { return typeof part == "string" || typeof part == "number"; })) {
-    // JS:             break;  // report error below
-    // JS:           }
-    // JS:
-    // JS:           let captures: StubHook[] = value[3].map(cap => {
-    // JS:             if (!(cap instanceof Array) ||
-    // JS:                 cap.length !== 2 ||
-    // JS:                 (cap[0] !== "import" && cap[0] !== "export") ||
-    // JS:                 typeof cap[1] !== "number") {
-    // JS:               throw new TypeError(`unknown map capture: ${JSON.stringify(cap)}`);
-    // JS:             }
-    // JS:
-    // JS:             if (cap[0] === "export") {
-    // JS:               return this.importer.importStub(cap[1]);
-    // JS:             } else {
-    // JS:               let exp = this.importer.getExport(cap[1]);
-    // JS:               if (!exp) {
-    // JS:                 throw new Error(`no such entry on exports table: ${cap[1]}`);
-    // JS:               }
-    // JS:               return exp.dup();
-    // JS:             }
-    // JS:           });
-    // JS:
-    // JS:           let instructions = value[4];
-    // JS:
-    // JS:           let resultHook = hook.map(path, captures, instructions);
-    // JS:
-    // JS:           let promise = new RpcPromise(resultHook, []);
-    // JS:           this.promises.push({promise, parent, property});
-    // JS:           return promise;
-    // JS:         }
-    // JS:
-    // JS:         case "export":
-    // JS:         case "promise":
-    // JS:           // It's an "export" from the perspective of the sender, i.e. they sent us a new object
-    // JS:           // which we want to import.
-    // JS:           //
-    // JS:           // "promise" is same as "export" but should not be delivered to the application. If any
-    // JS:           // promises appear in a value, they must be resolved and substituted with their results
-    // JS:           // before delivery. Note that if the value being evaluated appeared in call params, or
-    // JS:           // appeared in a resolve message for a promise that is being pulled, then the new promise
-    // JS:           // is automatically also being pulled, otherwise it is not.
-    // JS:           if (typeof value[1] == "number") {
-    // JS:             if (value[0] == "promise") {
-    // JS:               let hook = this.importer.importPromise(value[1]);
-    // JS:               let promise = new RpcPromise(hook, []);
-    // JS:               this.promises.push({parent, property, promise});
-    // JS:               return promise;
-    // JS:             } else {
-    // JS:               let hook = this.importer.importStub(value[1]);
-    // JS:               this.hooks.push(hook);
-    // JS:               return new RpcStub(hook);
-    // JS:             }
-    // JS:           }
-    // JS:           break;
-    // JS:
-    // JS:         case "writable":
-    // JS:           // It's a WritableStream export from the sender. We import it and create a proxy
-    // JS:           // WritableStream that forwards writes to the remote end.
-    // JS:           if (typeof value[1] == "number") {
-    // JS:             let hook = this.importer.importStub(value[1]);
-    // JS:             let stream = streamImpl.createWritableStreamFromHook(hook);
-    // JS:             // Track the stream for disposal.
-    // JS:             this.hooks.push(hook);
-    // JS:             return stream;
-    // JS:           }
-    // JS:           break;
-    // JS:
-    // JS:         case "readable":
-    // JS:           // References the readable end of a pipe. The import ID (from the sender's perspective)
-    // JS:           // is our export ID.
-    // JS:           if (typeof value[1] == "number") {
-    // JS:             let stream = this.importer.getPipeReadable(value[1]);
-    // JS:             // Track the stream for disposal so that if the payload is disposed before the
-    // JS:             // app reads the stream, the ReadableStream is properly canceled.
-    // JS:             let hook = streamImpl.createReadableStreamHook(stream);
-    // JS:             this.hooks.push(hook);
-    // JS:             return stream;
-    // JS:           }
-    // JS:           break;
-    // JS:       }
-    // JS:       throw new TypeError(`unknown special value: ${JSON.stringify(value)}`);
-    // JS:     } else if (value instanceof Object) {
-    // JS:       let result = <Record<string, unknown>>value;
-    // JS:       for (let key in result) {
-    // JS:         if (key in Object.prototype || key === "toJSON") {
-    // JS:           // Out of an abundance of caution, we will ignore properties that override properties
-    // JS:           // of Object.prototype. It's especially important that we don't allow `__proto__` as it
-    // JS:           // may lead to prototype pollution. We also would rather not allow, e.g., `toString()`,
-    // JS:           // as overriding this could lead to various mischief.
-    // JS:           //
-    // JS:           // We also block `toJSON()` for similar reasons -- even though Object.prototype doesn't
-    // JS:           // actually define it, `JSON.stringify()` treats it specially and we don't want someone
-    // JS:           // snooping on JSON calls.
-    // JS:           //
-    // JS:           // We do still evaluate the inner value so that we can properly release any stubs.
-    // JS:           this.evaluateImpl(result[key], result, key, depth + 1);
-    // JS:           delete result[key];
-    // JS:         } else {
-    // JS:           result[key] = this.evaluateImpl(result[key], result, key, depth + 1);
-    // JS:         }
-    // JS:       }
-    // JS:       return result;
-    // JS:     } else {
-    // JS:       // Other JSON types just pass through.
-    // JS:       return value;
-    // JS:     }
-    // JS:   }
     fn evaluate_impl(&mut self, value: WireValue, depth: usize) -> Result<CapnwebValue> {
-        let _encoding_level = self.encoding_level;
-        if depth >= self.limits.max_depth {
+        // JS:     let maxDepth = this.limits.maxDepth;
+        let max_depth = self.limits.max_depth;
+        // JS:     if (depth >= maxDepth) {
+        if depth >= max_depth {
+            // JS:       throw new TypeError(
+            // JS:           `Deserialization exceeded maximum allowed message depth of ${maxDepth}.`);
             return Err(Error::Type(format!(
-                "Deserialization exceeded maximum allowed message depth of {}.",
-                self.limits.max_depth
+                "Deserialization exceeded maximum allowed message depth of {max_depth}."
             )));
+            // JS:     }
         }
-
+        // JS:
+        // JS:     // At structuredClonable level, some native types pass through devaluation unencoded: Date and
+        // JS:     // BigInt (as well as undefined and non-finite numbers, which the generic paths below already
+        // JS:     // handle). Note that bytes and errors are tuple-encoded at every level, so raw `Uint8Array`
+        // JS:     // and `Error` values are intentionally *not* accepted here.
+        // JS:     if (this.encodingLevel === "structuredClonable") {
+        // JS:       if (value instanceof Date || typeof value === "bigint") {
+        // JS:         return value;
+        // JS:       }
+        // JS:     }
+        // RUST-DEFERRED(JS built-in: structured clone): native Date and BigInt objects are not input.
+        // JS:
+        // JS:     if (value instanceof Array) {
         match value {
-            WireValue::Null => Ok(CapnwebValue::Null),
-            WireValue::Bool(value) => Ok(CapnwebValue::Bool(value)),
-            WireValue::Number(value) => value
-                .as_f64()
-                .map(CapnwebValue::Number)
-                .ok_or_else(|| Error::Type("JSON number cannot be represented as f64".to_owned())),
-            WireValue::String(value) => Ok(CapnwebValue::String(value)),
-            WireValue::Object(values) => {
-                let mut result = BTreeMap::new();
-                for (key, value) in values {
-                    let value = self.evaluate_impl(value, depth + 1)?;
-                    if !is_blocked_object_property(&key) {
-                        result.insert(key, value);
-                    }
-                }
-                Ok(CapnwebValue::Object(result))
-            }
             WireValue::Array(mut expression) => {
+                // JS:       if (value.length == 1 && value[0] instanceof Array) {
                 if expression.len() == 1 && expression.first().is_some_and(WireValue::is_array) {
-                    let WireValue::Array(values) = expression.remove(0) else {
+                    // JS:         // Escaped array. Evaluate the contents.
+                    // JS:         let result = value[0];
+                    let WireValue::Array(result) = expression.remove(0) else {
                         unreachable!();
                     };
-                    return values
+                    // JS:         for (let i = 0; i < result.length; i++) {
+                    let result = result
                         .into_iter()
-                        .map(|value| self.evaluate_impl(value, depth + 1))
-                        .collect::<Result<Vec<_>>>()
-                        .map(CapnwebValue::Array);
+                        .map(|value| {
+                            // JS:           result[i] = this.evaluateImpl(result[i], result, i, depth + 1);
+                            self.evaluate_impl(value, depth + 1)
+                            // JS:         }
+                        })
+                        .collect::<Result<Vec<_>>>()?;
+                    // JS:         return result;
+                    return Ok(CapnwebValue::Array(result));
+                    // JS:       } else switch (value[0]) {
                 }
-
                 let tag = expression
                     .first()
                     .and_then(WireValue::as_str)
                     .ok_or_else(|| unknown_special(&expression))?
                     .to_owned();
                 match tag.as_str() {
+                    // JS:         case "bigint":
+                    // JS:           if (typeof value[1] == "string") {
+                    // JS:             let digits = value[1];
+                    // JS:             let maxBigIntDigits = this.limits.maxBigIntDigits;
+                    // JS:             // Cap the length before the superlinear BigInt() parse (DoS guard).
+                    // JS:             if (digits.length > maxBigIntDigits) {
+                    // JS:               throw new TypeError(
+                    // JS:                   `Deserialized bigint exceeds maximum length of ${maxBigIntDigits} digits.`);
+                    // JS:             }
+                    // JS:             return BigInt(digits);
+                    // JS:           }
+                    // JS:           break;
                     "bigint" if expression.len() == 2 => {
                         let digits = expression[1]
                             .as_str()
@@ -1682,6 +1236,79 @@ impl<'a> Evaluator<'a> {
                             .map(CapnwebValue::BigInt)
                             .map_err(|_| Error::Type("invalid bigint decimal string".to_owned()))
                     }
+                    // JS:         case "date":
+                    // JS:           if (value[1] === null) {
+                    // JS:             return new Date(NaN);
+                    // JS:           }
+                    // JS:           if (typeof value[1] == "number") {
+                    // JS:             return new Date(value[1]);
+                    // JS:           }
+                    // JS:           break;
+                    "date" => Err(Error::UnsupportedBuiltin("Date")),
+                    // JS:         case "bytes": {
+                    // JS:           let bytes: Uint8Array;
+                    // JS:           // At jsonCompatibleWithBytes/structuredClonable level, bytes may already be raw.
+                    // JS:           if (value[1] instanceof Uint8Array) {
+                    // JS:             bytes = value[1];
+                    // JS:           } else if (typeof value[1] == "string") {
+                    // JS:             if (typeof Buffer !== "undefined") {
+                    // JS:               bytes = Buffer.from(value[1], "base64");
+                    // JS:             } else if (Uint8Array.fromBase64) {
+                    // JS:               bytes = Uint8Array.fromBase64(value[1]);
+                    // JS:             } else {
+                    // JS:               let bs = atob(value[1]);
+                    // JS:               let len = bs.length;
+                    // JS:               bytes = new Uint8Array(len);
+                    // JS:               for (let i = 0; i < len; i++) {
+                    // JS:                 bytes[i] = bs.charCodeAt(i);
+                    // JS:               }
+                    // JS:             }
+                    // JS:           } else {
+                    // JS:             break;
+                    // JS:           }
+                    // JS:
+                    // JS:           if (value.length === 2) {
+                    // JS:             return bytes;
+                    // JS:           }
+                    // JS:           if (typeof value[2] !== "string") {
+                    // JS:             throw new TypeError(`Unknown bytes type marker type: ${typeof value[2]}`);
+                    // JS:           }
+                    // JS:
+                    // JS:           if (!isValidByteContainerName(value[2])) {
+                    // JS:             let marker = value[2].slice(0, 64);
+                    // JS:             throw new TypeError(`Unknown bytes type marker: ${marker}`);
+                    // JS:           }
+                    // JS:
+                    // JS:           let marker = value[2];
+                    // JS:           let elementSize = TYPED_ARRAY_ELEMENT_SIZE[marker];
+                    // JS:           if (elementSize !== undefined && bytes.byteLength % elementSize !== 0) {
+                    // JS:             throw new TypeError(
+                    // JS:                 `Invalid byte length ${bytes.byteLength} for ${marker}; ` +
+                    // JS:                 `expected a multiple of ${elementSize}`);
+                    // JS:           }
+                    // JS:
+                    // JS:           // Copy exactly the decoded range rather than exposing or aliasing a pooled Buffer.
+                    // JS:           let buffer = bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength);
+                    // JS:           if (!NATIVE_LITTLE_ENDIAN && elementSize !== undefined) {
+                    // JS:             swapByteOrder(new Uint8Array(buffer), elementSize);
+                    // JS:           }
+                    // JS:           switch (marker) {
+                    // JS:             case "ArrayBuffer": return buffer;
+                    // JS:             case "DataView": return new DataView(buffer);
+                    // JS:             case "Int8Array": return new Int8Array(buffer);
+                    // JS:             case "Uint8Array": return new Uint8Array(buffer);
+                    // JS:             case "Uint8ClampedArray": return new Uint8ClampedArray(buffer);
+                    // JS:             case "Int16Array": return new Int16Array(buffer);
+                    // JS:             case "Uint16Array": return new Uint16Array(buffer);
+                    // JS:             case "Int32Array": return new Int32Array(buffer);
+                    // JS:             case "Uint32Array": return new Uint32Array(buffer);
+                    // JS:             case "BigInt64Array": return new BigInt64Array(buffer);
+                    // JS:             case "BigUint64Array": return new BigUint64Array(buffer);
+                    // JS:             case "Float32Array": return new Float32Array(buffer);
+                    // JS:             case "Float64Array": return new Float64Array(buffer);
+                    // JS:             default: marker satisfies never;
+                    // JS:           }
+                    // JS:         }
                     "bytes" if expression.len() == 2 || expression.len() == 3 => {
                         let encoded = expression[1]
                             .as_str()
@@ -1695,26 +1322,327 @@ impl<'a> Evaluator<'a> {
                         }
                         Ok(CapnwebValue::Bytes(bytes))
                     }
+                    // JS:         case "error":
+                    // JS:           if (value.length >= 3 && typeof value[1] === "string" && typeof value[2] === "string") {
+                    // JS:             let cls = ERROR_TYPES[value[1]] || Error;
+                    // JS:             // AggregateError's constructor takes (errors, message); we pass an empty array
+                    // JS:             // and patch `errors` from the props bag below.
+                    // JS:             let result = cls === AggregateError ? new cls([], value[2]) : new cls(value[2]);
+                    // JS:             if (typeof value[3] === "string") {
+                    // JS:               result.stack = value[3];
+                    // JS:             }
+                    // JS:             // Optional 5th element: own properties bag. Unknown keys are assigned as own
+                    // JS:             // enumerable properties so the receiver sees what the sender attached.
+                    // JS:             if (value.length >= 5) {
+                    // JS:               let props = value[4];
+                    // JS:               if (!props || typeof props !== "object" || Array.isArray(props)) {
+                    // JS:                 break;  // malformed; fall through to the "unknown special value" throw
+                    // JS:               }
+                    // JS:               let anyResult = <any>result;
+                    // JS:               let propsObj = <Record<string, unknown>>props;
+                    // JS:               for (let key of Object.keys(propsObj)) {
+                    // JS:                 if (key === "name" || key === "message" || key === "stack") continue;
+                    // JS:                 if (key in Object.prototype || key === "toJSON") {
+                    // JS:                   // Consistent with the plain-object deserializer below: don't allow error
+                    // JS:                   // properties to override Object.prototype members (e.g. __proto__, toString,
+                    // JS:                   // valueOf) or toJSON. Still evaluate the inner value so any stubs are released.
+                    // JS:                   this.evaluateImpl(propsObj[key], result, key, depth + 1);
+                    // JS:                   continue;
+                    // JS:                 }
+                    // JS:                 anyResult[key] = this.evaluateImpl(propsObj[key], result, key, depth + 1);
+                    // JS:               }
+                    // JS:             }
+                    // JS:             return result;
+                    // JS:           }
+                    // JS:           break;
                     "error" if expression.len() >= 3 => {
                         let message = expression[2]
                             .as_str()
                             .ok_or_else(|| unknown_special(&expression))?;
                         Ok(CapnwebValue::Error(Error::Message(message.to_owned())))
                     }
+                    // JS:         case "undefined":
+                    // JS:           if (value.length === 1) {
+                    // JS:             return undefined;
+                    // JS:           }
+                    // JS:           break;
                     "undefined" if expression.len() == 1 => Ok(CapnwebValue::Null),
+                    // JS:         case "inf":
+                    // JS:           return Infinity;
                     "inf" if expression.len() == 1 => Ok(CapnwebValue::Number(f64::INFINITY)),
+                    // JS:         case "-inf":
+                    // JS:           return -Infinity;
                     "-inf" if expression.len() == 1 => Ok(CapnwebValue::Number(f64::NEG_INFINITY)),
+                    // JS:         case "nan":
+                    // JS:           return NaN;
                     "nan" if expression.len() == 1 => Ok(CapnwebValue::Number(f64::NAN)),
-                    "date" => Err(Error::UnsupportedBuiltin("Date")),
+                    // JS:
+                    // JS:         case "url":
+                    // JS:           if (value.length === 2 && typeof value[1] === "string") {
+                    // JS:             return new URL(value[1]);
+                    // JS:           }
+                    // JS:           break;
                     "url" => Err(Error::UnsupportedBuiltin("URL")),
+                    // JS:
+                    // JS:         case "headers":
+                    // JS:           // We only need to validate that the parameter is an array, so as not to invoke an
+                    // JS:           // unexpected variant of the Headers constructor. So long as it is an array then we can
+                    // JS:           // rely on the constructor to perform type checking.
+                    // JS:           if (value.length === 2 && value[1] instanceof Array) {
+                    // JS:             return new Headers(value[1] as [string, string][]);
+                    // JS:           }
+                    // JS:           break;
                     "headers" => Err(Error::UnsupportedBuiltin("Headers")),
+                    // JS:
+                    // JS:         case "request": {
+                    // JS:           if (value.length !== 3 || typeof value[1] !== "string") break;
+                    // JS:           let url = value[1] as string;
+                    // JS:           let init = value[2];
+                    // JS:           if (typeof init !== "object" || init === null) break;
+                    // JS:
+                    // JS:           // Evaluate specific properties which are expected to contain non-trivial types.
+                    // JS:           if (init.body) {
+                    // JS:             init.body = this.evaluateImpl(init.body, init, "body", depth + 1);
+                    // JS:             if (init.body === null ||
+                    // JS:                 typeof init.body === "string" ||
+                    // JS:                 init.body instanceof Uint8Array ||
+                    // JS:                 init.body instanceof ReadableStream) {
+                    // JS:               // Acceptable types.
+                    // JS:             } else {
+                    // JS:               throw new TypeError("Request body must be of type ReadableStream.");
+                    // JS:             }
+                    // JS:           }
+                    // JS:           if (init.signal) {
+                    // JS:             init.signal = this.evaluateImpl(init.signal, init, "signal", depth + 1);
+                    // JS:             if (!(init.signal instanceof AbortSignal)) {
+                    // JS:               throw new TypeError("Request siganl must be of type AbortSignal.");
+                    // JS:             }
+                    // JS:           }
+                    // JS:
+                    // JS:           // Type-check `headers` is an array because the constructor allows multiple
+                    // JS:           // representations and we don't want to allow the others.
+                    // JS:           if (init.headers && !(init.headers instanceof Array)) {
+                    // JS:             throw new TypeError("Request headers must be serialized as an array of pairs.");
+                    // JS:           }
+                    // JS:
+                    // JS:           // We assume the `Request` constructor can type-check the remaining properties.
+                    // JS:           let result = new Request(url, init as RequestInit);
+                    // JS:
+                    // JS:           if (init.body instanceof ReadableStream && result.body === undefined) {
+                    // JS:             // Oh no! We must be on Firefox where request bodies are not supported, but we had a
+                    // JS:             // body.
+                    // JS:             let promise = fixBrokenRequestBody(result, init.body);
+                    // JS:             this.promises.push({promise, parent, property});
+                    // JS:             return promise;
+                    // JS:           } else {
+                    // JS:             return result;
+                    // JS:           }
+                    // JS:         }
                     "request" => Err(Error::UnsupportedBuiltin("Request")),
+                    // JS:
+                    // JS:         case "response": {
+                    // JS:           if (value.length !== 3) break;
+                    // JS:
+                    // JS:           let body = this.evaluateImpl(value[1], parent, property, depth + 1);
+                    // JS:           if (body === null ||
+                    // JS:               typeof body === "string" ||
+                    // JS:               body instanceof Uint8Array ||
+                    // JS:               body instanceof ReadableStream) {
+                    // JS:             // Acceptable types.
+                    // JS:           } else {
+                    // JS:             throw new TypeError("Response body must be of type ReadableStream.");
+                    // JS:           }
+                    // JS:
+                    // JS:           let init = value[2];
+                    // JS:           if (typeof init !== "object" || init === null) break;
+                    // JS:
+                    // JS:           // Evaluate specific properties which are expected to contain non-trivial types.
+                    // JS:           if (init.webSocket) {
+                    // JS:             // `response.webSocket` is a Cloudflare Workers extension. Not (yet?) supported for
+                    // JS:             // serialization.
+                    // JS:             throw new TypeError("Can't deserialize a Response containing a webSocket.");
+                    // JS:           }
+                    // JS:
+                    // JS:           // Type-check `headers` is an array because the constructor allows multiple
+                    // JS:           // representations and we don't want to allow the others.
+                    // JS:           if (init.headers && !(init.headers instanceof Array)) {
+                    // JS:             throw new TypeError("Request headers must be serialized as an array of pairs.");
+                    // JS:           }
+                    // JS:
+                    // JS:           return new Response(body as BodyInit | null, init as ResponseInit);
+                    // JS:         }
                     "response" => Err(Error::UnsupportedBuiltin("Response")),
+                    // JS:
+                    // JS:         case "blob": {
+                    // JS:           // Wire format is strictly ["blob", type, ["readable", id]] — the encoder always streams
+                    // JS:           // bytes through a pipe, so the content expression must evaluate to a ReadableStream.
+                    // JS:           if (value.length !== 3 || typeof value[1] !== "string") break;
+                    // JS:           let contentType = value[1] as string;
+                    // JS:           let content = this.evaluateImpl(value[2], parent, property, depth + 1);
+                    // JS:           if (!(content instanceof ReadableStream)) {
+                    // JS:             throw new TypeError("Blob content must be serialized as a ReadableStream.");
+                    // JS:           }
+                    // JS:           // Reuse the RpcPromise infrastructure (same pattern as fixBrokenRequestBody): the
+                    // JS:           // payload-delivery machinery resolves the promise and substitutes the real Blob before
+                    // JS:           // user code sees the value.
+                    // JS:           let promise = streamToBlobPromise(content, contentType);
+                    // JS:           this.promises.push({promise, parent, property});
+                    // JS:           return promise;
+                    // JS:         }
                     "blob" => Err(Error::UnsupportedBuiltin("Blob")),
-                    "writable" => Err(Error::UnsupportedBuiltin("WritableStream")),
-                    "readable" => Err(Error::UnsupportedBuiltin("ReadableStream")),
+                    // JS:
+                    // JS:         case "import":
+                    // JS:         case "pipeline": {
+                    // JS:           // It's an "import" from the perspective of the sender, so it's an export from our
+                    // JS:           // side. In other words, the sender is passing our own object back to us.
+                    // JS:
+                    // JS:           if (value.length < 2 || value.length > 4) {
+                    // JS:             break;   // report error below
+                    // JS:           }
+                    // JS:
+                    // JS:           // First parameter is import ID (from the sender's perspective, so export ID from
+                    // JS:           // ours).
+                    // JS:           if (typeof value[1] != "number") {
+                    // JS:             break;   // report error below
+                    // JS:           }
+                    // JS:
+                    // JS:           let hook = this.importer.getExport(value[1]);
+                    // JS:           if (!hook) {
+                    // JS:             throw new Error(`no such entry on exports table: ${value[1]}`);
+                    // JS:           }
+                    // JS:
+                    // JS:           let isPromise = value[0] == "pipeline";
+                    // JS:
+                    // JS:           let addStub = (hook: StubHook) => {
+                    // JS:             if (isPromise) {
+                    // JS:               let promise = new RpcPromise(hook, []);
+                    // JS:               this.promises.push({promise, parent, property});
+                    // JS:               return promise;
+                    // JS:             } else {
+                    // JS:               this.hooks.push(hook);
+                    // JS:               return new RpcPromise(hook, []);
+                    // JS:             }
+                    // JS:           };
+                    // JS:
+                    // JS:           if (value.length == 2) {
+                    // JS:             // Just referencing the export itself.
+                    // JS:             if (isPromise) {
+                    // JS:               // We need to use hook.get([]) to make sure we get a promise hook.
+                    // JS:               return addStub(hook.get([]));
+                    // JS:             } else {
+                    // JS:               // dup() returns a stub hook.
+                    // JS:               return addStub(hook.dup());
+                    // JS:             }
+                    // JS:           }
+                    // JS:
+                    // JS:           // Second parameter, if given, is a property path.
+                    // JS:           let path = value[2];
+                    // JS:           if (!(path instanceof Array)) {
+                    // JS:             break;  // report error below
+                    // JS:           }
+                    // JS:           if (!path.every(
+                    // JS:               part => { return typeof part == "string" || typeof part == "number"; })) {
+                    // JS:             break;  // report error below
+                    // JS:           }
+                    // JS:
+                    // JS:           if (value.length == 3) {
+                    // JS:             // Just referencing the path, not a call.
+                    // JS:             return addStub(hook.get(path));
+                    // JS:           }
+                    // JS:
+                    // JS:           // Third parameter, if given, is call arguments. The sender has identified a function
+                    // JS:           // and wants us to call it.
+                    // JS:           //
+                    // JS:           // Usually this is used with "pipeline", in which case we evaluate to an
+                    // JS:           // RpcPromise. However, this can be used with "import", in which case the caller is
+                    // JS:           // asking that the result be coerced to RpcStub. This distinction matters if the
+                    // JS:           // result of this evaluation is to be passed as arguments to another call -- promises
+                    // JS:           // must be resolved in advance, but stubs can be passed immediately.
+                    // JS:           let args = value[3];
+                    // JS:           if (!(args instanceof Array)) {
+                    // JS:             break;  // report error below
+                    // JS:           }
+                    // JS:
+                    // JS:           // We need a new evaluator for the args, to build a separate payload.
+                    // JS:           let subEval = new Evaluator(this.importer);
+                    // JS:           args = subEval.evaluateWithDepth([args], depth);
+                    // JS:
+                    // JS:           return addStub(hook.call(path, args));
+                    // JS:         }
                     "import" | "pipeline" => self.evaluate_import_expression(expression, depth),
+                    // JS:
+                    // JS:         case "remap": {
+                    // JS:           if (value.length !== 5 ||
+                    // JS:               typeof value[1] !== "number" ||
+                    // JS:               !(value[2] instanceof Array) ||
+                    // JS:               !(value[3] instanceof Array) ||
+                    // JS:               !(value[4] instanceof Array)) {
+                    // JS:             break;   // report error below
+                    // JS:           }
+                    // JS:
+                    // JS:           let hook = this.importer.getExport(value[1]);
+                    // JS:           if (!hook) {
+                    // JS:             throw new Error(`no such entry on exports table: ${value[1]}`);
+                    // JS:           }
+                    // JS:
+                    // JS:           let path = value[2];
+                    // JS:           if (!path.every(
+                    // JS:               part => { return typeof part == "string" || typeof part == "number"; })) {
+                    // JS:             break;  // report error below
+                    // JS:           }
+                    // JS:
+                    // JS:           let captures: StubHook[] = value[3].map(cap => {
+                    // JS:             if (!(cap instanceof Array) ||
+                    // JS:                 cap.length !== 2 ||
+                    // JS:                 (cap[0] !== "import" && cap[0] !== "export") ||
+                    // JS:                 typeof cap[1] !== "number") {
+                    // JS:               throw new TypeError(`unknown map capture: ${JSON.stringify(cap)}`);
+                    // JS:             }
+                    // JS:
+                    // JS:             if (cap[0] === "export") {
+                    // JS:               return this.importer.importStub(cap[1]);
+                    // JS:             } else {
+                    // JS:               let exp = this.importer.getExport(cap[1]);
+                    // JS:               if (!exp) {
+                    // JS:                 throw new Error(`no such entry on exports table: ${cap[1]}`);
+                    // JS:               }
+                    // JS:               return exp.dup();
+                    // JS:             }
+                    // JS:           });
+                    // JS:
+                    // JS:           let instructions = value[4];
+                    // JS:
+                    // JS:           let resultHook = hook.map(path, captures, instructions);
+                    // JS:
+                    // JS:           let promise = new RpcPromise(resultHook, []);
+                    // JS:           this.promises.push({promise, parent, property});
+                    // JS:           return promise;
+                    // JS:         }
                     "remap" => self.evaluate_remap(expression),
+                    // JS:
+                    // JS:         case "export":
+                    // JS:         case "promise":
+                    // JS:           // It's an "export" from the perspective of the sender, i.e. they sent us a new object
+                    // JS:           // which we want to import.
+                    // JS:           //
+                    // JS:           // "promise" is same as "export" but should not be delivered to the application. If any
+                    // JS:           // promises appear in a value, they must be resolved and substituted with their results
+                    // JS:           // before delivery. Note that if the value being evaluated appeared in call params, or
+                    // JS:           // appeared in a resolve message for a promise that is being pulled, then the new promise
+                    // JS:           // is automatically also being pulled, otherwise it is not.
+                    // JS:           if (typeof value[1] == "number") {
+                    // JS:             if (value[0] == "promise") {
+                    // JS:               let hook = this.importer.importPromise(value[1]);
+                    // JS:               let promise = new RpcPromise(hook, []);
+                    // JS:               this.promises.push({parent, property, promise});
+                    // JS:               return promise;
+                    // JS:             } else {
+                    // JS:               let hook = this.importer.importStub(value[1]);
+                    // JS:               this.hooks.push(hook);
+                    // JS:               return new RpcStub(hook);
+                    // JS:             }
+                    // JS:           }
+                    // JS:           break;
                     "export" | "promise" if expression.len() == 2 => {
                         let id = wire_id(&expression[1])?;
                         if tag == "promise" {
@@ -1729,12 +1657,88 @@ impl<'a> Evaluator<'a> {
                             )))
                         }
                     }
+                    // JS:
+                    // JS:         case "writable":
+                    // JS:           // It's a WritableStream export from the sender. We import it and create a proxy
+                    // JS:           // WritableStream that forwards writes to the remote end.
+                    // JS:           if (typeof value[1] == "number") {
+                    // JS:             let hook = this.importer.importStub(value[1]);
+                    // JS:             let stream = streamImpl.createWritableStreamFromHook(hook);
+                    // JS:             // Track the stream for disposal.
+                    // JS:             this.hooks.push(hook);
+                    // JS:             return stream;
+                    // JS:           }
+                    // JS:           break;
+                    "writable" => Err(Error::UnsupportedBuiltin("WritableStream")),
+                    // JS:
+                    // JS:         case "readable":
+                    // JS:           // References the readable end of a pipe. The import ID (from the sender's perspective)
+                    // JS:           // is our export ID.
+                    // JS:           if (typeof value[1] == "number") {
+                    // JS:             let stream = this.importer.getPipeReadable(value[1]);
+                    // JS:             // Track the stream for disposal so that if the payload is disposed before the
+                    // JS:             // app reads the stream, the ReadableStream is properly canceled.
+                    // JS:             let hook = streamImpl.createReadableStreamHook(stream);
+                    // JS:             this.hooks.push(hook);
+                    // JS:             return stream;
+                    // JS:           }
+                    // JS:           break;
+                    "readable" => Err(Error::UnsupportedBuiltin("ReadableStream")),
+                    // JS:       }
                     _ => Err(unknown_special(&expression)),
                 }
+                // JS:       throw new TypeError(`unknown special value: ${JSON.stringify(value)}`);
+                // Unknown tags take the error arm above.
+                // JS:     } else if (value instanceof Object) {
             }
+            WireValue::Object(values) => {
+                // JS:       let result = <Record<string, unknown>>value;
+                let mut result = BTreeMap::new();
+                // JS:       for (let key in result) {
+                for (key, value) in values {
+                    // JS:         if (key in Object.prototype || key === "toJSON") {
+                    let value = self.evaluate_impl(value, depth + 1)?;
+                    if is_blocked_object_property(&key) {
+                        // JS:           // Out of an abundance of caution, we will ignore properties that override properties
+                        // JS:           // of Object.prototype. It's especially important that we don't allow `__proto__` as it
+                        // JS:           // may lead to prototype pollution. We also would rather not allow, e.g., `toString()`,
+                        // JS:           // as overriding this could lead to various mischief.
+                        // JS:           //
+                        // JS:           // We also block `toJSON()` for similar reasons -- even though Object.prototype doesn't
+                        // JS:           // actually define it, `JSON.stringify()` treats it specially and we don't want someone
+                        // JS:           // snooping on JSON calls.
+                        // JS:           //
+                        // JS:           // We do still evaluate the inner value so that we can properly release any stubs.
+                        // JS:           this.evaluateImpl(result[key], result, key, depth + 1);
+                        // Evaluation occurs before the blocked key is discarded.
+                        // JS:           delete result[key];
+                        drop(value);
+                    // JS:         } else {
+                    } else {
+                        // JS:           result[key] = this.evaluateImpl(result[key], result, key, depth + 1);
+                        result.insert(key, value);
+                        // JS:         }
+                    }
+                    // JS:       }
+                }
+                // JS:       return result;
+                Ok(CapnwebValue::Object(result))
+                // JS:     } else {
+            }
+            // JS:       // Other JSON types just pass through.
+            // Other JSON types pass through as the corresponding dynamic primitive.
+            // JS:       return value;
+            WireValue::Null => Ok(CapnwebValue::Null),
+            WireValue::Bool(value) => Ok(CapnwebValue::Bool(value)),
+            WireValue::Number(value) => value
+                .as_f64()
+                .map(CapnwebValue::Number)
+                .ok_or_else(|| Error::Type("JSON number cannot be represented as f64".to_owned())),
+            WireValue::String(value) => Ok(CapnwebValue::String(value)),
+            // JS:     }
         }
+        // JS:   }
     }
-
     fn evaluate_import_expression(
         &mut self,
         mut expression: Vec<WireValue>,
