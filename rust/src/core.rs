@@ -51,13 +51,13 @@ pub enum CapnwebValue {
     /// A plain string-keyed object.
     Object(BTreeMap<String, Self>),
     /// A serializable function capability.
-    Function(Arc<dyn RpcTarget>),
+    Function(Arc<dyn RpcTargetInner>),
     /// An RPC stub.
     Stub(RpcStub),
     /// An unresolved RPC value.
     RpcPromise(RpcPromise),
     /// A local RPC target.
-    Target(Arc<dyn RpcTarget>),
+    Target(Arc<dyn RpcTargetInner>),
     /// A serialized application error.
     Error(Error),
 }
@@ -128,11 +128,20 @@ pub enum MaybePromise<T> {
 
 // JS: export interface RpcTarget {
 /// Marker implemented by values exposed as local RPC targets.
-pub trait RpcTarget: Send + Sync + 'static {
+pub trait RpcTarget: RpcTargetInner {
     // JS:   [__RPC_TARGET_BRAND]: never;
     // RUST-DIFF(JS Proxy): generated target implementations provide the unforgeable marker.
     // JS: };
 }
+
+/// Object-safe dispatch generated in place of JavaScript prototype reflection.
+#[doc(hidden)]
+pub trait RpcTargetInner: Send + Sync + 'static {
+    /// Dispatches a call after generated property-path lookup.
+    fn call(self: Arc<Self>, path: PropertyPath, args: RpcPayload) -> Result<StubHook>;
+}
+
+impl<T: RpcTargetInner> RpcTarget for T {}
 // JS:
 
 // JS: export let RpcTarget = workersModule ? workersModule.RpcTarget : class {};

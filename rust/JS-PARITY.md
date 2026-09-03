@@ -146,6 +146,18 @@ behavior.
 JavaScript Proxy call/property interception is replaced by generated Rust methods. JavaScript
 prototype reflection is replaced by generated target dispatch and getter tables.
 
+The generated target boundary uses an object-safe runtime trait equivalent to:
+
+```rust
+trait RpcTargetInner {
+    fn call(self: Arc<Self>, path: PropertyPath, args: RpcPayload) -> Result<StubHook>;
+}
+```
+
+`#[rpc_target]` implements this boundary for application targets. Dynamic target values hold an
+`Arc<dyn RpcTargetInner>`. Generated dispatch invokes synchronous application methods synchronously
+and eagerly starts asynchronous methods before returning their promise hook.
+
 The original Proxy/reflection lines remain as `// JS:` comments in the corresponding Rust source.
 Their Rust equivalent points to or invokes the generated macro boundary at the same logical point.
 The generated code must perform the same hook calls, path construction, argument ownership, and
@@ -176,6 +188,14 @@ machine and ordering.
 Rust futures are lazy while JavaScript promises are eager. Therefore constructing the Rust
 counterpart must start or poll a future at the exact point where JavaScript constructs the promise.
 Execution may not be deferred until `pull()` unless the JavaScript implementation also defers it.
+
+The runtime uses an eager task-backed promise representation. Construction polls the future once
+synchronously, matching execution of a JavaScript async function through its first `await`. If the
+future is pending, subsequent polls are scheduled immediately on Tokio. Resolution callbacks are
+stored and invoked in registration order rather than relying on incidental Tokio task order. An
+immediately-ready result remains available through the synchronous fast path. Creating pending work
+without an active Tokio runtime produces a rejected RPC promise instead of silently leaving a lazy
+future dormant.
 
 ## In-scope source files
 
