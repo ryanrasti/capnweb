@@ -18,6 +18,17 @@ For every in-scope JavaScript/TypeScript source file:
 A reviewer must be able to read the Rust file from top to bottom beside the JavaScript file and see
 where every source line was translated.
 
+## Source baseline
+
+The rewrite is pinned to repository commit
+`2b2dc89049c08ed6bf01f5955b8cdfc606e45896`. The corresponding `src/` Git tree is
+`185594ec5a9b8ba0d02cb0b6dfe6483038417fc1`.
+
+The source-line checker must fail if the current JavaScript source differs from that baseline until
+the change is intentionally reviewed and the Rust comments are resynchronized. Updating the
+baseline is a deliberate parity change and must be committed together with the corresponding Rust
+translation updates.
+
 ## Required source format
 
 A single-line translation looks like this:
@@ -80,6 +91,17 @@ which built-in is deferred. The rest of the containing method is still translate
 Protocol-neutral values are not excluded merely because JavaScript represents them with a built-in.
 Rust equivalents remain required for null, booleans, numbers, strings, arrays, records, arbitrary
 integers, byte strings, errors, capabilities, promises, limits, and malformed-wire handling.
+
+### `undefined` mapping
+
+At the public Rust application boundary, JavaScript `undefined` is represented as `None` when a
+nullable type is known and as `CapnwebValue::Null` for a dynamic value. This deliberately conflates
+`undefined` and `null` in the initial Rust API.
+
+The wire decoder must still accept the JavaScript `undefined` expression. The runtime may retain an
+internal distinction when required to reproduce protocol control flow, method `void` behavior, or
+interoperability, but it must expose the value to initial Rust application code using the lossy
+mapping above. This is an explicit language mapping, not an omitted JavaScript built-in.
 
 ### 2. Local JavaScript reference counting
 
