@@ -18,10 +18,13 @@ use crate::core::{
     CapnwebError, CapnwebValue, Error, PayloadStubHook, PromiseStubHook, PropertyKey, PropertyPath,
     Result, RpcPayload, RpcStub, RpcTargetInner, StubHook, function_target,
 };
-use crate::serialize::{deserialize, serialize, swap_byte_order};
+use crate::rpc::{AnyRpcTransport, RpcSession, RpcSessionOptions, TransportMessage, TransportSend};
+use crate::serialize::{EncodingLevel, deserialize, serialize, swap_byte_order};
 use num_bigint::BigInt;
 use std::collections::BTreeMap;
+use std::future::{Future, pending};
 use std::mem::ManuallyDrop;
+use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 // JS:
@@ -1331,61 +1334,133 @@ mod error_serialization {
 // JS:   }
 // JS: }
 // JS:
+enum FailingSendMode {
+    AsyncString,
+    SyncString,
+    SyncCustom,
+}
+struct FailingSendTransport(FailingSendMode);
+impl AnyRpcTransport for FailingSendTransport {
+    fn encoding_level(&self) -> EncodingLevel {
+        match self.0 {
+            FailingSendMode::SyncCustom => EncodingLevel::StructuredClonable,
+            _ => EncodingLevel::String,
+        }
+    }
+    fn send(&self, _message: TransportMessage) -> Result<TransportSend> {
+        match self.0 {
+            FailingSendMode::AsyncString => Ok(TransportSend::Pending(Box::pin(async {
+                Err(Error::Message("send failed".to_owned()))
+            }))),
+            FailingSendMode::SyncString => Err(Error::Message("sync send failed".to_owned())),
+            FailingSendMode::SyncCustom => {
+                Err(Error::Message("sync custom send failed".to_owned()))
+            }
+        }
+    }
+    fn receive(self: Arc<Self>) -> Pin<Box<dyn Future<Output = Result<TransportMessage>> + Send>> {
+        Box::pin(pending())
+    }
+}
+
 // JS: it("propagates async send failures from string transports", async () => {
-// JS:   let sendError = new Error("send failed");
-// JS:   let transport: RpcTransport = {
-// JS:     send(_message: string): Promise<void> {
-// JS:       return Promise.reject(sendError);
-// JS:     },
-// JS:     receive(): Promise<string> {
-// JS:       return new Promise(() => {});
-// JS:     },
-// JS:   };
-// JS:
-// JS:   let session = new RpcSession<TestTarget>(transport);
-// JS:   using stub = session.getRemoteMain();
-// JS:
-// JS:   await expect(() => stub.square(1)).rejects.toThrow(sendError);
-// JS: });
+#[tokio::test(flavor = "current_thread")]
+async fn propagates_async_send_failures_from_string_transports() {
+    // JS:   let sendError = new Error("send failed");
+    let send_error = "send failed";
+    // JS:   let transport: RpcTransport = {
+    let transport = Arc::new(FailingSendTransport(FailingSendMode::AsyncString));
+    // JS:     send(_message: string): Promise<void> {
+    // Implemented by `FailingSendTransport::send()`.
+    // JS:       return Promise.reject(sendError);
+    // The pending send rejects with `send_error`.
+    // JS:     },
+    // JS:     receive(): Promise<string> {
+    // Implemented by `FailingSendTransport::receive()`.
+    // JS:       return new Promise(() => {});
+    // The receive future remains pending.
+    // JS:     },
+    // JS:   };
+    // JS:
+    // JS:   let session = new RpcSession<TestTarget>(transport);
+    let session = RpcSession::new(transport, None, RpcSessionOptions::default()).unwrap();
+    // JS:   using stub = session.getRemoteMain();
+    let stub = session.get_remote_main();
+    // JS:
+    // JS:   await expect(() => stub.square(1)).rejects.toThrow(sendError);
+    let error = stub
+        .call(vec!["square".to_owned()], one_number_argument(1.0))
+        .pull()
+        .await
+        .unwrap_err();
+    assert!(error.to_string().contains(send_error));
+    // JS: });
+}
 // JS:
 // JS: it("propagates synchronous send failures from string transports", async () => {
-// JS:   // A transport whose send() throws synchronously (rather than rejecting a promise) must still
-// JS:   // abort the session. The abort is deliberately deferred to a microtask so the caller finishes
-// JS:   // its own bookkeeping first, matching the timing of a rejected promise from an async transport.
-// JS:   let sendError = new Error("sync send failed");
-// JS:   let transport: RpcTransport = {
-// JS:     send(_message: string): void {
-// JS:       throw sendError;
-// JS:     },
-// JS:     receive(): Promise<string> {
-// JS:       return new Promise(() => {});
-// JS:     },
-// JS:   };
-// JS:
-// JS:   let session = new RpcSession<TestTarget>(transport);
-// JS:   using stub = session.getRemoteMain();
-// JS:
-// JS:   await expect(() => stub.square(1)).rejects.toThrow(sendError);
-// JS: });
+#[tokio::test(flavor = "current_thread")]
+async fn propagates_synchronous_send_failures_from_string_transports() {
+    // JS:   // A transport whose send() throws synchronously (rather than rejecting a promise) must still
+    // JS:   // abort the session. The abort is deliberately deferred to a microtask so the caller finishes
+    // JS:   // its own bookkeeping first, matching the timing of a rejected promise from an async transport.
+    // JS:   let sendError = new Error("sync send failed");
+    let send_error = "sync send failed";
+    // JS:   let transport: RpcTransport = {
+    let transport = Arc::new(FailingSendTransport(FailingSendMode::SyncString));
+    // JS:     send(_message: string): void {
+    // JS:       throw sendError;
+    // JS:     },
+    // JS:     receive(): Promise<string> {
+    // JS:       return new Promise(() => {});
+    // JS:     },
+    // JS:   };
+    // JS:
+    // JS:   let session = new RpcSession<TestTarget>(transport);
+    let session = RpcSession::new(transport, None, RpcSessionOptions::default()).unwrap();
+    // JS:   using stub = session.getRemoteMain();
+    let stub = session.get_remote_main();
+    // JS:
+    // JS:   await expect(() => stub.square(1)).rejects.toThrow(sendError);
+    let error = stub
+        .call(vec!["square".to_owned()], one_number_argument(1.0))
+        .pull()
+        .await
+        .unwrap_err();
+    assert!(error.to_string().contains(send_error));
+    // JS: });
+}
 // JS:
 // JS: it("propagates synchronous send failures from custom-encoding transports", async () => {
-// JS:   // Same as above, but exercising the custom-encoding (non-string) send path.
-// JS:   let sendError = new Error("sync custom send failed");
-// JS:   let transport: RpcTransportWithCustomEncoding = {
-// JS:     encodingLevel: "structuredClonable",
-// JS:     send(_message: unknown): void {
-// JS:       throw sendError;
-// JS:     },
-// JS:     receive(): Promise<unknown> {
-// JS:       return new Promise(() => {});
-// JS:     },
-// JS:   };
-// JS:
-// JS:   let session = new RpcSession<TestTarget>(transport);
-// JS:   using stub = session.getRemoteMain();
-// JS:
-// JS:   await expect(() => stub.square(1)).rejects.toThrow(sendError);
-// JS: });
+#[tokio::test(flavor = "current_thread")]
+async fn propagates_synchronous_send_failures_from_custom_encoding_transports() {
+    // JS:   // Same as above, but exercising the custom-encoding (non-string) send path.
+    // JS:   let sendError = new Error("sync custom send failed");
+    let send_error = "sync custom send failed";
+    // JS:   let transport: RpcTransportWithCustomEncoding = {
+    let transport = Arc::new(FailingSendTransport(FailingSendMode::SyncCustom));
+    // JS:     encodingLevel: "structuredClonable",
+    // JS:     send(_message: unknown): void {
+    // JS:       throw sendError;
+    // JS:     },
+    // JS:     receive(): Promise<unknown> {
+    // JS:       return new Promise(() => {});
+    // JS:     },
+    // JS:   };
+    // JS:
+    // JS:   let session = new RpcSession<TestTarget>(transport);
+    let session = RpcSession::new(transport, None, RpcSessionOptions::default()).unwrap();
+    // JS:   using stub = session.getRemoteMain();
+    let stub = session.get_remote_main();
+    // JS:
+    // JS:   await expect(() => stub.square(1)).rejects.toThrow(sendError);
+    let error = stub
+        .call(vec!["square".to_owned()], one_number_argument(1.0))
+        .pull()
+        .await
+        .unwrap_err();
+    assert!(error.to_string().contains(send_error));
+    // JS: });
+}
 // JS:
 struct LocalTestTarget;
 
