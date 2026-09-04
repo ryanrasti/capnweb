@@ -12,7 +12,7 @@ use num_bigint::BigInt;
 use std::str::FromStr;
 
 use crate::core::CapnwebValue;
-use crate::serialize::{DEFAULT_LIMITS, deserialize, serialize};
+use crate::serialize::{DEFAULT_LIMITS, DEFAULT_MAX_DEPTH, deserialize, serialize};
 // JS:          DEFAULT_MAX_DEPTH, type RpcLimits } from "../src/index.js"
 // JS:
 // JS: // Builds the wire string for a value nested inside `depth` escaped-array layers. Each escaped
@@ -190,42 +190,55 @@ mod bigint_deserialization_limits {
 }
 // JS:
 // JS: describe("message depth limits", () => {
-// JS:   it("accepts nesting just under the default depth limit", () => {
-// JS:     // The top value sits at depth 0, so maxDepth-1 escaped-array layers stay within the limit.
-// JS:     let value = deserialize(nestedEscapedArrays(DEFAULT_LIMITS.maxDepth - 1));
-// JS:     expect(value).toBeInstanceOf(Array);
-// JS:   });
-// JS:
-// JS:   it("rejects nesting over the default depth limit", () => {
-// JS:     expect(() => deserialize(nestedEscapedArrays(DEFAULT_LIMITS.maxDepth + 5)))
-// JS:         .toThrowError(/maximum allowed message depth/);
-// JS:   });
-// JS:
-// JS:   it("honors a per-session override of maxDepth", async () => {
-// JS:     // Override depth to a small value; nesting beyond it aborts the session.
-// JS:     let deep = nestedEscapedArrays(10);
-// JS:     let aborted = await pushFrame(deep, { maxDepth: 4 }).waitForAbort();
-// JS:     expect(aborted).toMatch(/maximum allowed message depth/);
-// JS:
-// JS:     // The same depth is well within the default, so by default it does not abort.
-// JS:     await pushFrame(deep).expectNoAbort();
-// JS:   });
-// JS:
-// JS:   it("does not reset depth across nested call arguments", async () => {
-// JS:     let aborted = await pushFrame(nestedCallArgs(8), { maxDepth: 8 }).waitForAbort();
-// JS:     expect(aborted).toMatch(/maximum allowed message depth/);
-// JS:   });
-// JS:
-// JS:   it("accepts nested call arguments within the default depth limit", async () => {
-// JS:     await pushFrame(nestedCallArgs(64)).expectNoAbort();
-// JS:   });
-// JS:
-// JS:   it("accepts near-limit call arguments that the default sender can serialize", async () => {
-// JS:     let appArg = deserialize(nestedEscapedArrays(DEFAULT_MAX_DEPTH - 2));
-// JS:     let wireArgs = JSON.parse(serialize([appArg]))[0];
-// JS:     await pushFrame(`["pipeline",0,["echo"],${JSON.stringify(wireArgs)}]`).expectNoAbort();
-// JS:   });
-// JS: });
+mod message_depth_limits {
+    use super::*;
+    // JS:   it("accepts nesting just under the default depth limit", () => {
+    #[test]
+    fn accepts_nesting_just_under_the_default_depth_limit() {
+        // JS:     // The top value sits at depth 0, so maxDepth-1 escaped-array layers stay within the limit.
+        // JS:     let value = deserialize(nestedEscapedArrays(DEFAULT_LIMITS.maxDepth - 1));
+        let value = deserialize(&nested_escaped_arrays(DEFAULT_LIMITS.max_depth - 1)).unwrap();
+        // JS:     expect(value).toBeInstanceOf(Array);
+        assert!(matches!(value, CapnwebValue::Array(_)));
+        // JS:   });
+    }
+    // JS:
+    // JS:   it("rejects nesting over the default depth limit", () => {
+    #[test]
+    fn rejects_nesting_over_the_default_depth_limit() {
+        // JS:     expect(() => deserialize(nestedEscapedArrays(DEFAULT_LIMITS.maxDepth + 5)))
+        let error = deserialize(&nested_escaped_arrays(DEFAULT_LIMITS.max_depth + 5)).unwrap_err();
+        // JS:         .toThrowError(/maximum allowed message depth/);
+        assert!(error.to_string().contains("maximum allowed message depth"));
+        // JS:   });
+    }
+    // JS:
+    // JS:   it("honors a per-session override of maxDepth", async () => {
+    // JS:     // Override depth to a small value; nesting beyond it aborts the session.
+    // JS:     let deep = nestedEscapedArrays(10);
+    // JS:     let aborted = await pushFrame(deep, { maxDepth: 4 }).waitForAbort();
+    // JS:     expect(aborted).toMatch(/maximum allowed message depth/);
+    // JS:
+    // JS:     // The same depth is well within the default, so by default it does not abort.
+    // JS:     await pushFrame(deep).expectNoAbort();
+    // JS:   });
+    // JS:
+    // JS:   it("does not reset depth across nested call arguments", async () => {
+    // JS:     let aborted = await pushFrame(nestedCallArgs(8), { maxDepth: 8 }).waitForAbort();
+    // JS:     expect(aborted).toMatch(/maximum allowed message depth/);
+    // JS:   });
+    // JS:
+    // JS:   it("accepts nested call arguments within the default depth limit", async () => {
+    // JS:     await pushFrame(nestedCallArgs(64)).expectNoAbort();
+    // JS:   });
+    // JS:
+    // JS:   it("accepts near-limit call arguments that the default sender can serialize", async () => {
+    // JS:     let appArg = deserialize(nestedEscapedArrays(DEFAULT_MAX_DEPTH - 2));
+    // JS:     let wireArgs = JSON.parse(serialize([appArg]))[0];
+    // JS:     await pushFrame(`["pipeline",0,["echo"],${JSON.stringify(wireArgs)}]`).expectNoAbort();
+    // JS:   });
+    // JS: });
+}
 // JS:
 // JS: describe("message size limits", () => {
 // JS:   it("aborts the session on a message over the size limit", async () => {
@@ -242,42 +255,72 @@ mod bigint_deserialization_limits {
 // JS: });
 // JS:
 // JS: describe("limits backwards compatibility", () => {
-// JS:   it("DEFAULT_LIMITS has the documented values", () => {
-// JS:     expect(DEFAULT_MAX_DEPTH).toBe(256);
-// JS:     expect(DEFAULT_LIMITS).toStrictEqual({
-// JS:       maxBigIntDigits: 16384,
-// JS:       maxDepth: DEFAULT_MAX_DEPTH,
-// JS:       maxMessageSize: 32 * 1024 * 1024,
-// JS:     });
-// JS:   });
-// JS:
-// JS:   it("standalone deserialize round-trips normal values unchanged with no config", () => {
-// JS:     expect(deserialize('["bigint","123"]')).toBe(123n);
-// JS:     expect(deserialize(serialize(12345678901234567890n))).toBe(12345678901234567890n);
-// JS:     expect(deserialize('[[[[123,456]]]]')).toStrictEqual([[123, 456]]);
-// JS:     expect(deserialize('{"foo":{"bar":123}}')).toStrictEqual({foo: {bar: 123}});
-// JS:   });
-// JS:
-// JS:   it("a session constructed with no options behaves exactly as before", async () => {
-// JS:     // A legitimate bigint, normal nesting, and a normal call all flow through a default session
-// JS:     // without aborting.
-// JS:     using harness = new SessionPair(new EchoTarget());
-// JS:
-// JS:     let stub = harness.stub as any;
-// JS:     expect(await stub.echo(123n)).toBe(123n);
-// JS:     expect(await stub.echo([[1, 2, 3]])).toStrictEqual([[1, 2, 3]]);
-// JS:     expect(await stub.echo({a: {b: {c: 1}}})).toStrictEqual({a: {b: {c: 1}}});
-// JS:
-// JS:     await harness.dispose();
-// JS:   });
-// JS:
-// JS:   it("a session constructed with an empty options object behaves identically", async () => {
-// JS:     using harness = new SessionPair(new EchoTarget(), {});
-// JS:     let stub = harness.stub as any;
-// JS:     expect(await stub.echo(999n)).toBe(999n);
-// JS:     await harness.dispose();
-// JS:   });
-// JS: });
+mod limits_backwards_compatibility {
+    use super::*;
+    // JS:   it("DEFAULT_LIMITS has the documented values", () => {
+    #[test]
+    fn default_limits_have_the_documented_values() {
+        // JS:     expect(DEFAULT_MAX_DEPTH).toBe(256);
+        assert_eq!(DEFAULT_MAX_DEPTH, 256);
+        // JS:     expect(DEFAULT_LIMITS).toStrictEqual({
+        // JS:       maxBigIntDigits: 16384,
+        // JS:       maxDepth: DEFAULT_MAX_DEPTH,
+        // JS:       maxMessageSize: 32 * 1024 * 1024,
+        // JS:     });
+        assert_eq!(DEFAULT_LIMITS.max_big_int_digits, 16_384);
+        assert_eq!(DEFAULT_LIMITS.max_depth, DEFAULT_MAX_DEPTH);
+        assert_eq!(DEFAULT_LIMITS.max_message_size, 32 * 1024 * 1024);
+        // JS:   });
+    }
+    // JS:
+    // JS:   it("standalone deserialize round-trips normal values unchanged with no config", () => {
+    #[test]
+    fn standalone_deserialize_round_trips_normal_values_without_config() {
+        // JS:     expect(deserialize('["bigint","123"]')).toBe(123n);
+        assert!(matches!(deserialize("[\"bigint\",\"123\"]").unwrap(),
+            CapnwebValue::BigInt(value) if value == BigInt::from(123)));
+        // JS:     expect(deserialize(serialize(12345678901234567890n))).toBe(12345678901234567890n);
+        let bigint = BigInt::from_str("12345678901234567890").unwrap();
+        let wire = serialize(&CapnwebValue::BigInt(bigint.clone())).unwrap();
+        assert!(
+            matches!(deserialize(&wire).unwrap(), CapnwebValue::BigInt(value) if value == bigint)
+        );
+        // JS:     expect(deserialize('[[[[123,456]]]]')).toStrictEqual([[123, 456]]);
+        assert!(
+            matches!(deserialize("[[[[123,456]]]]").unwrap(), CapnwebValue::Array(outer)
+            if matches!(&outer[..], [CapnwebValue::Array(inner)]
+                if matches!(&inner[..], [CapnwebValue::Number(123.0), CapnwebValue::Number(456.0)])))
+        );
+        // JS:     expect(deserialize('{"foo":{"bar":123}}')).toStrictEqual({foo: {bar: 123}});
+        let CapnwebValue::Object(object) = deserialize("{\"foo\":{\"bar\":123}}").unwrap() else {
+            panic!()
+        };
+        assert!(matches!(&object["foo"], CapnwebValue::Object(foo)
+            if matches!(foo.get("bar"), Some(CapnwebValue::Number(123.0)))));
+        // JS:   });
+    }
+    // JS:
+    // JS:   it("a session constructed with no options behaves exactly as before", async () => {
+    // JS:     // A legitimate bigint, normal nesting, and a normal call all flow through a default session
+    // JS:     // without aborting.
+    // JS:     using harness = new SessionPair(new EchoTarget());
+    // JS:
+    // JS:     let stub = harness.stub as any;
+    // JS:     expect(await stub.echo(123n)).toBe(123n);
+    // JS:     expect(await stub.echo([[1, 2, 3]])).toStrictEqual([[1, 2, 3]]);
+    // JS:     expect(await stub.echo({a: {b: {c: 1}}})).toStrictEqual({a: {b: {c: 1}}});
+    // JS:
+    // JS:     await harness.dispose();
+    // JS:   });
+    // JS:
+    // JS:   it("a session constructed with an empty options object behaves identically", async () => {
+    // JS:     using harness = new SessionPair(new EchoTarget(), {});
+    // JS:     let stub = harness.stub as any;
+    // JS:     expect(await stub.echo(999n)).toBe(999n);
+    // JS:     await harness.dispose();
+    // JS:   });
+    // JS: });
+}
 // JS:
 // JS: // A minimal in-memory bidirectional session pair, sufficient for the round-trip checks above.
 // JS: class PairTransport implements RpcTransport {

@@ -1239,7 +1239,9 @@ impl<'a> Evaluator<'a> {
     /// Evaluates a complete wire expression.
     pub fn evaluate(&mut self, value: CapnwebValue) -> Result<RpcPayload> {
         // JS:     return this.evaluateWithDepth(value, 0);
-        self.evaluate_with_depth(value, 0)
+        stacker::maybe_grow(4 * 1024 * 1024, 8 * 1024 * 1024, || {
+            self.evaluate_with_depth(value, 0)
+        })
         // JS:   }
     }
     // JS:
@@ -2074,10 +2076,18 @@ fn validate_byte_marker(marker: &CapnwebValue, byte_len: usize) -> Result<()> {
 // JS: }
 /// Deserializes a standalone Cap'n Web JSON value.
 pub fn deserialize(value: &str) -> Result<CapnwebValue> {
-    let json = serde_json::from_str(value)
-        .map_err(|error| Error::Type(format!("invalid JSON: {error}")))?;
-    let wire = json_to_capnweb(json)?;
-    let mut importer = NULL_IMPORTER;
-    let payload = Evaluator::new(&mut importer, EncodingLevel::String).evaluate(wire)?;
-    Ok(payload.value)
+    stacker::maybe_grow(4 * 1024 * 1024, 8 * 1024 * 1024, || {
+        let mut deserializer = serde_json::Deserializer::from_str(value);
+        deserializer.disable_recursion_limit();
+        let json =
+            serde::Deserialize::deserialize(serde_stacker::Deserializer::new(&mut deserializer))
+                .map_err(|error| Error::Type(format!("invalid JSON: {error}")))?;
+        deserializer
+            .end()
+            .map_err(|error| Error::Type(format!("invalid JSON: {error}")))?;
+        let wire = json_to_capnweb(json)?;
+        let mut importer = NULL_IMPORTER;
+        let payload = Evaluator::new(&mut importer, EncodingLevel::String).evaluate(wire)?;
+        Ok(payload.value)
+    })
 }
