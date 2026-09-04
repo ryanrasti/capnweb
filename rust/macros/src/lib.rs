@@ -40,8 +40,9 @@ pub fn rpc_interface(_attribute: TokenStream, item: TokenStream) -> TokenStream 
                 return compile_error(&argument.pat, "RPC arguments must use identifier patterns");
             };
             let name = &pattern.ident;
-            parameters.push(quote!(#name: impl Into<::capnweb::Argument>));
-            arguments.push(quote!(::capnweb::CapnwebValue::from(#name.into())));
+            let ty = &argument.ty;
+            parameters.push(quote!(#name: #ty));
+            arguments.push(quote!(::capnweb::IntoCapnwebValue::into_capnweb_value(#name)?));
         }
         let output = match &method.sig.output {
             ReturnType::Default => quote!(()),
@@ -52,12 +53,19 @@ pub fn rpc_interface(_attribute: TokenStream, item: TokenStream) -> TokenStream 
                 &self,
                 #(#parameters),*
             ) -> ::capnweb::TypedRpcPromise<#output> {
-                let args = ::capnweb::RpcPayload::from_app_params(
-                    ::capnweb::CapnwebValue::Array(vec![#(#arguments),*])
-                );
-                ::capnweb::TypedRpcPromise::new(
-                    self.inner.call(vec![#wire_name.to_owned()], args)
-                )
+                let arguments = (|| -> ::capnweb::Result<Vec<::capnweb::CapnwebValue>> {
+                    Ok(vec![#(#arguments),*])
+                })();
+                let promise = match arguments {
+                    Ok(arguments) => self.inner.call(
+                        vec![#wire_name.to_owned()],
+                        ::capnweb::RpcPayload::from_app_params(
+                            ::capnweb::CapnwebValue::Array(arguments)
+                        ),
+                    ),
+                    Err(error) => ::capnweb::RpcPromise::rejected(error),
+                };
+                ::capnweb::TypedRpcPromise::new(promise)
             }
         });
     }
@@ -108,6 +116,7 @@ pub fn rpc_target(attribute: TokenStream, item: TokenStream) -> TokenStream {
 
     let self_type = &implementation.self_ty;
     let mut arms = Vec::new();
+    let mut getter_arms = Vec::new();
     for item in &implementation.items {
         let ImplItem::Fn(method) = item else {
             continue;
@@ -120,80 +129,85 @@ pub fn rpc_target(attribute: TokenStream, item: TokenStream) -> TokenStream {
         };
         let convert = convert_result(&method.sig.output);
 
+        let has_parameters = method
+            .sig
+            .inputs
+            .iter()
+            .any(|input| matches!(input, FnArg::Typed(_)));
+
         if method.sig.asyncness.is_some() {
-            // Difference from JS: invoking an async Rust function only creates
-            // a lazy Future. PromiseStubHook eagerly spawns it, but its first
-            // poll occurs on the Tokio task rather than inline in dispatch.
+            if !has_parameters {
+                let getter_convert = convert.clone();
+                getter_arms.push(quote! {
+                    #wire_name => Ok(::capnweb::PromiseStubHook::from_future(async move {
+                        let __result = self.#method_name().await;
+                        #getter_convert
+                    }))
+                });
+            }
             arms.push(quote! {
-                #wire_name => {
-                    ::capnweb::PromiseStubHook::create(async move {
-                        let delivered = args.deliver().await?;
-                        let ::capnweb::CapnwebValue::Array(values) = delivered else {
-                            return Err(::capnweb::Error::Type("arguments are not an array".into()));
-                        };
-                        let mut __arguments = values.into_iter();
-                        #(#decoders)*
-                        if __arguments.next().is_some() {
-                            return Err(::capnweb::Error::Type(format!(
-                                "too many arguments for `{}`", #wire_name
-                            )));
-                        }
-                        let __result = self.#method_name(#(#arguments),*).await;
-                        #convert
-                    })
-                }
+                #wire_name => Ok(::capnweb::PromiseStubHook::from_future(async move {
+                    let delivered = args.deliver_resolve().await?;
+                    let ::capnweb::CapnwebValue::Array(values) = delivered else {
+                        return Err(::capnweb::Error::Type("arguments are not an array".into()));
+                    };
+                    let mut __arguments = values.into_iter();
+                    #(#decoders)*
+                    if __arguments.next().is_some() {
+                        return Err(::capnweb::Error::Type(format!(
+                            "too many arguments for `{}`", #wire_name
+                        )));
+                    }
+                    let __result = self.#method_name(#(#arguments),*).await;
+                    #convert
+                }))
             });
         } else {
-            let delayed_convert = convert.clone();
+            if !has_parameters {
+                let getter_convert = convert.clone();
+                getter_arms.push(quote! {
+                    #wire_name => Ok(::capnweb::PromiseStubHook::from_future(async move {
+                        let __result = self.#method_name();
+                        #getter_convert
+                    }))
+                });
+            }
             arms.push(quote! {
-                #wire_name => {
-                    if args.is_immediate() {
-                        let __call = || -> ::capnweb::Result<::capnweb::StubHook> {
-                            let ::capnweb::CapnwebValue::Array(values) = args.value else {
-                                return Err(::capnweb::Error::Type("arguments are not an array".into()));
-                            };
-                            let mut __arguments = values.into_iter();
-                            #(#decoders)*
-                            if __arguments.next().is_some() {
-                                return Err(::capnweb::Error::Type(format!(
-                                    "too many arguments for `{}`", #wire_name
-                                )));
-                            }
-                            let __result = self.#method_name(#(#arguments),*);
-                            #convert
-                        };
-                        match __call() {
-                            Ok(hook) => hook,
-                            Err(error) => ::capnweb::ErrorStubHook::create(error),
-                        }
-                    } else {
-                        ::capnweb::PromiseStubHook::create(async move {
-                            let delivered = args.deliver().await?;
-                            let ::capnweb::CapnwebValue::Array(values) = delivered else {
-                                return Err(::capnweb::Error::Type("arguments are not an array".into()));
-                            };
-                            let mut __arguments = values.into_iter();
-                            #(#decoders)*
-                            if __arguments.next().is_some() {
-                                return Err(::capnweb::Error::Type(format!(
-                                    "too many arguments for `{}`", #wire_name
-                                )));
-                            }
-                            let __result = self.#method_name(#(#arguments),*);
-                            #delayed_convert
-                        })
+                #wire_name => Ok(::capnweb::PromiseStubHook::from_future(async move {
+                    let delivered = args.deliver_resolve().await?;
+                    let ::capnweb::CapnwebValue::Array(values) = delivered else {
+                        return Err(::capnweb::Error::Type("arguments are not an array".into()));
+                    };
+                    let mut __arguments = values.into_iter();
+                    #(#decoders)*
+                    if __arguments.next().is_some() {
+                        return Err(::capnweb::Error::Type(format!(
+                            "too many arguments for `{}`", #wire_name
+                        )));
                     }
-                }
+                    let __result = self.#method_name(#(#arguments),*);
+                    #convert
+                }))
             });
         }
     }
 
-    let interface_guard = interface.map(|interface| {
+    let interface_guard = interface.as_ref().map(|interface| {
         quote! {
             if !<#interface as ::capnweb::RpcInterfaceDescriptor>::has_member(&method) {
-                return ::capnweb::ErrorStubHook::create(
-                    ::capnweb::Error::NoSuchMethod(method)
-                );
+                return Err(::capnweb::Error::Type(format!(
+                    "No such RPC method: {}", method
+                )));
+            }
+        }
+    });
+
+    let getter_interface_guard = interface.as_ref().map(|interface| {
+        quote! {
+            if !<#interface as ::capnweb::RpcInterfaceDescriptor>::has_member(&property) {
+                return Err(::capnweb::Error::Type(format!(
+                    "No such RPC property: {}", property
+                )));
             }
         }
     });
@@ -204,15 +218,60 @@ pub fn rpc_target(attribute: TokenStream, item: TokenStream) -> TokenStream {
         impl ::capnweb::RpcTargetInner for #self_type {
             fn call(
                 self: ::std::sync::Arc<Self>,
-                method: String,
+                path: ::capnweb::PropertyPath,
                 args: ::capnweb::RpcPayload,
-            ) -> ::capnweb::StubHook {
+            ) -> ::capnweb::Result<::capnweb::StubHook> {
+                if path.len() > 1 {
+                    let first = vec![path[0].clone()];
+                    let remaining = path[1..].to_vec();
+                    let property = ::capnweb::RpcTargetInner::get(
+                        ::std::sync::Arc::clone(&self),
+                        first,
+                    )?;
+                    return property.call(remaining, args);
+                }
+                let method = match path.as_slice() {
+                    [::capnweb::PropertyKey::String(method)] => method.clone(),
+                    _ => {
+                        drop(args);
+                        return Err(::capnweb::Error::Type(format!(
+                            "No such RPC method path: {:?}", path
+                        )));
+                    }
+                };
                 #interface_guard
                 match method.as_str() {
                     #(#arms,)*
-                    _ => ::capnweb::ErrorStubHook::create(
-                        ::capnweb::Error::NoSuchMethod(method)
-                    ),
+                    _ => Err(::capnweb::Error::Type(format!(
+                        "No such RPC method: {}", method
+                    ))),
+                }
+            }
+
+            fn get(
+                self: ::std::sync::Arc<Self>,
+                path: ::capnweb::PropertyPath,
+            ) -> ::capnweb::Result<::capnweb::StubHook> {
+                if path.len() > 1 {
+                    let first = vec![path[0].clone()];
+                    let remaining = path[1..].to_vec();
+                    let property = ::capnweb::RpcTargetInner::get(self, first)?;
+                    return property.get(remaining);
+                }
+                let property = match path.as_slice() {
+                    [::capnweb::PropertyKey::String(property)] => property.clone(),
+                    _ => {
+                        return Err(::capnweb::Error::Type(format!(
+                            "No such RPC property path: {:?}", path
+                        )));
+                    }
+                };
+                #getter_interface_guard
+                match property.as_str() {
+                    #(#getter_arms,)*
+                    _ => Err(::capnweb::Error::Type(format!(
+                        "RPC member is not a readable property: {}", property
+                    ))),
                 }
             }
         }
@@ -257,19 +316,19 @@ fn convert_result(output: &ReturnType) -> proc_macro2::TokenStream {
             match __result {
                 Ok(value) => {
                     let value = ::capnweb::IntoCapnwebValue::into_capnweb_value(value)?;
-                    Ok(::capnweb::PayloadStubHook::create(
+                    Ok(::std::sync::Arc::new(::capnweb::PayloadStubHook::new(
                         ::capnweb::RpcPayload::from_app_return(value)
-                    ))
+                    )) as ::capnweb::StubHook)
                 }
-                Err(error) => Err(::capnweb::Error::Remote(error.to_string())),
+                Err(error) => Err(::capnweb::Error::Message(error.to_string())),
             }
         }
     } else {
         quote! {
             let value = ::capnweb::IntoCapnwebValue::into_capnweb_value(__result)?;
-            Ok(::capnweb::PayloadStubHook::create(
+            Ok(::std::sync::Arc::new(::capnweb::PayloadStubHook::new(
                 ::capnweb::RpcPayload::from_app_return(value)
-            ))
+            )) as ::capnweb::StubHook)
         }
     }
 }

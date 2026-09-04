@@ -231,6 +231,43 @@ pub trait RpcTargetInner: Send + Sync + 'static {
 }
 
 impl<T: RpcTargetInner> RpcTarget for T {}
+
+struct FunctionTarget<F>(F);
+
+impl<F, Fut> RpcTargetInner for FunctionTarget<F>
+where
+    F: Fn(RpcPayload) -> Fut + Send + Sync + 'static,
+    Fut: Future<Output = Result<CapnwebValue>> + Send + 'static,
+{
+    fn call(self: Arc<Self>, path: PropertyPath, args: RpcPayload) -> Result<StubHook> {
+        if !path.is_empty() {
+            drop(args);
+            return Err(Error::Type(
+                "RPC function capabilities can only be called at the empty path".to_owned(),
+            ));
+        }
+        let future = (self.0)(args);
+        Ok(PromiseStubHook::from_future(async move {
+            let value = future.await?;
+            Ok(Arc::new(PayloadStubHook::new(RpcPayload::from_app_return(value))) as StubHook)
+        }))
+    }
+
+    fn get(self: Arc<Self>, path: PropertyPath) -> Result<StubHook> {
+        Err(Error::Type(format!(
+            "Cannot read path {path:?} from an RPC function capability"
+        )))
+    }
+}
+
+/// Wraps an async Rust closure as a callable Cap'n Web function value.
+pub fn function_target<F, Fut>(function: F) -> CapnwebValue
+where
+    F: Fn(RpcPayload) -> Fut + Send + Sync + 'static,
+    Fut: Future<Output = Result<CapnwebValue>> + Send + 'static,
+{
+    CapnwebValue::Function(Arc::new(FunctionTarget(function)))
+}
 // JS:
 
 // JS: export let RpcTarget = workersModule ? workersModule.RpcTarget : class {};
@@ -240,6 +277,32 @@ impl<T: RpcTargetInner> RpcTarget for T {}
 // JS: export type PropertyPath = (string | number)[];
 /// A sequence of string or numeric property keys traversed by an RPC operation.
 pub type PropertyPath = Vec<PropertyKey>;
+
+/// Converts generated string paths or native property paths into the runtime representation.
+pub trait IntoPropertyPath {
+    /// Performs the path conversion.
+    fn into_property_path(self) -> PropertyPath;
+}
+
+impl IntoPropertyPath for PropertyPath {
+    fn into_property_path(self) -> PropertyPath {
+        self
+    }
+}
+
+impl IntoPropertyPath for Vec<String> {
+    fn into_property_path(self) -> PropertyPath {
+        self.into_iter().map(PropertyKey::String).collect()
+    }
+}
+
+impl<const N: usize> IntoPropertyPath for [&str; N] {
+    fn into_property_path(self) -> PropertyPath {
+        self.into_iter()
+            .map(|part| PropertyKey::String(part.to_owned()))
+            .collect()
+    }
+}
 
 /// Raw wire expressions interpreted by the map runtime.
 pub type MapInstructions = Vec<CapnwebValue>;
@@ -1062,6 +1125,12 @@ impl RpcStub {
         }
     }
 
+    /// Constructs a stub directly from a generated local target.
+    pub fn from_target<T: RpcTargetInner>(target: Arc<T>) -> Self {
+        let target: Arc<dyn RpcTargetInner> = target;
+        Self::from_value(CapnwebValue::Target(target))
+    }
+
     /// Constructs a stub which adopts an application value.
     pub fn from_value(value: CapnwebValue) -> Self {
         let hook = match value {
@@ -1074,6 +1143,23 @@ impl RpcStub {
 
     fn current_hook(&self) -> StubHook {
         Arc::clone(&self.hook)
+    }
+
+    /// Creates a lazy property promise at `path` without pulling the capability.
+    pub fn get(&self, path: Vec<String>) -> RpcPromise {
+        let mut combined = self.path_if_promise.clone().unwrap_or_default();
+        combined.extend(path.into_iter().map(PropertyKey::String));
+        RpcPromise::from_hook(self.current_hook(), combined)
+    }
+
+    /// Sends or pipelines a call, converting synchronous setup errors into rejected RPC promises.
+    pub fn call(&self, path: Vec<String>, args: RpcPayload) -> RpcPromise {
+        let mut combined = self.path_if_promise.clone().unwrap_or_default();
+        combined.extend(path.into_iter().map(PropertyKey::String));
+        match do_call(self.current_hook(), combined, args) {
+            Ok(hook) => RpcPromise::from_hook(hook, Vec::new()),
+            Err(error) => RpcPromise::rejected(error),
+        }
     }
 
     #[doc(hidden)]
@@ -1126,6 +1212,7 @@ impl RpcStub {
         &self,
         function: impl FnOnce(RpcPromise) -> Result<CapnwebValue> + Send + 'static,
     ) -> Result<RpcPromise> {
+        let _ = crate::map::force_init_map();
         // JS:     let {hook, pathIfPromise} = this[RAW_STUB];
         let hook = self.current_hook();
         let path = self.path_if_promise.clone().unwrap_or_default();
@@ -1139,6 +1226,12 @@ impl RpcStub {
 // JS:     return "[object RpcStub]";
 // JS:   }
 // JS: }
+impl std::fmt::Debug for RpcStub {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("RpcStub(..)")
+    }
+}
+
 impl std::fmt::Display for RpcStub {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter.write_str("[object RpcStub]")
@@ -1226,6 +1319,21 @@ impl RpcPromise {
         }
     }
 
+    /// Creates a permanently rejected RPC promise.
+    pub fn rejected(error: Error) -> Self {
+        Self::from_hook(Arc::new(ErrorStubHook::new(error)), Vec::new())
+    }
+
+    /// Creates a lazy property promise relative to this promise's pipeline path.
+    pub fn get(&self, path: Vec<String>) -> Self {
+        self.stub.get(path)
+    }
+
+    /// Sends a call relative to this promise's pipeline path.
+    pub fn call(&self, path: Vec<String>, args: RpcPayload) -> Self {
+        self.stub.call(path, args)
+    }
+
     /// Adopts an already-dynamic value as an asynchronously delivered promise resolution.
     pub fn from_value(value: CapnwebValue) -> Self {
         if let CapnwebValue::RpcPromise(promise) = value {
@@ -1252,6 +1360,11 @@ impl RpcPromise {
 
     pub(crate) fn as_stub(&self) -> &RpcStub {
         &self.stub
+    }
+
+    /// Pulls, resolves, and consumes this promise handle.
+    pub async fn pull(self) -> Result<CapnwebValue> {
+        pull_promise(self).await
     }
 
     /// Resolves and consumes this promise handle.

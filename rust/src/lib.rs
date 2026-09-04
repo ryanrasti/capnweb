@@ -3,9 +3,31 @@
 // JS: //     https://opensource.org/license/mit
 // JS:
 // JS: import { RpcTarget as RpcTargetImpl, RpcStub as RpcStubImpl, RpcPromise as RpcPromiseImpl } from "./core.js";
+mod core;
+mod eager_promise;
+mod typed;
 // JS: import { serialize, deserialize, EncodingLevel } from "./serialize.js";
+mod serialize;
 // JS: import { RpcTransport, RpcTransportWithCustomEncoding, AnyRpcTransport, RpcSession as RpcSessionImpl, RpcSessionOptions } from "./rpc.js";
+mod rpc;
 // JS: import { RpcLimits, DEFAULT_LIMITS, DEFAULT_MAX_DEPTH } from "./serialize.js";
+pub use capnweb_macros::{rpc_interface, rpc_target};
+pub use core::{
+    CapnwebError, CapnwebValue, Error, IntoPropertyPath, MapInstructions, MaybePromise,
+    PayloadStubHook, PromiseStubHook, PropertyKey, PropertyPath, Result, RpcPayload, RpcPromise,
+    RpcStub, RpcTarget, RpcTargetInner, StreamCall, StubHook, StubHookInner, function_target,
+};
+pub use num_bigint::BigInt;
+pub use rpc::{
+    AnyRpcTransport, RpcSession, RpcSessionImpl, RpcSessionOptions, RpcSessionStats,
+    TransportMessage, TransportSend,
+};
+pub use serialize::{
+    DEFAULT_LIMITS, DEFAULT_MAX_DEPTH, EncodingLevel, ExportId, Exporter, ImportId, Importer,
+    RpcLimits, deserialize, serialize,
+};
+pub use typed::{FromCapnwebValue, IntoCapnwebValue, RpcInterfaceDescriptor, TypedRpcPromise};
+
 // JS: import { RpcTargetBranded, RpcCompatible, Stub, ElideStub, PayloadOrStub,
 // JS:          type RpcPromise as RpcPromiseType, __RPC_TARGET_BRAND } from "./types.js";
 // JS: import { newWebSocketRpcSession as newWebSocketRpcSessionImpl,
@@ -14,6 +36,8 @@
 // JS:          newHttpBatchRpcResponse, nodeHttpBatchRpcResponse } from "./batch.js";
 // JS: import { newMessagePortRpcSession as newMessagePortRpcSessionImpl } from "./messageport.js";
 // JS: import { forceInitMap } from "./map.js";
+mod map;
+pub use map::force_init_map;
 // JS: import { forceInitStreams } from "./streams.js";
 // JS:
 // JS: forceInitMap();

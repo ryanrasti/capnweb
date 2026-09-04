@@ -1083,6 +1083,7 @@ impl RpcSessionImpl {
         main_hook: StubHook,
         options: RpcSessionOptions,
     ) -> Result<Self> {
+        let _ = crate::map::force_init_map();
         // JS:     // `RpcTransport` has no `encodingLevel` field, so its presence is what marks a custom-encoding
         // JS:     // transport. Read it defensively: treat a present-but-`undefined` value (e.g. an uninitialized
         // JS:     // class field) as the default string level rather than mis-routing it down the custom-encoding

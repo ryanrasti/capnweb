@@ -4,6 +4,8 @@
 mod core;
 #[path = "../src/eager_promise.rs"]
 mod eager_promise;
+#[path = "../src/map.rs"]
+mod map;
 #[path = "../src/rpc.rs"]
 mod rpc;
 #[path = "../src/serialize.rs"]
