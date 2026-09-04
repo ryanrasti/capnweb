@@ -465,11 +465,12 @@ impl ImportTableEntry {
             // JS:           delete this.session.onBrokenCallbacks[endIndex];
             if let Some(session) = &session {
                 let mut session = session.lock().expect("RPC session mutex poisoned");
+                // Rust boxes the forwarding closure, so callback pointer identity cannot survive
+                // `on_broken()`. A newly-appended slot is the equivalent registration-back signal.
                 let registered_back = session
                     .on_broken_callbacks
                     .get(end_index)
-                    .and_then(Option::as_ref)
-                    .is_some_and(|candidate| Arc::ptr_eq(candidate, &callback));
+                    .is_some_and(Option::is_some);
                 if registered_back {
                     session.on_broken_callbacks[end_index] = None;
                 } else if let Some(slot) = session.on_broken_callbacks.get_mut(index) {

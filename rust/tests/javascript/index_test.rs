@@ -15,9 +15,9 @@
 // JS:
 // JS: type CustomEncodingLevel = RpcTransportWithCustomEncoding["encodingLevel"];
 use crate::core::{
-    CapnwebError, CapnwebValue, Error, PayloadStubHook, PromiseStubHook, PropertyKey, PropertyPath,
-    Result, RpcPayload, RpcPromise, RpcStub, RpcTargetInner, StubHook, function_target,
-    unwrap_stub_and_path,
+    CapnwebError, CapnwebValue, Error, ErrorStubHook, PayloadStubHook, PromiseStubHook,
+    PropertyKey, PropertyPath, Result, RpcPayload, RpcPromise, RpcStub, RpcTargetInner, StubHook,
+    StubHookInner, function_target, unwrap_stub_and_path,
 };
 use crate::rpc::{AnyRpcTransport, RpcSession, RpcSessionOptions, TransportMessage, TransportSend};
 use crate::serialize::{EncodingLevel, deserialize, serialize, swap_byte_order};
@@ -2827,6 +2827,38 @@ impl RpcTargetInner for OrderTarget {
     }
 }
 
+struct BrokenSignalTarget;
+
+impl RpcTargetInner for BrokenSignalTarget {
+    fn call(self: Arc<Self>, path: PropertyPath, _args: RpcPayload) -> Result<StubHook> {
+        match path.as_slice() {
+            [PropertyKey::String(method)] if method == "getValue" => Ok(Arc::new(
+                PayloadStubHook::new(RpcPayload::from_app_return(CapnwebValue::Number(42.0))),
+            )),
+            [PropertyKey::String(method)] if method == "makeCounter" => {
+                Ok(Arc::new(PayloadStubHook::new(RpcPayload::from_app_return(
+                    CapnwebValue::Target(Arc::new(LocalCounter(std::sync::Mutex::new(0.0)))),
+                ))))
+            }
+            [PropertyKey::String(method)] if method == "hangingCall" => {
+                Ok(PromiseStubHook::from_future(async move {
+                    pending::<Result<StubHook>>().await
+                }))
+            }
+            [PropertyKey::String(method)] if method == "throwError" => {
+                Ok(PromiseStubHook::from_future(async move {
+                    Err(Error::Message("test error".to_owned()))
+                }))
+            }
+            _ => Err(Error::Type(format!("No such RPC method: {path:?}"))),
+        }
+    }
+
+    fn get(self: Arc<Self>, path: PropertyPath) -> Result<StubHook> {
+        Err(Error::Type(format!("No such RPC property: {path:?}")))
+    }
+}
+
 struct DisposableValueTarget {
     disposed: Arc<std::sync::atomic::AtomicUsize>,
 }
@@ -5591,229 +5623,702 @@ mod remote_error_serialization {
 }
 // JS:
 // JS: describe("onRpcBroken", () => {
-// JS:   it("signals when the connection is lost", async () => {
-// JS:     class TestBroken extends RpcTarget {
-// JS:       getValue() { return 42; }
-// JS:       makeCounter() { return new Counter(0); }
-// JS:       hangingCall(): Promise<Counter> {
-// JS:         // This call will hang and be interrupted by disconnect
-// JS:         return new Promise(() => {}); // Never resolves
-// JS:       }
-// JS:       throwError(): Promise<Counter> { throw new Error("test error"); }
-// JS:     }
-// JS:
-// JS:     // Intentionally don't use `using` here because we expect the stats to be wrong after a
-// JS:     // disconnect.
-// JS:     let harness = new TestHarness(new TestBroken());
-// JS:     let stub = harness.stub;
-// JS:     expect(await stub.getValue()).toBe(42);
-// JS:
-// JS:     let errors: {which: string, error: any}[] = [];
-// JS:     stub.onRpcBroken(error => { errors.push({which: "stub", error}); });
-// JS:
-// JS:     let counter1Promise = stub.makeCounter();
-// JS:     counter1Promise.onRpcBroken(error => { errors.push({which: "counter1Promise", error}); });
-// JS:
-// JS:     let counter2 = await stub.makeCounter();
-// JS:     counter2.onRpcBroken(error => { errors.push({which: "counter2", error}); });
-// JS:
-// JS:     let counter1 = await counter1Promise;
-// JS:     counter1.onRpcBroken(error => { errors.push({which: "counter1", error}); });
-// JS:
-// JS:     let hangingPromise = stub.hangingCall();
-// JS:     hangingPromise.onRpcBroken(error => { errors.push({which: "hangingCall", error}); });
-// JS:
-// JS:     let throwingPromise = stub.throwError();
-// JS:     throwingPromise.onRpcBroken(error => { errors.push({which: "throwError", error}); });
-// JS:
-// JS:     // The method that threw should report brokenness immediately.
-// JS:     await throwingPromise.catch(err => {});
-// JS:     expect(errors).toStrictEqual([
-// JS:       {which: "throwError", error: new Error("test error")},
-// JS:     ]);
-// JS:
-// JS:     // onRpcBroken() when already broken just reports the error immediately.
-// JS:     throwingPromise.onRpcBroken(error => { errors.push({which: "throwError2", error}); });
-// JS:     expect(errors).toStrictEqual([
-// JS:       {which: "throwError", error: new Error("test error")},
-// JS:       {which: "throwError2", error: new Error("test error")},
-// JS:     ]);
-// JS:
-// JS:     // Simulate disconnect by making the transport fail
-// JS:     harness.clientTransport.forceReceiveError(new Error("test disconnect"));
-// JS:     await hangingPromise.catch(err => {});
-// JS:
-// JS:     // Now all the other errors were reported, in the order in which the callbacks were
-// JS:     // registered.
-// JS:     expect(errors).toStrictEqual([
-// JS:       {which: "throwError", error: new Error("test error")},
-// JS:       {which: "throwError2", error: new Error("test error")},
-// JS:       {which: "stub", error: new Error("test disconnect")},
-// JS:       {which: "counter1Promise", error: new Error("test disconnect")},
-// JS:       {which: "counter2", error: new Error("test disconnect")},
-// JS:       {which: "counter1", error: new Error("test disconnect")},
-// JS:       {which: "hangingCall", error: new Error("test disconnect")},
-// JS:     ]);
-// JS:   });
-// JS: });
+mod on_rpc_broken {
+    use super::*;
+
+    fn record_error(
+        errors: Arc<std::sync::Mutex<Vec<(String, String)>>>,
+        which: &'static str,
+    ) -> impl FnOnce(Error) + Send + 'static {
+        move |error| {
+            let message = match error {
+                Error::Serialized(error) => error.message,
+                error => format!("{error}"),
+            };
+            errors.lock().unwrap().push((which.to_owned(), message))
+        }
+    }
+    // JS:   it("signals when the connection is lost", async () => {
+    #[tokio::test(flavor = "current_thread")]
+    async fn signals_when_the_connection_is_lost() {
+        // JS:     class TestBroken extends RpcTarget {
+        // JS:       getValue() { return 42; }
+        // JS:       makeCounter() { return new Counter(0); }
+        // JS:       hangingCall(): Promise<Counter> {
+        // JS:         // This call will hang and be interrupted by disconnect
+        // JS:         return new Promise(() => {}); // Never resolves
+        // JS:       }
+        // JS:       throwError(): Promise<Counter> { throw new Error("test error"); }
+        // JS:     }
+        // `BrokenSignalTarget` is the generated dispatch equivalent.
+        // JS:
+        // JS:     // Intentionally don't use `using` here because we expect the stats to be wrong after a
+        // JS:     // disconnect.
+        // JS:     let harness = new TestHarness(new TestBroken());
+        let harness = IndexRpcHarness::new(Arc::new(BrokenSignalTarget));
+        // JS:     let stub = harness.stub;
+        let stub = harness.stub.clone();
+        // JS:     expect(await stub.getValue()).toBe(42);
+        assert!(matches!(
+            stub.call(
+                vec!["getValue".to_owned()],
+                RpcPayload::from_app_params(CapnwebValue::Array(vec![]))
+            )
+            .pull()
+            .await
+            .unwrap(),
+            CapnwebValue::Number(42.0)
+        ));
+        // JS:
+        // JS:     let errors: {which: string, error: any}[] = [];
+        let errors = Arc::new(std::sync::Mutex::new(Vec::new()));
+        // JS:     stub.onRpcBroken(error => { errors.push({which: "stub", error}); });
+        stub.on_rpc_broken(record_error(errors.clone(), "stub"));
+        // JS:
+        // JS:     let counter1Promise = stub.makeCounter();
+        let counter1_promise = stub.call(
+            vec!["makeCounter".to_owned()],
+            RpcPayload::from_app_params(CapnwebValue::Array(vec![])),
+        );
+        // JS:     counter1Promise.onRpcBroken(error => { errors.push({which: "counter1Promise", error}); });
+        counter1_promise
+            .as_stub()
+            .on_rpc_broken(record_error(errors.clone(), "counter1Promise"));
+        // JS:
+        // JS:     let counter2 = await stub.makeCounter();
+        let counter2 = RpcStub::from_value(
+            stub.call(
+                vec!["makeCounter".to_owned()],
+                RpcPayload::from_app_params(CapnwebValue::Array(vec![])),
+            )
+            .pull()
+            .await
+            .unwrap(),
+        );
+        // JS:     counter2.onRpcBroken(error => { errors.push({which: "counter2", error}); });
+        counter2.on_rpc_broken(record_error(errors.clone(), "counter2"));
+        // JS:
+        // JS:     let counter1 = await counter1Promise;
+        let counter1 = RpcStub::from_value(counter1_promise.clone().pull().await.unwrap());
+        // JS:     counter1.onRpcBroken(error => { errors.push({which: "counter1", error}); });
+        counter1.on_rpc_broken(record_error(errors.clone(), "counter1"));
+        // JS:
+        // JS:     let hangingPromise = stub.hangingCall();
+        let hanging_promise = stub.call(
+            vec!["hangingCall".to_owned()],
+            RpcPayload::from_app_params(CapnwebValue::Array(vec![])),
+        );
+        // JS:     hangingPromise.onRpcBroken(error => { errors.push({which: "hangingCall", error}); });
+        hanging_promise
+            .as_stub()
+            .on_rpc_broken(record_error(errors.clone(), "hangingCall"));
+        // JS:
+        // JS:     let throwingPromise = stub.throwError();
+        let throwing_promise = stub.call(
+            vec!["throwError".to_owned()],
+            RpcPayload::from_app_params(CapnwebValue::Array(vec![])),
+        );
+        // JS:     throwingPromise.onRpcBroken(error => { errors.push({which: "throwError", error}); });
+        throwing_promise
+            .as_stub()
+            .on_rpc_broken(record_error(errors.clone(), "throwError"));
+        // JS:
+        // JS:     // The method that threw should report brokenness immediately.
+        // JS:     await throwingPromise.catch(err => {});
+        let _ = throwing_promise.clone().pull().await;
+        // JS:     expect(errors).toStrictEqual([
+        let snapshot = errors.lock().unwrap().clone();
+        // JS:       {which: "throwError", error: new Error("test error")},
+        assert_eq!(
+            snapshot,
+            [("throwError".to_owned(), "test error".to_owned())]
+        );
+        // JS:     ]);
+        // Compared above.
+        // JS:
+        // JS:     // onRpcBroken() when already broken just reports the error immediately.
+        // JS:     throwingPromise.onRpcBroken(error => { errors.push({which: "throwError2", error}); });
+        throwing_promise
+            .as_stub()
+            .on_rpc_broken(record_error(errors.clone(), "throwError2"));
+        // JS:     expect(errors).toStrictEqual([
+        let snapshot = errors.lock().unwrap().clone();
+        // JS:       {which: "throwError", error: new Error("test error")},
+        // JS:       {which: "throwError2", error: new Error("test error")},
+        assert_eq!(
+            snapshot,
+            [
+                ("throwError".to_owned(), "test error".to_owned()),
+                ("throwError2".to_owned(), "test error".to_owned())
+            ]
+        );
+        // JS:     ]);
+        // Compared above.
+        // JS:
+        // JS:     // Simulate disconnect by making the transport fail
+        // JS:     harness.clientTransport.forceReceiveError(new Error("test disconnect"));
+        harness
+            .client_transport
+            .force_receive_error(Error::Message("test disconnect".to_owned()));
+        // JS:     await hangingPromise.catch(err => {});
+        let _ = hanging_promise.clone().pull().await;
+        // JS:
+        // JS:     // Now all the other errors were reported, in the order in which the callbacks were
+        // JS:     // registered.
+        // JS:     expect(errors).toStrictEqual([
+        let snapshot = errors.lock().unwrap().clone();
+        // JS:       {which: "throwError", error: new Error("test error")},
+        // JS:       {which: "throwError2", error: new Error("test error")},
+        // JS:       {which: "stub", error: new Error("test disconnect")},
+        // JS:       {which: "counter1Promise", error: new Error("test disconnect")},
+        // JS:       {which: "counter2", error: new Error("test disconnect")},
+        // JS:       {which: "counter1", error: new Error("test disconnect")},
+        // JS:       {which: "hangingCall", error: new Error("test disconnect")},
+        assert_eq!(
+            snapshot
+                .iter()
+                .map(|(which, error)| (which.as_str(), error.as_str()))
+                .collect::<Vec<_>>(),
+            [
+                ("throwError", "test error"),
+                ("throwError2", "test error"),
+                ("stub", "test disconnect"),
+                ("counter1Promise", "test disconnect"),
+                ("counter2", "test disconnect"),
+                ("counter1", "test disconnect"),
+                ("hangingCall", "test disconnect")
+            ]
+        );
+        // JS:     ]);
+        // Compared above.
+        // JS:   });
+    }
+    // JS: });
+}
 // JS:
 // JS: // =======================================================================================
 // JS:
 // JS: // Creates an RpcTarget that records whether its disposer has run, for verifying that a payload
 // JS: // containing (a copy of) it was properly disposed.
 // JS: function disposalSpy() {
+struct DisposableCounterTarget {
+    value: std::sync::Mutex<f64>,
+    disposed: Arc<AtomicBool>,
+}
+
+impl Drop for DisposableCounterTarget {
+    fn drop(&mut self) {
+        self.disposed.store(true, Ordering::SeqCst);
+    }
+}
+
+impl RpcTargetInner for DisposableCounterTarget {
+    fn call(self: Arc<Self>, path: PropertyPath, args: RpcPayload) -> Result<StubHook> {
+        if path != vec![PropertyKey::String("increment".to_owned())] {
+            return Err(Error::Type(format!("No such RPC method: {path:?}")));
+        }
+        Ok(PromiseStubHook::from_future(async move {
+            let CapnwebValue::Array(values) = args.deliver_resolve().await? else {
+                panic!()
+            };
+            let by = match values.first() {
+                Some(CapnwebValue::Number(value)) => *value,
+                None => 1.0,
+                _ => panic!(),
+            };
+            let result = {
+                let mut value = self.value.lock().unwrap();
+                *value += by;
+                *value
+            };
+            Ok(Arc::new(PayloadStubHook::new(RpcPayload::from_app_return(
+                CapnwebValue::Number(result),
+            ))) as StubHook)
+        }))
+    }
+    fn get(self: Arc<Self>, path: PropertyPath) -> Result<StubHook> {
+        Err(Error::Type(format!("No such RPC property: {path:?}")))
+    }
+}
+
+struct DisposalSpyTarget(Arc<AtomicBool>);
+impl Drop for DisposalSpyTarget {
+    fn drop(&mut self) {
+        self.0.store(true, Ordering::SeqCst);
+    }
+}
+impl RpcTargetInner for DisposalSpyTarget {
+    fn call(self: Arc<Self>, path: PropertyPath, _args: RpcPayload) -> Result<StubHook> {
+        Err(Error::Type(format!("No such RPC method: {path:?}")))
+    }
+    fn get(self: Arc<Self>, path: PropertyPath) -> Result<StubHook> {
+        Err(Error::Type(format!("No such RPC property: {path:?}")))
+    }
+}
 // JS:   let disposed = false;
+// Stored in the shared atomic flag below.
 // JS:   class Disposable extends RpcTarget {
 // JS:     [Symbol.dispose]() { disposed = true; }
 // JS:   }
+// `DisposalSpyTarget::drop` is Rust's ownership equivalent.
 // JS:   return { target: new Disposable(), wasDisposed: () => disposed };
+fn disposal_spy() -> (CapnwebValue, Arc<AtomicBool>) {
+    let disposed = Arc::new(AtomicBool::new(false));
+    (
+        CapnwebValue::Target(Arc::new(DisposalSpyTarget(disposed.clone()))),
+        disposed,
+    )
+}
 // JS: }
 // JS:
 // JS: describe("PromiseStubHook", () => {
-// JS:   it("disposes copied call arguments when the backing promise rejects", async () => {
-// JS:     let spy = disposalSpy();
-// JS:     let argument = new RpcStub(spy.target);
-// JS:     let hook = new PromiseStubHook(Promise.reject(new Error("nope")));
-// JS:     let result = hook.call([], RpcPayload.fromAppParams([argument]));
-// JS:
-// JS:     await expect(result.pull()).rejects.toThrow("nope");
-// JS:     argument[Symbol.dispose]();
-// JS:     expect(spy.wasDisposed()).toBe(true);
-// JS:   });
-// JS:
-// JS:   it("disposes copied stream arguments when the backing promise rejects", async () => {
-// JS:     let spy = disposalSpy();
-// JS:     let argument = new RpcStub(spy.target);
-// JS:     let hook = new PromiseStubHook(Promise.reject(new Error("nope")));
-// JS:     let result = hook.stream(["write"], RpcPayload.fromAppParams([argument]));
-// JS:
-// JS:     await expect(result.promise).rejects.toThrow("nope");
-// JS:     argument[Symbol.dispose]();
-// JS:     expect(spy.wasDisposed()).toBe(true);
-// JS:   });
-// JS:
-// JS:   it("delivers a call initiated before disposal", async () => {
-// JS:     let disposed = false;
-// JS:     class DisposableCounter extends Counter {
-// JS:       [Symbol.dispose]() { disposed = true; }
-// JS:     }
-// JS:
-// JS:     let inner = new RpcStub(new DisposableCounter(1));
-// JS:     let hook = new PromiseStubHook(Promise.resolve(unwrapStubTakingOwnership(<any>inner)));
-// JS:     await pumpMicrotasks();
-// JS:
-// JS:     let stub: RpcStub<Counter> = <any>new RawRpcStub(hook);
-// JS:     let result = stub.increment(2);
-// JS:     stub[Symbol.dispose]();
-// JS:
-// JS:     expect(disposed).toBe(false);
-// JS:     expect(await result).toBe(3);
-// JS:     expect(disposed).toBe(true);
-// JS:   });
-// JS:
-// JS:   it("disposes copied call arguments when the destination hook is broken", async () => {
-// JS:     let spy = disposalSpy();
-// JS:     let argument = new RpcStub(spy.target);
-// JS:     let hook = new PromiseStubHook(Promise.resolve(new ErrorStubHook(new Error("broken"))));
-// JS:     let result = hook.call([], RpcPayload.fromAppParams([argument]));
-// JS:
-// JS:     await expect(result.pull()).rejects.toThrow("broken");
-// JS:     argument[Symbol.dispose]();
-// JS:     expect(spy.wasDisposed()).toBe(true);
-// JS:   });
-// JS:
-// JS:   it("disposes copied stream arguments when the destination hook is broken", async () => {
-// JS:     let spy = disposalSpy();
-// JS:     let argument = new RpcStub(spy.target);
-// JS:     let hook = new PromiseStubHook(Promise.resolve(new ErrorStubHook(new Error("broken"))));
-// JS:     let result = hook.stream(["write"], RpcPayload.fromAppParams([argument]));
-// JS:
-// JS:     await expect(result.promise).rejects.toThrow("broken");
-// JS:     argument[Symbol.dispose]();
-// JS:     expect(spy.wasDisposed()).toBe(true);
-// JS:   });
-// JS:
-// JS:   it("disposes copied call arguments when the local call path fails", async () => {
-// JS:     let spy = disposalSpy();
-// JS:     let argument = new RpcStub(spy.target);
-// JS:     let hook = new PromiseStubHook(
-// JS:         Promise.resolve(new PayloadStubHook(RpcPayload.fromAppReturn({}))));
-// JS:     let result = hook.call(["nope"], RpcPayload.fromAppParams([argument]));
-// JS:
-// JS:     await expect(result.pull()).rejects.toThrow("'nope' is not a function");
-// JS:     argument[Symbol.dispose]();
-// JS:     expect(spy.wasDisposed()).toBe(true);
-// JS:     hook.dispose();
-// JS:   });
-// JS:
-// JS:   it("disposes map captures when the destination hook is broken", () => {
-// JS:     let spy = disposalSpy();
-// JS:     let capture = unwrapStubTakingOwnership(<any>new RpcStub(spy.target));
-// JS:     let hook = new ErrorStubHook(new Error("broken"));
-// JS:     hook.map([], [capture], []);
-// JS:     expect(spy.wasDisposed()).toBe(true);
-// JS:   });
-// JS:
-// JS:   // A minimal contract-honoring callee: its call() takes ownership of `args` (disposing them)
-// JS:   // and then throws synchronously. Used to pin the division of labor: once the backing promise
-// JS:   // resolves, args ownership lies with the resolved callee, not with PromiseStubHook.
-// JS:   //
-// JS:   // Extends ErrorStubHook only to inherit harmless implementations of the methods these tests
-// JS:   // never invoke; note it does not override stream(), so the base StubHook.stream() is used.
-// JS:   class SyncThrowingHook extends ErrorStubHook {
-// JS:     constructor() { super(new Error("unused")); }
-// JS:     call(path: PropertyPath, args: RpcPayload): StubHook {
-// JS:       args.dispose();
-// JS:       throw new Error("sync failure");
-// JS:     }
-// JS:   }
-// JS:
-// JS:   it("leaves call args ownership with a resolved callee whose call() throws synchronously",
-// JS:       async () => {
-// JS:     let spy = disposalSpy();
-// JS:     let argument = new RpcStub(spy.target);
-// JS:     let hook = new PromiseStubHook(Promise.resolve(new SyncThrowingHook()));
-// JS:     let result = hook.call([], RpcPayload.fromAppParams([argument]));
-// JS:
-// JS:     await expect(result.pull()).rejects.toThrow("sync failure");
-// JS:     argument[Symbol.dispose]();
-// JS:     expect(spy.wasDisposed()).toBe(true);
-// JS:   });
-// JS:
-// JS:   it("leaves stream args ownership with a resolved callee whose call() throws synchronously",
-// JS:       async () => {
-// JS:     let spy = disposalSpy();
-// JS:     let argument = new RpcStub(spy.target);
-// JS:     let hook = new PromiseStubHook(Promise.resolve(new SyncThrowingHook()));
-// JS:     // SyncThrowingHook inherits the default stream(), which delegates to call().
-// JS:     let result = hook.stream(["write"], RpcPayload.fromAppParams([argument]));
-// JS:
-// JS:     await expect(result.promise).rejects.toThrow("sync failure");
-// JS:     argument[Symbol.dispose]();
-// JS:     expect(spy.wasDisposed()).toBe(true);
-// JS:   });
-// JS:
-// JS:   it("default stream() disposes the result hook when pull() throws synchronously", () => {
-// JS:     let resultHookDisposed = false;
-// JS:
-// JS:     class ThrowingPullHook extends SyncThrowingHook {
-// JS:       pull(): RpcPayload | Promise<RpcPayload> { throw new Error("pull failed"); }
-// JS:       dispose(): void { resultHookDisposed = true; }
-// JS:     }
-// JS:
-// JS:     class LocalCallHook extends SyncThrowingHook {
-// JS:       // Inherits the base StubHook.stream(), which delegates to call() + pull().
-// JS:       call(path: PropertyPath, args: RpcPayload): StubHook {
-// JS:         args.dispose();
-// JS:         return new ThrowingPullHook();
-// JS:       }
-// JS:     }
-// JS:
-// JS:     expect(() => new LocalCallHook().stream(["write"], RpcPayload.fromAppParams([])))
-// JS:         .toThrow("pull failed");
-// JS:     expect(resultHookDisposed).toBe(true);
-// JS:   });
-// JS: });
+mod promise_stub_hook {
+    use super::*;
+    // JS:   it("disposes copied call arguments when the backing promise rejects", async () => {
+    #[tokio::test(flavor = "current_thread")]
+    async fn disposes_copied_call_arguments_when_backing_promise_rejects() {
+        // JS:     let spy = disposalSpy();
+        let (target, disposed) = disposal_spy();
+        // JS:     let argument = new RpcStub(spy.target);
+        let argument = RpcStub::from_value(target);
+        // JS:     let hook = new PromiseStubHook(Promise.reject(new Error("nope")));
+        let hook = PromiseStubHook::from_future(async { Err(Error::Message("nope".to_owned())) });
+        // JS:     let result = hook.call([], RpcPayload.fromAppParams([argument]));
+        let result = hook
+            .call(
+                Vec::new(),
+                RpcPayload::from_app_params(CapnwebValue::Array(vec![CapnwebValue::Stub(
+                    argument.clone(),
+                )])),
+            )
+            .unwrap();
+        // JS:
+        // JS:     await expect(result.pull()).rejects.toThrow("nope");
+        assert!(
+            format!(
+                "{}",
+                RpcPromise::from_hook(result, Vec::new())
+                    .pull()
+                    .await
+                    .unwrap_err()
+            )
+            .contains("nope")
+        );
+        // JS:     argument[Symbol.dispose]();
+        drop(argument);
+        // JS:     expect(spy.wasDisposed()).toBe(true);
+        assert!(disposed.load(Ordering::SeqCst));
+        // JS:   });
+    }
+    // JS:
+    // JS:   it("disposes copied stream arguments when the backing promise rejects", async () => {
+    #[tokio::test(flavor = "current_thread")]
+    async fn disposes_copied_stream_arguments_when_backing_promise_rejects() {
+        // JS:     let spy = disposalSpy();
+        let (target, disposed) = disposal_spy();
+        // JS:     let argument = new RpcStub(spy.target);
+        let argument = RpcStub::from_value(target);
+        // JS:     let hook = new PromiseStubHook(Promise.reject(new Error("nope")));
+        let hook = PromiseStubHook::from_future(async { Err(Error::Message("nope".to_owned())) });
+        // JS:     let result = hook.stream(["write"], RpcPayload.fromAppParams([argument]));
+        let result = hook
+            .stream(
+                vec![PropertyKey::String("write".to_owned())],
+                RpcPayload::from_app_params(CapnwebValue::Array(vec![CapnwebValue::Stub(
+                    argument.clone(),
+                )])),
+            )
+            .unwrap();
+        // JS:
+        // JS:     await expect(result.promise).rejects.toThrow("nope");
+        assert!(format!("{}", result.promise.await.unwrap_err()).contains("nope"));
+        // JS:     argument[Symbol.dispose]();
+        drop(argument);
+        // JS:     expect(spy.wasDisposed()).toBe(true);
+        assert!(disposed.load(Ordering::SeqCst));
+        // JS:   });
+    }
+    // JS:
+    // JS:   it("delivers a call initiated before disposal", async () => {
+    #[tokio::test(flavor = "current_thread")]
+    async fn delivers_a_call_initiated_before_disposal() {
+        // JS:     let disposed = false;
+        let disposed = Arc::new(AtomicBool::new(false));
+        // JS:     class DisposableCounter extends Counter {
+        // JS:       [Symbol.dispose]() { disposed = true; }
+        // JS:     }
+        // `DisposableCounterTarget::drop` is Rust's ownership equivalent.
+        // JS:
+        // JS:     let inner = new RpcStub(new DisposableCounter(1));
+        let inner = RpcStub::from_target(Arc::new(DisposableCounterTarget {
+            value: std::sync::Mutex::new(1.0),
+            disposed: disposed.clone(),
+        }));
+        // JS:     let hook = new PromiseStubHook(Promise.resolve(unwrapStubTakingOwnership(<any>inner)));
+        let inner_hook = unwrap_stub_and_path(&inner).0;
+        drop(inner);
+        let hook = PromiseStubHook::from_future(async move { Ok(inner_hook) });
+        // JS:     await pumpMicrotasks();
+        tokio::task::yield_now().await;
+        // JS:
+        // JS:     let stub: RpcStub<Counter> = <any>new RawRpcStub(hook);
+        let stub = RpcStub::from_hook(hook, None);
+        // JS:     let result = stub.increment(2);
+        let result = stub.call(vec!["increment".to_owned()], one_number_argument(2.0));
+        // JS:     stub[Symbol.dispose]();
+        drop(stub);
+        // JS:
+        // JS:     expect(disposed).toBe(false);
+        assert!(!disposed.load(Ordering::SeqCst));
+        // JS:     expect(await result).toBe(3);
+        assert!(matches!(
+            result.pull().await.unwrap(),
+            CapnwebValue::Number(3.0)
+        ));
+        // JS:     expect(disposed).toBe(true);
+        assert!(disposed.load(Ordering::SeqCst));
+        // JS:   });
+    }
+    // JS:
+    // JS:   it("disposes copied call arguments when the destination hook is broken", async () => {
+    #[tokio::test(flavor = "current_thread")]
+    async fn disposes_copied_call_arguments_when_destination_hook_is_broken() {
+        // JS:     let spy = disposalSpy();
+        let (target, disposed) = disposal_spy();
+        // JS:     let argument = new RpcStub(spy.target);
+        let argument = RpcStub::from_value(target);
+        // JS:     let hook = new PromiseStubHook(Promise.resolve(new ErrorStubHook(new Error("broken"))));
+        let hook = PromiseStubHook::from_future(async {
+            Ok(Arc::new(ErrorStubHook::new(Error::Message("broken".to_owned()))) as StubHook)
+        });
+        // JS:     let result = hook.call([], RpcPayload.fromAppParams([argument]));
+        let result = hook
+            .call(
+                Vec::new(),
+                RpcPayload::from_app_params(CapnwebValue::Array(vec![CapnwebValue::Stub(
+                    argument.clone(),
+                )])),
+            )
+            .unwrap();
+        // JS:
+        // JS:     await expect(result.pull()).rejects.toThrow("broken");
+        assert!(
+            format!(
+                "{}",
+                RpcPromise::from_hook(result, Vec::new())
+                    .pull()
+                    .await
+                    .unwrap_err()
+            )
+            .contains("broken")
+        );
+        // JS:     argument[Symbol.dispose]();
+        drop(argument);
+        // JS:     expect(spy.wasDisposed()).toBe(true);
+        assert!(disposed.load(Ordering::SeqCst));
+        // JS:   });
+    }
+    // JS:
+    // JS:   it("disposes copied stream arguments when the destination hook is broken", async () => {
+    #[tokio::test(flavor = "current_thread")]
+    async fn disposes_copied_stream_arguments_when_destination_hook_is_broken() {
+        // JS:     let spy = disposalSpy();
+        let (target, disposed) = disposal_spy();
+        // JS:     let argument = new RpcStub(spy.target);
+        let argument = RpcStub::from_value(target);
+        // JS:     let hook = new PromiseStubHook(Promise.resolve(new ErrorStubHook(new Error("broken"))));
+        let hook = PromiseStubHook::from_future(async {
+            Ok(Arc::new(ErrorStubHook::new(Error::Message("broken".to_owned()))) as StubHook)
+        });
+        // JS:     let result = hook.stream(["write"], RpcPayload.fromAppParams([argument]));
+        let result = hook
+            .stream(
+                vec![PropertyKey::String("write".to_owned())],
+                RpcPayload::from_app_params(CapnwebValue::Array(vec![CapnwebValue::Stub(
+                    argument.clone(),
+                )])),
+            )
+            .unwrap();
+        // JS:
+        // JS:     await expect(result.promise).rejects.toThrow("broken");
+        assert!(format!("{}", result.promise.await.unwrap_err()).contains("broken"));
+        // JS:     argument[Symbol.dispose]();
+        drop(argument);
+        // JS:     expect(spy.wasDisposed()).toBe(true);
+        assert!(disposed.load(Ordering::SeqCst));
+        // JS:   });
+    }
+    // JS:
+    // JS:   it("disposes copied call arguments when the local call path fails", async () => {
+    #[tokio::test(flavor = "current_thread")]
+    async fn disposes_copied_call_arguments_when_local_call_path_fails() {
+        // JS:     let spy = disposalSpy();
+        let (target, disposed) = disposal_spy();
+        // JS:     let argument = new RpcStub(spy.target);
+        let argument = RpcStub::from_value(target);
+        // JS:     let hook = new PromiseStubHook(
+        let hook = PromiseStubHook::from_future(async {
+            // JS:         Promise.resolve(new PayloadStubHook(RpcPayload.fromAppReturn({}))));
+            Ok(Arc::new(PayloadStubHook::new(RpcPayload::from_app_return(
+                CapnwebValue::Object(BTreeMap::new()),
+            ))) as StubHook)
+        });
+        // JS:     let result = hook.call(["nope"], RpcPayload.fromAppParams([argument]));
+        let result = hook
+            .call(
+                vec![PropertyKey::String("nope".to_owned())],
+                RpcPayload::from_app_params(CapnwebValue::Array(vec![CapnwebValue::Stub(
+                    argument.clone(),
+                )])),
+            )
+            .unwrap();
+        // JS:
+        // JS:     await expect(result.pull()).rejects.toThrow("'nope' is not a function");
+        assert!(
+            format!(
+                "{}",
+                RpcPromise::from_hook(result, Vec::new())
+                    .pull()
+                    .await
+                    .unwrap_err()
+            )
+            .contains("'nope' is not a function")
+        );
+        // JS:     argument[Symbol.dispose]();
+        drop(argument);
+        // JS:     expect(spy.wasDisposed()).toBe(true);
+        assert!(disposed.load(Ordering::SeqCst));
+        // JS:     hook.dispose();
+        drop(hook);
+        // JS:   });
+    }
+    // JS:
+    // JS:   it("disposes map captures when the destination hook is broken", () => {
+    #[test]
+    fn disposes_map_captures_when_destination_hook_is_broken() {
+        // JS:     let spy = disposalSpy();
+        let (target, disposed) = disposal_spy();
+        // JS:     let capture = unwrapStubTakingOwnership(<any>new RpcStub(spy.target));
+        let stub = RpcStub::from_value(target);
+        let capture = unwrap_stub_and_path(&stub).0;
+        drop(stub);
+        // JS:     let hook = new ErrorStubHook(new Error("broken"));
+        let hook: StubHook = Arc::new(ErrorStubHook::new(Error::Message("broken".to_owned())));
+        // JS:     hook.map([], [capture], []);
+        let _ = hook.map(Vec::new(), vec![capture], Vec::new());
+        // JS:     expect(spy.wasDisposed()).toBe(true);
+        assert!(disposed.load(Ordering::SeqCst));
+        // JS:   });
+    }
+    // JS:
+    // JS:   // A minimal contract-honoring callee: its call() takes ownership of `args` (disposing them)
+    // JS:   // and then throws synchronously. Used to pin the division of labor: once the backing promise
+    // JS:   // resolves, args ownership lies with the resolved callee, not with PromiseStubHook.
+    // JS:   //
+    // JS:   // Extends ErrorStubHook only to inherit harmless implementations of the methods these tests
+    // JS:   // never invoke; note it does not override stream(), so the base StubHook.stream() is used.
+    // JS:   class SyncThrowingHook extends ErrorStubHook {
+    struct SyncThrowingHook;
+    impl StubHookInner for SyncThrowingHook {
+        // JS:     constructor() { super(new Error("unused")); }
+        // JS:     call(path: PropertyPath, args: RpcPayload): StubHook {
+        fn call(&self, _path: PropertyPath, args: RpcPayload) -> Result<StubHook> {
+            // JS:       args.dispose();
+            drop(args);
+            // JS:       throw new Error("sync failure");
+            Err(Error::Message("sync failure".to_owned()))
+            // JS:     }
+        }
+        fn map(
+            &self,
+            _path: PropertyPath,
+            captures: Vec<StubHook>,
+            _instructions: Vec<CapnwebValue>,
+        ) -> Result<StubHook> {
+            drop(captures);
+            Err(Error::Message("unused".to_owned()))
+        }
+        fn get(&self, _path: PropertyPath) -> Result<StubHook> {
+            Ok(Arc::new(ErrorStubHook::new(Error::Message(
+                "unused".to_owned(),
+            ))))
+        }
+        fn pull(&self) -> Result<crate::core::MaybePromise<RpcPayload>> {
+            Err(Error::Message("unused".to_owned()))
+        }
+        fn ignore_unhandled_rejections(&self) {}
+        fn on_broken(&self, callback: Box<dyn FnOnce(Error) + Send + 'static>) {
+            callback(Error::Message("unused".to_owned()));
+        }
+        // JS:   }
+    }
+    // JS:
+    // JS:   it("leaves call args ownership with a resolved callee whose call() throws synchronously",
+    // JS:       async () => {
+    #[tokio::test(flavor = "current_thread")]
+    async fn leaves_call_args_ownership_with_resolved_sync_throwing_callee() {
+        // JS:     let spy = disposalSpy();
+        let (target, disposed) = disposal_spy();
+        // JS:     let argument = new RpcStub(spy.target);
+        let argument = RpcStub::from_value(target);
+        // JS:     let hook = new PromiseStubHook(Promise.resolve(new SyncThrowingHook()));
+        let hook =
+            PromiseStubHook::from_future(async { Ok(Arc::new(SyncThrowingHook) as StubHook) });
+        // JS:     let result = hook.call([], RpcPayload.fromAppParams([argument]));
+        let result = hook
+            .call(
+                Vec::new(),
+                RpcPayload::from_app_params(CapnwebValue::Array(vec![CapnwebValue::Stub(
+                    argument.clone(),
+                )])),
+            )
+            .unwrap();
+        // JS:
+        // JS:     await expect(result.pull()).rejects.toThrow("sync failure");
+        assert!(
+            format!(
+                "{}",
+                RpcPromise::from_hook(result, Vec::new())
+                    .pull()
+                    .await
+                    .unwrap_err()
+            )
+            .contains("sync failure")
+        );
+        // JS:     argument[Symbol.dispose]();
+        drop(argument);
+        // JS:     expect(spy.wasDisposed()).toBe(true);
+        assert!(disposed.load(Ordering::SeqCst));
+        // JS:   });
+    }
+    // JS:
+    // JS:   it("leaves stream args ownership with a resolved callee whose call() throws synchronously",
+    // JS:       async () => {
+    #[tokio::test(flavor = "current_thread")]
+    async fn leaves_stream_args_ownership_with_resolved_sync_throwing_callee() {
+        // JS:     let spy = disposalSpy();
+        let (target, disposed) = disposal_spy();
+        // JS:     let argument = new RpcStub(spy.target);
+        let argument = RpcStub::from_value(target);
+        // JS:     let hook = new PromiseStubHook(Promise.resolve(new SyncThrowingHook()));
+        let hook =
+            PromiseStubHook::from_future(async { Ok(Arc::new(SyncThrowingHook) as StubHook) });
+        // JS:     // SyncThrowingHook inherits the default stream(), which delegates to call().
+        // The Rust trait default performs the same delegation.
+        // JS:     let result = hook.stream(["write"], RpcPayload.fromAppParams([argument]));
+        let result = hook
+            .stream(
+                vec![PropertyKey::String("write".to_owned())],
+                RpcPayload::from_app_params(CapnwebValue::Array(vec![CapnwebValue::Stub(
+                    argument.clone(),
+                )])),
+            )
+            .unwrap();
+        // JS:
+        // JS:     await expect(result.promise).rejects.toThrow("sync failure");
+        assert!(format!("{}", result.promise.await.unwrap_err()).contains("sync failure"));
+        // JS:     argument[Symbol.dispose]();
+        drop(argument);
+        // JS:     expect(spy.wasDisposed()).toBe(true);
+        assert!(disposed.load(Ordering::SeqCst));
+        // JS:   });
+    }
+    // JS:
+    // JS:   it("default stream() disposes the result hook when pull() throws synchronously", () => {
+    #[test]
+    fn default_stream_disposes_result_hook_when_pull_throws_synchronously() {
+        // JS:     let resultHookDisposed = false;
+        let result_hook_disposed = Arc::new(AtomicBool::new(false));
+        // JS:
+        // JS:     class ThrowingPullHook extends SyncThrowingHook {
+        struct ThrowingPullHook(Arc<AtomicBool>);
+        impl Drop for ThrowingPullHook {
+            fn drop(&mut self) {
+                self.0.store(true, Ordering::SeqCst);
+            }
+        }
+        impl StubHookInner for ThrowingPullHook {
+            fn call(&self, _path: PropertyPath, args: RpcPayload) -> Result<StubHook> {
+                drop(args);
+                Err(Error::Message("unused".to_owned()))
+            }
+            fn map(
+                &self,
+                _path: PropertyPath,
+                captures: Vec<StubHook>,
+                _instructions: Vec<CapnwebValue>,
+            ) -> Result<StubHook> {
+                drop(captures);
+                Err(Error::Message("unused".to_owned()))
+            }
+            fn get(&self, _path: PropertyPath) -> Result<StubHook> {
+                Err(Error::Message("unused".to_owned()))
+            }
+            // JS:       pull(): RpcPayload | Promise<RpcPayload> { throw new Error("pull failed"); }
+            fn pull(&self) -> Result<crate::core::MaybePromise<RpcPayload>> {
+                Err(Error::Message("pull failed".to_owned()))
+            }
+            fn ignore_unhandled_rejections(&self) {}
+            fn on_broken(&self, callback: Box<dyn FnOnce(Error) + Send + 'static>) {
+                callback(Error::Message("unused".to_owned()));
+            }
+            // JS:       dispose(): void { resultHookDisposed = true; }
+            // `Drop` sets the shared flag.
+            // JS:     }
+        }
+        // JS:
+        // JS:     class LocalCallHook extends SyncThrowingHook {
+        struct LocalCallHook(Arc<AtomicBool>);
+        impl StubHookInner for LocalCallHook {
+            // JS:       // Inherits the base StubHook.stream(), which delegates to call() + pull().
+            // The Rust trait default performs the same delegation.
+            // JS:       call(path: PropertyPath, args: RpcPayload): StubHook {
+            fn call(&self, _path: PropertyPath, args: RpcPayload) -> Result<StubHook> {
+                // JS:         args.dispose();
+                drop(args);
+                // JS:         return new ThrowingPullHook();
+                Ok(Arc::new(ThrowingPullHook(self.0.clone())))
+                // JS:       }
+            }
+            fn map(
+                &self,
+                _path: PropertyPath,
+                captures: Vec<StubHook>,
+                _instructions: Vec<CapnwebValue>,
+            ) -> Result<StubHook> {
+                drop(captures);
+                Err(Error::Message("unused".to_owned()))
+            }
+            fn get(&self, _path: PropertyPath) -> Result<StubHook> {
+                Err(Error::Message("unused".to_owned()))
+            }
+            fn pull(&self) -> Result<crate::core::MaybePromise<RpcPayload>> {
+                Err(Error::Message("unused".to_owned()))
+            }
+            fn ignore_unhandled_rejections(&self) {}
+            fn on_broken(&self, callback: Box<dyn FnOnce(Error) + Send + 'static>) {
+                callback(Error::Message("unused".to_owned()));
+            }
+            // JS:     }
+        }
+        // JS:
+        // JS:     expect(() => new LocalCallHook().stream(["write"], RpcPayload.fromAppParams([])))
+        let hook = LocalCallHook(result_hook_disposed.clone());
+        let error = match hook.stream(
+            vec![PropertyKey::String("write".to_owned())],
+            RpcPayload::from_app_params(CapnwebValue::Array(vec![])),
+        ) {
+            Err(error) => error,
+            Ok(_) => panic!("stream unexpectedly succeeded"),
+        };
+        // JS:         .toThrow("pull failed");
+        assert!(format!("{error}").contains("pull failed"));
+        // JS:     expect(resultHookDisposed).toBe(true);
+        assert!(result_hook_disposed.load(Ordering::SeqCst));
+        // JS:   });
+    }
+    // JS: });
+}
 // JS:
 // JS: describe("RpcImportHook argument disposal", () => {
 // JS:   it("call() disposes owned args when argument serialization fails", async () => {
