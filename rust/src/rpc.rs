@@ -1823,7 +1823,7 @@ impl RpcSessionImpl {
             path_to_value(path),
         ];
         // JS:     if (args) {
-        if let Some(args) = args {
+        if let Some(args) = args.as_ref() {
             // JS:       let devalue: unknown;
             // JS:       try {
             // JS:         devalue = Devaluator.devaluate(args.value, undefined, this, args, this.encodingLevel);

@@ -3455,13 +3455,49 @@ mod capability_passing {
     }
     // JS:
     // JS:   it("supports passing a stub back over the connection", async () => {
-    // JS:     await using harness = new TestHarness(new TestTarget());
-    // JS:     let stub = harness.stub;
-    // JS:
-    // JS:     using counter = await stub.makeCounter(4);
-    // JS:     expect(await stub.incrementCounter(counter)).toBe(5);
-    // JS:     expect(await stub.incrementCounter(counter, 4)).toBe(9);
-    // JS:   });
+    #[tokio::test(flavor = "current_thread")]
+    async fn supports_passing_a_stub_back_over_the_connection() {
+        // JS:     await using harness = new TestHarness(new TestTarget());
+        let harness = IndexRpcHarness::new(Arc::new(LocalTestTarget));
+        // JS:     let stub = harness.stub;
+        let stub = harness.stub.clone();
+        // JS:
+        // JS:     using counter = await stub.makeCounter(4);
+        let counter = RpcStub::from_value(
+            stub.call(vec!["makeCounter".to_owned()], one_number_argument(4.0))
+                .pull()
+                .await
+                .unwrap(),
+        );
+        // JS:     expect(await stub.incrementCounter(counter)).toBe(5);
+        assert!(matches!(
+            stub.call(
+                vec!["incrementCounter".to_owned()],
+                RpcPayload::from_app_params(CapnwebValue::Array(vec![CapnwebValue::Stub(
+                    counter.clone()
+                )])),
+            )
+            .pull()
+            .await
+            .unwrap(),
+            CapnwebValue::Number(5.0)
+        ));
+        // JS:     expect(await stub.incrementCounter(counter, 4)).toBe(9);
+        assert!(matches!(
+            stub.call(
+                vec!["incrementCounter".to_owned()],
+                RpcPayload::from_app_params(CapnwebValue::Array(vec![
+                    CapnwebValue::Stub(counter),
+                    CapnwebValue::Number(4.0),
+                ])),
+            )
+            .pull()
+            .await
+            .unwrap(),
+            CapnwebValue::Number(9.0)
+        ));
+        // JS:   });
+    }
     // JS:
     // JS:   it("supports three-party capability passing", async () => {
     // JS:     // Create two parallel connections: Alice and Bob
