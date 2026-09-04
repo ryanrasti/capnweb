@@ -30,11 +30,54 @@ pub(crate) struct EagerPromise<T> {
     inner: Arc<Inner<T>>,
 }
 
+/// Rust equivalent of JavaScript's `Promise.withResolvers<T>()` result.
+pub(crate) struct PromiseWithResolvers<T> {
+    promise: EagerPromise<T>,
+}
+
+impl<T> Clone for PromiseWithResolvers<T> {
+    fn clone(&self) -> Self {
+        Self {
+            promise: self.promise.clone(),
+        }
+    }
+}
+
 impl<T> Clone for EagerPromise<T> {
     fn clone(&self) -> Self {
         Self {
             inner: Arc::clone(&self.inner),
         }
+    }
+}
+
+impl<T: Clone + Send + 'static> PromiseWithResolvers<T> {
+    /// Creates one pending, shared promise and its settlement handle.
+    pub(crate) fn new() -> Self {
+        Self {
+            promise: EagerPromise::pending(),
+        }
+    }
+
+    /// Returns another handle to the same pending or settled promise.
+    pub(crate) fn promise(&self) -> EagerPromise<T> {
+        self.promise.clone()
+    }
+
+    /// Fulfills the promise exactly once.
+    pub(crate) fn resolve(&self, value: T) {
+        self.promise.settle(Ok(value));
+    }
+
+    /// Rejects the promise exactly once.
+    pub(crate) fn reject(&self, error: Error) {
+        self.promise.settle(Err(error));
+    }
+}
+
+impl<T: Clone + Send + 'static> Default for PromiseWithResolvers<T> {
+    fn default() -> Self {
+        Self::new()
     }
 }
 

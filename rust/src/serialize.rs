@@ -1030,7 +1030,7 @@ fn property_path_to_wire(path: Vec<PropertyKey>) -> Result<CapnwebValue> {
         .map(CapnwebValue::Array)
 }
 
-fn json_to_capnweb(value: serde_json::Value) -> Result<CapnwebValue> {
+pub(crate) fn json_to_capnweb(value: serde_json::Value) -> Result<CapnwebValue> {
     match value {
         serde_json::Value::Null => Ok(CapnwebValue::Null),
         serde_json::Value::Bool(value) => Ok(CapnwebValue::Bool(value)),
@@ -1052,7 +1052,7 @@ fn json_to_capnweb(value: serde_json::Value) -> Result<CapnwebValue> {
     }
 }
 
-fn capnweb_to_json(value: &CapnwebValue) -> Result<serde_json::Value> {
+pub(crate) fn capnweb_to_json(value: &CapnwebValue) -> Result<serde_json::Value> {
     match value {
         CapnwebValue::Null => Ok(serde_json::Value::Null),
         CapnwebValue::Bool(value) => Ok(serde_json::Value::Bool(*value)),

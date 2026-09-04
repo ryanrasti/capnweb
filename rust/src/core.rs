@@ -599,6 +599,11 @@ pub trait StubHookInner: Send + Sync {
         None
     }
 
+    /// Identifies an import hook without JavaScript `instanceof` reflection.
+    fn rpc_import(&self) -> Option<(u64, i64)> {
+        None
+    }
+
     // JS:   // Call a function at the given property path with the given arguments. Returns a hook for the
     // JS:   // promise for the result.
     // JS:   //
