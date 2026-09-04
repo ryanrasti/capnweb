@@ -2889,6 +2889,15 @@ fn follow_path(
         // JS:   }
     }
     // JS:
+    // RUST-DIFF(JS Proxy/reflection): a JavaScript `RpcStub` is a callable Proxy, so reaching one
+    // forwards the eventual operation to its hook even though the Rust wrapper is not a function.
+    if let CapnwebValue::Stub(stub) = value {
+        let (hook, path) = unwrap_stub_and_path(&stub);
+        return Ok(FollowPathResult::Hook {
+            hook,
+            remaining_path: path.unwrap_or_default(),
+        });
+    }
     // JS:   // If we reached a promise, we actually want the caller to forward to the promise, not return
     // JS:   // the promise itself.
     // JS:   if (value instanceof RpcPromise) {

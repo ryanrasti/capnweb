@@ -42,6 +42,74 @@ async fn function_target_rejects_nonempty_paths() {
     assert!(error.to_string().contains("empty path"));
 }
 
+struct FunctionFactoryInterface;
+
+impl RpcInterfaceDescriptor for FunctionFactoryInterface {
+    fn has_member(wire_name: &str) -> bool {
+        wire_name == "formatter"
+    }
+}
+
+struct FunctionFactory;
+
+#[rpc_target(FunctionFactoryInterface)]
+impl FunctionFactory {
+    fn formatter(&self) -> RpcStub {
+        RpcStub::from_value(function_target(|arguments| async move {
+            let delivered = arguments.deliver_resolve().await?;
+            let CapnwebValue::Array(mut values) = delivered else {
+                return Err(Error::Type(
+                    "function arguments were not an array".to_owned(),
+                ));
+            };
+            let CapnwebValue::String(value) = values.remove(0) else {
+                return Err(Error::Type("function argument was not a string".to_owned()));
+            };
+            Ok(CapnwebValue::String(format!("formatted: {value}")))
+        }))
+    }
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn functions_returned_through_promises_remain_callable() {
+    let factory = RpcStub::from_target(Arc::new(FunctionFactory));
+    let pipelined = factory.call(
+        vec!["formatter".to_owned()],
+        RpcPayload::from_app_params(CapnwebValue::Array(Vec::new())),
+    );
+    let pipelined_result = pipelined
+        .call(
+            Vec::new(),
+            RpcPayload::from_app_params(CapnwebValue::Array(vec![CapnwebValue::String(
+                "pipeline".to_owned(),
+            )])),
+        )
+        .pull()
+        .await
+        .expect("pipeline call to returned function");
+    assert!(
+        matches!(pipelined_result, CapnwebValue::String(value) if value == "formatted: pipeline")
+    );
+
+    let returned = factory.call(
+        vec!["formatter".to_owned()],
+        RpcPayload::from_app_params(CapnwebValue::Array(Vec::new())),
+    );
+    let function = RpcStub::from_value(returned.pull().await.expect("return function"));
+    let result = function
+        .call(
+            Vec::new(),
+            RpcPayload::from_app_params(CapnwebValue::Array(vec![CapnwebValue::String(
+                "value".to_owned(),
+            )])),
+        )
+        .pull()
+        .await
+        .expect("call returned function");
+
+    assert!(matches!(result, CapnwebValue::String(value) if value == "formatted: value"));
+}
+
 #[tokio::test(flavor = "current_thread")]
 async fn typed_promise_decodes_its_resolution() {
     let promise = RpcPromise::from_value(CapnwebValue::String("typed".to_owned()));
