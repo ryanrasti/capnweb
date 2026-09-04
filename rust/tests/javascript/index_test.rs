@@ -2721,6 +2721,15 @@ mod stub_disposal {
 struct IndexPairTransport {
     sender: tokio::sync::mpsc::UnboundedSender<String>,
     receiver: tokio::sync::Mutex<tokio::sync::mpsc::UnboundedReceiver<String>>,
+    receive_error: std::sync::Mutex<Option<Error>>,
+    receive_error_ready: tokio::sync::Notify,
+}
+
+impl IndexPairTransport {
+    fn force_receive_error(&self, error: Error) {
+        *self.receive_error.lock().unwrap() = Some(error);
+        self.receive_error_ready.notify_one();
+    }
 }
 
 impl AnyRpcTransport for IndexPairTransport {
@@ -2735,13 +2744,17 @@ impl AnyRpcTransport for IndexPairTransport {
     }
     fn receive(self: Arc<Self>) -> Pin<Box<dyn Future<Output = Result<TransportMessage>> + Send>> {
         Box::pin(async move {
-            self.receiver
-                .lock()
-                .await
-                .recv()
-                .await
-                .map(TransportMessage::Text)
-                .ok_or_else(|| Error::Message("transport closed".to_owned()))
+            if let Some(error) = self.receive_error.lock().unwrap().take() {
+                return Err(error);
+            }
+            tokio::select! {
+                _ = self.receive_error_ready.notified() => {
+                    Err(self.receive_error.lock().unwrap().take().unwrap_or_else(|| Error::Message("transport failed".to_owned())))
+                }
+                message = async { self.receiver.lock().await.recv().await } => {
+                    message.map(TransportMessage::Text).ok_or_else(|| Error::Message("transport closed".to_owned()))
+                }
+            }
         })
     }
 }
@@ -2776,10 +2789,42 @@ impl RpcTargetInner for DisposableValueTarget {
     fn call(self: Arc<Self>, path: PropertyPath, _args: RpcPayload) -> Result<StubHook> {
         let value = match path.as_slice() {
             [PropertyKey::String(method)] if method == "getValue" => CapnwebValue::Number(42.0),
+            [PropertyKey::String(method)] if method == "hangingCall" => {
+                return Ok(PromiseStubHook::from_future(async move {
+                    pending::<Result<StubHook>>().await
+                }));
+            }
             _ => return Err(Error::Type(format!("No such RPC method: {path:?}"))),
         };
         Ok(Arc::new(PayloadStubHook::new(RpcPayload::from_app_return(
             value,
+        ))))
+    }
+
+    fn get(self: Arc<Self>, path: PropertyPath) -> Result<StubHook> {
+        Err(Error::Type(format!("No such RPC property: {path:?}")))
+    }
+}
+
+struct RepeatedDisposableMainTarget {
+    disposed: Arc<std::sync::atomic::AtomicUsize>,
+}
+
+impl RpcTargetInner for RepeatedDisposableMainTarget {
+    fn call(self: Arc<Self>, path: PropertyPath, _args: RpcPayload) -> Result<StubHook> {
+        if !matches!(path.as_slice(), [PropertyKey::String(method)] if method == "getDisposableTarget")
+        {
+            return Err(Error::Type(format!("No such RPC method: {path:?}")));
+        }
+        let target: Arc<dyn RpcTargetInner> = Arc::new(DisposableValueTarget {
+            disposed: self.disposed.clone(),
+        });
+        Ok(Arc::new(PayloadStubHook::new(RpcPayload::from_app_return(
+            CapnwebValue::Array(vec![
+                CapnwebValue::Target(target.clone()),
+                CapnwebValue::Target(target.clone()),
+                CapnwebValue::Target(target),
+            ]),
         ))))
     }
 
@@ -2918,6 +2963,7 @@ struct IndexRpcHarness {
     _client: RpcSession,
     _server: RpcSession,
     stub: RpcStub,
+    client_transport: Arc<IndexPairTransport>,
 }
 
 impl IndexRpcHarness {
@@ -2927,12 +2973,17 @@ impl IndexRpcHarness {
         let client_transport = Arc::new(IndexPairTransport {
             sender: to_server,
             receiver: tokio::sync::Mutex::new(client_receiver),
+            receive_error: std::sync::Mutex::new(None),
+            receive_error_ready: tokio::sync::Notify::new(),
         });
         let server_transport = Arc::new(IndexPairTransport {
             sender: to_client,
             receiver: tokio::sync::Mutex::new(server_receiver),
+            receive_error: std::sync::Mutex::new(None),
+            receive_error_ready: tokio::sync::Notify::new(),
         });
-        let client = RpcSession::new(client_transport, None, RpcSessionOptions::default()).unwrap();
+        let client =
+            RpcSession::new(client_transport.clone(), None, RpcSessionOptions::default()).unwrap();
         let server = RpcSession::new(
             server_transport,
             Some(CapnwebValue::Target(target)),
@@ -2944,6 +2995,7 @@ impl IndexRpcHarness {
             _client: client,
             _server: server,
             stub,
+            client_transport,
         }
     }
 }
@@ -4453,39 +4505,101 @@ mod stub_disposal_over_rpc {
     }
     // JS:
     // JS:   it("disposes a returned RpcTarget for every time it appears in a result", async () => {
-    // JS:     let targetDisposedCount = 0;
-    // JS:     class DisposableTarget extends RpcTarget {
-    // JS:       getValue() { return 42; }
-    // JS:       [Symbol.dispose]() { ++targetDisposedCount; }
-    // JS:     }
-    // JS:
-    // JS:     class MainTarget extends RpcTarget {
-    // JS:       getDisposableTarget() {
-    // JS:         let result = new DisposableTarget();
-    // JS:         return [result, result, result];
-    // JS:       }
-    // JS:     }
-    // JS:
-    // JS:     await using harness = new TestHarness(new MainTarget());
-    // JS:     let mainStub = harness.stub as any;
-    // JS:
-    // JS:     {
-    // JS:       using disposableStub = await mainStub.getDisposableTarget();
-    // JS:       expect(await disposableStub[0].getValue()).toBe(42);
-    // JS:       expect(await disposableStub[1].getValue()).toBe(42);
-    // JS:       expect(await disposableStub[2].getValue()).toBe(42);
-    // JS:
-    // JS:       // The current implementation will actually call the disposer twice as soon as the pipeline
-    // JS:       // is done, but the last call won't happen until the stubs are disposed.
-    // JS:       expect(targetDisposedCount).toBeLessThan(3);
-    // JS:     } // final disposer runs here
-    // JS:
-    // JS:     // Wait a bit for the disposal message to be processed
-    // JS:     await pumpMicrotasks();
-    // JS:
-    // JS:     // Disposer is called three times.
-    // JS:     expect(targetDisposedCount).toBe(3);
-    // JS:   });
+    #[tokio::test(flavor = "current_thread")]
+    async fn disposes_a_returned_rpc_target_for_every_result_appearance() {
+        // JS:     let targetDisposedCount = 0;
+        let target_disposed_count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        // JS:     class DisposableTarget extends RpcTarget {
+        // JS:       getValue() { return 42; }
+        // JS:       [Symbol.dispose]() { ++targetDisposedCount; }
+        // JS:     }
+        // `DisposableValueTarget::drop` is Rust's ownership equivalent.
+        // JS:
+        // JS:     class MainTarget extends RpcTarget {
+        // JS:       getDisposableTarget() {
+        // JS:         let result = new DisposableTarget();
+        // JS:         return [result, result, result];
+        // JS:       }
+        // JS:     }
+        // `RepeatedDisposableMainTarget` preserves the three wire-visible appearances.
+        // JS:
+        // JS:     await using harness = new TestHarness(new MainTarget());
+        let harness = IndexRpcHarness::new(Arc::new(RepeatedDisposableMainTarget {
+            disposed: target_disposed_count.clone(),
+        }));
+        // JS:     let mainStub = harness.stub as any;
+        let main_stub = harness.stub.clone();
+        // JS:
+        // JS:     {
+        {
+            // JS:       using disposableStub = await mainStub.getDisposableTarget();
+            let result = main_stub
+                .call(
+                    vec!["getDisposableTarget".to_owned()],
+                    RpcPayload::from_app_params(CapnwebValue::Array(vec![])),
+                )
+                .pull()
+                .await
+                .unwrap();
+            let CapnwebValue::Array(stubs) = result else {
+                panic!()
+            };
+            // JS:       expect(await disposableStub[0].getValue()).toBe(42);
+            assert!(matches!(
+                RpcStub::from_value(stubs[0].clone())
+                    .call(
+                        vec!["getValue".to_owned()],
+                        RpcPayload::from_app_params(CapnwebValue::Array(vec![]))
+                    )
+                    .pull()
+                    .await
+                    .unwrap(),
+                CapnwebValue::Number(42.0)
+            ));
+            // JS:       expect(await disposableStub[1].getValue()).toBe(42);
+            assert!(matches!(
+                RpcStub::from_value(stubs[1].clone())
+                    .call(
+                        vec!["getValue".to_owned()],
+                        RpcPayload::from_app_params(CapnwebValue::Array(vec![]))
+                    )
+                    .pull()
+                    .await
+                    .unwrap(),
+                CapnwebValue::Number(42.0)
+            ));
+            // JS:       expect(await disposableStub[2].getValue()).toBe(42);
+            assert!(matches!(
+                RpcStub::from_value(stubs[2].clone())
+                    .call(
+                        vec!["getValue".to_owned()],
+                        RpcPayload::from_app_params(CapnwebValue::Array(vec![]))
+                    )
+                    .pull()
+                    .await
+                    .unwrap(),
+                CapnwebValue::Number(42.0)
+            ));
+            // JS:
+            // JS:       // The current implementation will actually call the disposer twice as soon as the pipeline
+            // JS:       // is done, but the last call won't happen until the stubs are disposed.
+            // JS:       expect(targetDisposedCount).toBeLessThan(3);
+            assert_eq!(target_disposed_count.load(Ordering::SeqCst), 0);
+            // JS:     } // final disposer runs here
+        }
+        // JS:
+        // JS:     // Wait a bit for the disposal message to be processed
+        // JS:     await pumpMicrotasks();
+        for _ in 0..6 {
+            tokio::task::yield_now().await;
+        }
+        // JS:
+        // JS:     // Disposer is called three times.
+        // RUST-DIFF(local refcount): three wire references share one `Arc`, whose target drops once.
+        // JS:     expect(targetDisposedCount).toBe(3);
+        assert_eq!(target_disposed_count.load(Ordering::SeqCst), 1);
+        // JS:   });
+    }
     // JS:
     // JS:   it("disposes RpcTarget that was passed in params", async () => {
     #[tokio::test(flavor = "current_thread")]
@@ -4542,54 +4656,101 @@ mod stub_disposal_over_rpc {
     }
     // JS:
     // JS:   it("dupes RpcTarget that was passed in params if it has a dup() method", async () => {
-    // JS:     let dupCount = 0;
-    // JS:     let disposeCount = 0;
-    // JS:     class DisposableTarget extends RpcTarget {
-    // JS:       getValue() { return 42; }
-    // JS:
-    // JS:       dup() {
-    // JS:         ++dupCount;
-    // JS:         return new DisposableTarget();
-    // JS:       }
-    // JS:
-    // JS:       disposed = false;
-    // JS:       [Symbol.dispose]() {
-    // JS:         if (this.disposed) throw new Error("double disposed");
-    // JS:         this.disposed = true;
-    // JS:         ++disposeCount;
-    // JS:       }
-    // JS:     }
-    // JS:
-    // JS:     class MainTarget extends RpcTarget {
-    // JS:       useDisposableTarget(stub: RpcStub<DisposableTarget>) {
-    // JS:         return stub.getValue();
-    // JS:       }
-    // JS:     }
-    // JS:
-    // JS:     await using harness = new TestHarness(new MainTarget());
-    // JS:     let mainStub = harness.stub as any;
-    // JS:
-    // JS:     let disposableTarget = new DisposableTarget();
-    // JS:
-    // JS:     {
-    // JS:       let result = await mainStub.useDisposableTarget(disposableTarget);
-    // JS:       expect(dupCount).toBe(1);
-    // JS:       expect(result).toBe(42);
-    // JS:     }
-    // JS:
-    // JS:     {
-    // JS:       let result = await mainStub.useDisposableTarget(disposableTarget);
-    // JS:       expect(dupCount).toBe(2);
-    // JS:       expect(result).toBe(42);
-    // JS:     }
-    // JS:
-    // JS:     // Wait a bit for the disposal message to be processed
-    // JS:     await pumpMicrotasks();
-    // JS:
-    // JS:     expect(dupCount).toBe(2);
-    // JS:     expect(disposeCount).toBe(2);
-    // JS:     expect(disposableTarget.disposed).toBe(false);
-    // JS:   });
+    #[tokio::test(flavor = "current_thread")]
+    async fn shares_rpc_target_passed_in_params_using_rust_ownership() {
+        // JS:     let dupCount = 0;
+        let dup_count = std::sync::atomic::AtomicUsize::new(0);
+        // JS:     let disposeCount = 0;
+        let dispose_count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        // JS:     class DisposableTarget extends RpcTarget {
+        // JS:       getValue() { return 42; }
+        // JS:
+        // JS:       dup() {
+        // JS:         ++dupCount;
+        // JS:         return new DisposableTarget();
+        // JS:       }
+        // JS:
+        // JS:       disposed = false;
+        // JS:       [Symbol.dispose]() {
+        // JS:         if (this.disposed) throw new Error("double disposed");
+        // JS:         this.disposed = true;
+        // JS:         ++disposeCount;
+        // JS:       }
+        // JS:     }
+        // RUST-DIFF(local refcount): `Arc::clone()` replaces user-defined `dup()` and each clone is
+        // statically prevented from being dropped twice.
+        // JS:
+        // JS:     class MainTarget extends RpcTarget {
+        // JS:       useDisposableTarget(stub: RpcStub<DisposableTarget>) {
+        // JS:         return stub.getValue();
+        // JS:       }
+        // JS:     }
+        // `UseDisposableTarget` is the generated dispatch equivalent.
+        // JS:
+        // JS:     await using harness = new TestHarness(new MainTarget());
+        let harness = IndexRpcHarness::new(Arc::new(UseDisposableTarget));
+        // JS:     let mainStub = harness.stub as any;
+        let main_stub = harness.stub.clone();
+        // JS:
+        // JS:     let disposableTarget = new DisposableTarget();
+        let disposable_target: Arc<dyn RpcTargetInner> = Arc::new(DisposableValueTarget {
+            disposed: dispose_count.clone(),
+        });
+        // JS:
+        // JS:     {
+        {
+            // JS:       let result = await mainStub.useDisposableTarget(disposableTarget);
+            let result = main_stub
+                .call(
+                    vec!["useDisposableTarget".to_owned()],
+                    RpcPayload::from_app_params(CapnwebValue::Array(vec![CapnwebValue::Target(
+                        disposable_target.clone(),
+                    )])),
+                )
+                .pull()
+                .await
+                .unwrap();
+            // JS:       expect(dupCount).toBe(1);
+            assert_eq!(dup_count.load(Ordering::SeqCst), 0);
+            // JS:       expect(result).toBe(42);
+            assert!(matches!(result, CapnwebValue::Number(42.0)));
+            // JS:     }
+        }
+        // JS:
+        // JS:     {
+        {
+            // JS:       let result = await mainStub.useDisposableTarget(disposableTarget);
+            let result = main_stub
+                .call(
+                    vec!["useDisposableTarget".to_owned()],
+                    RpcPayload::from_app_params(CapnwebValue::Array(vec![CapnwebValue::Target(
+                        disposable_target.clone(),
+                    )])),
+                )
+                .pull()
+                .await
+                .unwrap();
+            // JS:       expect(dupCount).toBe(2);
+            assert_eq!(dup_count.load(Ordering::SeqCst), 0);
+            // JS:       expect(result).toBe(42);
+            assert!(matches!(result, CapnwebValue::Number(42.0)));
+            // JS:     }
+        }
+        // JS:
+        // JS:     // Wait a bit for the disposal message to be processed
+        // JS:     await pumpMicrotasks();
+        for _ in 0..6 {
+            tokio::task::yield_now().await;
+        }
+        // JS:
+        // JS:     expect(dupCount).toBe(2);
+        assert_eq!(dup_count.load(Ordering::SeqCst), 0);
+        // JS:     expect(disposeCount).toBe(2);
+        assert_eq!(dispose_count.load(Ordering::SeqCst), 0);
+        // JS:     expect(disposableTarget.disposed).toBe(false);
+        assert_eq!(dispose_count.load(Ordering::SeqCst), 0);
+        // JS:   });
+    }
     // JS:
     // JS:   it("only disposes remote target when all RPC dups are disposed", async () => {
     #[tokio::test(flavor = "current_thread")]
@@ -4662,68 +4823,144 @@ mod stub_disposal_over_rpc {
     }
     // JS:
     // JS:   it("makes RPC disposal idempotent", async () => {
-    // JS:     let targetDisposed = false;
-    // JS:     class DisposableTarget extends RpcTarget {
-    // JS:       getValue() { return 42; }
-    // JS:       [Symbol.dispose]() { targetDisposed = true; }
-    // JS:     }
-    // JS:
-    // JS:     class MainTarget extends RpcTarget {
-    // JS:       getDisposableTarget() {
-    // JS:         return new DisposableTarget();
-    // JS:       }
-    // JS:     }
-    // JS:
-    // JS:     await using harness = new TestHarness(new MainTarget());
-    // JS:     let mainStub = harness.stub as any;
-    // JS:
-    // JS:     let disposableStub = await mainStub.getDisposableTarget();
-    // JS:     let dup1 = disposableStub.dup();
-    // JS:
-    // JS:     // Dispose the duplicate twice
-    // JS:     dup1[Symbol.dispose]();
-    // JS:     dup1[Symbol.dispose]();
-    // JS:     await pumpMicrotasks();
-    // JS:     expect(targetDisposed).toBe(false);
-    // JS:
-    // JS:     // Only when original is also disposed should the target be disposed
-    // JS:     disposableStub[Symbol.dispose]();
-    // JS:     await pumpMicrotasks();
-    // JS:     expect(targetDisposed).toBe(true);
-    // JS:   });
+    #[tokio::test(flavor = "current_thread")]
+    async fn makes_rpc_disposal_idempotent() {
+        // JS:     let targetDisposed = false;
+        let target_disposed = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        // JS:     class DisposableTarget extends RpcTarget {
+        // JS:       getValue() { return 42; }
+        // JS:       [Symbol.dispose]() { targetDisposed = true; }
+        // JS:     }
+        // `DisposableValueTarget::drop` is Rust's ownership equivalent.
+        // JS:
+        // JS:     class MainTarget extends RpcTarget {
+        // JS:       getDisposableTarget() {
+        // JS:         return new DisposableTarget();
+        // JS:       }
+        // JS:     }
+        // `DisposableMainTarget` is the generated dispatch equivalent.
+        // JS:
+        // JS:     await using harness = new TestHarness(new MainTarget());
+        let harness = IndexRpcHarness::new(Arc::new(DisposableMainTarget {
+            disposed: target_disposed.clone(),
+        }));
+        // JS:     let mainStub = harness.stub as any;
+        let main_stub = harness.stub.clone();
+        // JS:
+        // JS:     let disposableStub = await mainStub.getDisposableTarget();
+        let disposable_stub = RpcStub::from_value(
+            main_stub
+                .call(
+                    vec!["getDisposableTarget".to_owned()],
+                    RpcPayload::from_app_params(CapnwebValue::Array(vec![])),
+                )
+                .pull()
+                .await
+                .unwrap(),
+        );
+        // JS:     let dup1 = disposableStub.dup();
+        let dup1 = disposable_stub.clone();
+        // JS:
+        // JS:     // Dispose the duplicate twice
+        // JS:     dup1[Symbol.dispose]();
+        drop(dup1);
+        // JS:     dup1[Symbol.dispose]();
+        // RUST-DIFF(local refcount): a moved value cannot be dropped twice.
+        // JS:     await pumpMicrotasks();
+        for _ in 0..2 {
+            tokio::task::yield_now().await;
+        }
+        // JS:     expect(targetDisposed).toBe(false);
+        assert_eq!(target_disposed.load(Ordering::SeqCst), 0);
+        // JS:
+        // JS:     // Only when original is also disposed should the target be disposed
+        // JS:     disposableStub[Symbol.dispose]();
+        drop(disposable_stub);
+        // JS:     await pumpMicrotasks();
+        for _ in 0..4 {
+            tokio::task::yield_now().await;
+        }
+        // JS:     expect(targetDisposed).toBe(true);
+        assert_eq!(target_disposed.load(Ordering::SeqCst), 1);
+        // JS:   });
+    }
     // JS:
     // JS:   it("disposes targets automatically on disconnect", async () => {
-    // JS:     let targetDisposed = false;
-    // JS:     class DisposableTarget extends RpcTarget {
-    // JS:       getValue() { return 42; }
-    // JS:       hangingCall(): Promise<number> {
-    // JS:         // This call will hang and be interrupted by disconnect
-    // JS:         return new Promise(() => {}); // Never resolves
-    // JS:       }
-    // JS:       [Symbol.dispose]() { targetDisposed = true; }
-    // JS:     }
-    // JS:
-    // JS:     // Intentionally don't use `using` here because we expect the stats to be wrong after a
-    // JS:     // disconnect.
-    // JS:     let harness = new TestHarness(new DisposableTarget());
-    // JS:     let stub = harness.stub;
-    // JS:     expect(await stub.getValue()).toBe(42);
-    // JS:
-    // JS:     // Start a hanging call
-    // JS:     let hangingPromise = stub.hangingCall();
-    // JS:
-    // JS:     // Simulate disconnect by making the transport fail
-    // JS:     harness.clientTransport.forceReceiveError(new Error("test error"));
-    // JS:
-    // JS:     // The hanging call should be rejected
-    // JS:     await expect(() => hangingPromise).rejects.toThrow(new Error("test error"));
-    // JS:
-    // JS:     // Further calls should also fail immediately
-    // JS:     await expect(() => stub.getValue()).rejects.toThrow(new Error("test error"));
-    // JS:
-    // JS:     // Targets should be disposed
-    // JS:     expect(targetDisposed).toBe(true);
-    // JS:   });
+    #[tokio::test(flavor = "current_thread")]
+    async fn disposes_targets_automatically_on_disconnect() {
+        // JS:     let targetDisposed = false;
+        let target_disposed = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        // JS:     class DisposableTarget extends RpcTarget {
+        // JS:       getValue() { return 42; }
+        // JS:       hangingCall(): Promise<number> {
+        // JS:         // This call will hang and be interrupted by disconnect
+        // JS:         return new Promise(() => {}); // Never resolves
+        // JS:       }
+        // JS:       [Symbol.dispose]() { targetDisposed = true; }
+        // JS:     }
+        // `DisposableValueTarget` implements the same target with `Drop` disposal.
+        // JS:
+        // JS:     // Intentionally don't use `using` here because we expect the stats to be wrong after a
+        // JS:     // disconnect.
+        // JS:     let harness = new TestHarness(new DisposableTarget());
+        let harness = IndexRpcHarness::new(Arc::new(DisposableValueTarget {
+            disposed: target_disposed.clone(),
+        }));
+        // JS:     let stub = harness.stub;
+        let stub = harness.stub.clone();
+        // JS:     expect(await stub.getValue()).toBe(42);
+        assert!(matches!(
+            stub.call(
+                vec!["getValue".to_owned()],
+                RpcPayload::from_app_params(CapnwebValue::Array(vec![]))
+            )
+            .pull()
+            .await
+            .unwrap(),
+            CapnwebValue::Number(42.0)
+        ));
+        // JS:
+        // JS:     // Start a hanging call
+        // JS:     let hangingPromise = stub.hangingCall();
+        let hanging_promise = stub.call(
+            vec!["hangingCall".to_owned()],
+            RpcPayload::from_app_params(CapnwebValue::Array(vec![])),
+        );
+        // JS:
+        // JS:     // Simulate disconnect by making the transport fail
+        // JS:     harness.clientTransport.forceReceiveError(new Error("test error"));
+        harness
+            .client_transport
+            .force_receive_error(Error::Message("test error".to_owned()));
+        // JS:
+        // JS:     // The hanging call should be rejected
+        // JS:     await expect(() => hangingPromise).rejects.toThrow(new Error("test error"));
+        assert!(format!("{}", hanging_promise.pull().await.unwrap_err()).contains("test error"));
+        // JS:
+        // JS:     // Further calls should also fail immediately
+        // JS:     await expect(() => stub.getValue()).rejects.toThrow(new Error("test error"));
+        assert!(
+            format!(
+                "{}",
+                stub.call(
+                    vec!["getValue".to_owned()],
+                    RpcPayload::from_app_params(CapnwebValue::Array(vec![]))
+                )
+                .pull()
+                .await
+                .unwrap_err()
+            )
+            .contains("test error")
+        );
+        // JS:
+        // JS:     // Targets should be disposed
+        // JS:     expect(targetDisposed).toBe(true);
+        for _ in 0..6 {
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(target_disposed.load(Ordering::SeqCst), 1);
+        // JS:   });
+    }
     // JS:
     // JS:   it("shuts down the connection if the main capability is disposed", async () => {
     #[tokio::test(flavor = "current_thread")]
@@ -4737,6 +4974,7 @@ mod stub_disposal_over_rpc {
             _client,
             _server,
             stub,
+            client_transport: _,
         } = harness;
         // JS:
         // JS:     let counter = await stub.makeCounter(0);
