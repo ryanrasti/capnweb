@@ -10,6 +10,8 @@ mod map;
 mod rpc;
 #[path = "../src/serialize.rs"]
 mod serialize;
+#[path = "../src/streams.rs"]
+mod streams;
 
 #[path = "javascript/flow_control_test.rs"]
 mod flow_control_test;

@@ -39,6 +39,8 @@ pub use typed::{FromCapnwebValue, IntoCapnwebValue, RpcInterfaceDescriptor, Type
 mod map;
 pub use map::force_init_map;
 // JS: import { forceInitStreams } from "./streams.js";
+mod streams;
+pub use streams::{FlowController, SendToken};
 // JS:
 // JS: forceInitMap();
 // JS: forceInitStreams();

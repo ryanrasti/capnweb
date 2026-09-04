@@ -141,174 +141,288 @@
 // JS: //
 // JS: // Initial window size in bytes. Used before we have any bandwidth estimate.
 // JS: const INITIAL_WINDOW = 256 * 1024;
+const INITIAL_WINDOW: f64 = 256.0 * 1024.0;
 // JS: // Maximum window size in bytes.
 // JS: const MAX_WINDOW = 1024 * 1024 * 1024;
+const MAX_WINDOW: f64 = 1024.0 * 1024.0 * 1024.0;
 // JS: // Minimum window size in bytes.
 // JS: const MIN_WINDOW = 64 * 1024;
+const MIN_WINDOW: f64 = 64.0 * 1024.0;
 // JS: // During startup, we allow the window to grow by up to this factor per RTT.
 // JS: const STARTUP_GROWTH_FACTOR = 2;
+const STARTUP_GROWTH_FACTOR: f64 = 2.0;
 // JS: // In steady state, we allow the window to grow by up to this factor per RTT.
 // JS: const STEADY_GROWTH_FACTOR = 1.25;
+const STEADY_GROWTH_FACTOR: f64 = 1.25;
 // JS: // Allowed reduction in window size per RTT.
 // JS: const DECAY_FACTOR = 0.90;
+const DECAY_FACTOR: f64 = 0.90;
 // JS: // Number of consecutive non-increasing ack rounds before exiting startup.
 // JS: const STARTUP_EXIT_ROUNDS = 3;
+const STARTUP_EXIT_ROUNDS: u32 = 3;
 // JS:
 // JS: // Opaque token returned by onSend() that must be passed back to onAck(). Carries the
 // JS: // send-time snapshot needed to compute delivery rate and apply the window collar.
 // JS: export type SendToken = {
-// JS:   sentTime: number;
-// JS:   size: number;
-// JS:   deliveredAtSend: number;
-// JS:   deliveredTimeAtSend: number;
-// JS:   windowAtSend: number;
-// JS:   windowFullAtSend: boolean;
-// JS: };
+#[derive(Clone, Copy)]
+pub struct SendToken {
+    // JS:   sentTime: number;
+    sent_time: f64,
+    // JS:   size: number;
+    size: f64,
+    // JS:   deliveredAtSend: number;
+    delivered_at_send: f64,
+    // JS:   deliveredTimeAtSend: number;
+    delivered_time_at_send: f64,
+    // JS:   windowAtSend: number;
+    window_at_send: f64,
+    // JS:   windowFullAtSend: boolean;
+    window_full_at_send: bool,
+    // JS: };
+}
 // JS:
 // JS: // Exported for testing purposes only -- otherwise this is only used internally by
 // JS: // createWritableStreamFromHook().
 // JS: export class FlowController {
-// JS:   // The current window size in bytes. The sender blocks when bytesInFlight >= window.
-// JS:   window = INITIAL_WINDOW;
-// JS:
-// JS:   // Total bytes currently in flight (sent but not yet acked).
-// JS:   bytesInFlight = 0;
-// JS:
-// JS:   // Whether we're still in the startup phase.
-// JS:   inStartupPhase = true;
-// JS:
-// JS:   // ----- BDP estimation state (private) -----
-// JS:
-// JS:   // Total bytes acked so far.
-// JS:   private delivered = 0;
-// JS:   // Time of most recent ack.
-// JS:   private deliveredTime = 0;
-// JS:   // Time when the very first ack was received.
-// JS:   private firstAckTime = 0;
-// JS:   private firstAckDelivered = 0;
-// JS:   // Global minimum RTT observed (milliseconds).
-// JS:   private minRtt = Infinity;
-// JS:
-// JS:   // For startup exit: count of consecutive RTT rounds where the window didn't meaningfully grow.
-// JS:   private roundsWithoutIncrease = 0;
-// JS:   // Window size at the start of the current round, for startup exit detection.
-// JS:   private lastRoundWindow = 0;
-// JS:   // Time when the current round started.
-// JS:   private roundStartTime = 0;
-// JS:
-// JS:   constructor(private now: () => number) {}
-// JS:
-// JS:   // Called when a write of `size` bytes is about to be sent. Returns a token that must be
-// JS:   // passed to onAck() when the ack arrives, and whether the sender should block (window full).
-// JS:   onSend(size: number): { token: SendToken, shouldBlock: boolean } {
-// JS:     this.bytesInFlight += size;
-// JS:
-// JS:     let token: SendToken = {
-// JS:       sentTime: this.now(),
-// JS:       size,
-// JS:       deliveredAtSend: this.delivered,
-// JS:       deliveredTimeAtSend: this.deliveredTime,
-// JS:       windowAtSend: this.window,
-// JS:       windowFullAtSend: this.bytesInFlight >= this.window,
-// JS:     };
-// JS:
-// JS:     return { token, shouldBlock: token.windowFullAtSend };
-// JS:   }
-// JS:
-// JS:   // Called when a previously-sent write fails. Restores bytesInFlight without updating
-// JS:   // any BDP estimates.
-// JS:   onError(token: SendToken): void {
-// JS:     this.bytesInFlight -= token.size;
-// JS:   }
-// JS:
-// JS:   // Called when an ack is received for a previously-sent write. Updates BDP estimates and
-// JS:   // the window. Returns whether a blocked sender should now unblock.
-// JS:   onAck(token: SendToken): boolean {
-// JS:     let ackTime = this.now();
-// JS:
-// JS:     // Update delivery tracking metrics.
-// JS:     this.delivered += token.size;
-// JS:     this.deliveredTime = ackTime;
-// JS:     this.bytesInFlight -= token.size;
-// JS:
-// JS:     // Update RTT estimate.
-// JS:     let rtt = ackTime - token.sentTime;
-// JS:     this.minRtt = Math.min(this.minRtt, rtt);
-// JS:
-// JS:     // Update bandwidth estimate and window.
-// JS:     if (this.firstAckTime === 0) {
-// JS:       // This is the very first ack. We can't estimate bandwidth yet since we need to look
-// JS:       // at the interval between acks.
-// JS:       this.firstAckTime = ackTime;
-// JS:       this.firstAckDelivered = this.delivered;
-// JS:     } else {
-// JS:       let baseTime;
-// JS:       let baseDelivered;
-// JS:
-// JS:       if (token.deliveredTimeAtSend === 0) {
-// JS:         // This write was sent before any acks had been received, but wasn't the very first
-// JS:         // write. We can estimate bandwidth starting from the first ack.
-// JS:         baseTime = this.firstAckTime;
-// JS:         baseDelivered = this.firstAckDelivered;
-// JS:       } else {
-// JS:         baseTime = token.deliveredTimeAtSend;
-// JS:         baseDelivered = token.deliveredAtSend;
-// JS:       }
-// JS:
-// JS:       let interval = ackTime - baseTime;
-// JS:       let bytes = this.delivered - baseDelivered;
-// JS:       let bandwidth = bytes / interval;
-// JS:
-// JS:       // Choose our target growth factor depending on whether we're at startup or steady
-// JS:       // state.
-// JS:       let growthFactor = this.inStartupPhase ? STARTUP_GROWTH_FACTOR : STEADY_GROWTH_FACTOR;
-// JS:
-// JS:       // Calculate new window to be our calculated bandwidth-delay product, plus a growth
-// JS:       // factor to account for the possibility that bandwidth is constrained only due to
-// JS:       // the window having been too small.
-// JS:       let newWindow = bandwidth * this.minRtt * growthFactor;
-// JS:
-// JS:       // Don't allow the window to grow too quickly -- it can only grow by at most
-// JS:       // `growthFactor` for each RTT.
-// JS:       newWindow = Math.min(newWindow, token.windowAtSend * growthFactor);
-// JS:
-// JS:       if (token.windowFullAtSend) {
-// JS:         // Don't allow the window to shrink too quickly.
-// JS:         newWindow = Math.max(newWindow, token.windowAtSend * DECAY_FACTOR);
-// JS:       } else {
-// JS:         // Don't allow the window to shrink at all if we weren't saturating it -- in this
-// JS:         // case the sending app is not fully utilizing the connection, so no backpressure is
-// JS:         // needed. We clamp to this.window here, not this.windowAtSend, since we don't want to
-// JS:         // undo previous shrinkage, when alternating between sends that saturated and ones that
-// JS:         // didn't.
-// JS:         newWindow = Math.max(newWindow, this.window);
-// JS:       }
-// JS:
-// JS:       // Clamp to min/max values.
-// JS:       this.window = Math.max(Math.min(newWindow, MAX_WINDOW), MIN_WINDOW);
-// JS:
-// JS:       // Check if the startup phase is done.
-// JS:       if (this.inStartupPhase && token.sentTime >= this.roundStartTime) {
-// JS:         if (this.window > this.lastRoundWindow * STEADY_GROWTH_FACTOR) {
-// JS:           // Saw a significant increase this round, so reset the counter.
-// JS:           this.roundsWithoutIncrease = 0;
-// JS:         } else {
-// JS:           // Window size didn't increase enough this round.
-// JS:           if (++this.roundsWithoutIncrease >= STARTUP_EXIT_ROUNDS) {
-// JS:             // After three rounds with insufficient increase, exit startup mode.
-// JS:             this.inStartupPhase = false;
-// JS:           }
-// JS:         }
-// JS:
-// JS:         // Advance to next round.
-// JS:         this.roundStartTime = ackTime;
-// JS:         this.lastRoundWindow = this.window;
-// JS:       }
-// JS:     }
-// JS:
-// JS:     return this.bytesInFlight < this.window;
-// JS:   }
-// JS: }
+pub struct FlowController {
+    // JS:   // The current window size in bytes. The sender blocks when bytesInFlight >= window.
+    // JS:   window = INITIAL_WINDOW;
+    pub window: f64,
+    // JS:
+    // JS:   // Total bytes currently in flight (sent but not yet acked).
+    // JS:   bytesInFlight = 0;
+    pub bytes_in_flight: f64,
+    // JS:
+    // JS:   // Whether we're still in the startup phase.
+    // JS:   inStartupPhase = true;
+    pub in_startup_phase: bool,
+    // JS:
+    // JS:   // ----- BDP estimation state (private) -----
+    // JS:
+    // JS:   // Total bytes acked so far.
+    // JS:   private delivered = 0;
+    delivered: f64,
+    // JS:   // Time of most recent ack.
+    // JS:   private deliveredTime = 0;
+    delivered_time: f64,
+    // JS:   // Time when the very first ack was received.
+    // JS:   private firstAckTime = 0;
+    first_ack_time: f64,
+    // JS:   private firstAckDelivered = 0;
+    first_ack_delivered: f64,
+    // JS:   // Global minimum RTT observed (milliseconds).
+    // JS:   private minRtt = Infinity;
+    min_rtt: f64,
+    // JS:
+    // JS:   // For startup exit: count of consecutive RTT rounds where the window didn't meaningfully grow.
+    // JS:   private roundsWithoutIncrease = 0;
+    rounds_without_increase: u32,
+    // JS:   // Window size at the start of the current round, for startup exit detection.
+    // JS:   private lastRoundWindow = 0;
+    last_round_window: f64,
+    // JS:   // Time when the current round started.
+    // JS:   private roundStartTime = 0;
+    round_start_time: f64,
+    now: Box<dyn Fn() -> f64>,
+    // JS:
+    // JS:   constructor(private now: () => number) {}
+}
+impl FlowController {
+    pub fn new(now: impl Fn() -> f64 + 'static) -> Self {
+        Self {
+            window: INITIAL_WINDOW,
+            bytes_in_flight: 0.0,
+            in_startup_phase: true,
+            delivered: 0.0,
+            delivered_time: 0.0,
+            first_ack_time: 0.0,
+            first_ack_delivered: 0.0,
+            min_rtt: f64::INFINITY,
+            rounds_without_increase: 0,
+            last_round_window: 0.0,
+            round_start_time: 0.0,
+            now: Box::new(now),
+        }
+    }
+    // JS:
+    // JS:   // Called when a write of `size` bytes is about to be sent. Returns a token that must be
+    // JS:   // passed to onAck() when the ack arrives, and whether the sender should block (window full).
+    // JS:   onSend(size: number): { token: SendToken, shouldBlock: boolean } {
+    pub fn on_send(&mut self, size: f64) -> (SendToken, bool) {
+        // JS:     this.bytesInFlight += size;
+        self.bytes_in_flight += size;
+        // JS:
+        // JS:     let token: SendToken = {
+        let token = SendToken {
+            // JS:       sentTime: this.now(),
+            sent_time: (self.now)(),
+            // JS:       size,
+            size,
+            // JS:       deliveredAtSend: this.delivered,
+            delivered_at_send: self.delivered,
+            // JS:       deliveredTimeAtSend: this.deliveredTime,
+            delivered_time_at_send: self.delivered_time,
+            // JS:       windowAtSend: this.window,
+            window_at_send: self.window,
+            // JS:       windowFullAtSend: this.bytesInFlight >= this.window,
+            window_full_at_send: self.bytes_in_flight >= self.window,
+            // JS:     };
+        };
+        // JS:
+        // JS:     return { token, shouldBlock: token.windowFullAtSend };
+        (token, token.window_full_at_send)
+        // JS:   }
+    }
+    // JS:
+    // JS:   // Called when a previously-sent write fails. Restores bytesInFlight without updating
+    // JS:   // any BDP estimates.
+    // JS:   onError(token: SendToken): void {
+    pub fn on_error(&mut self, token: SendToken) {
+        // JS:     this.bytesInFlight -= token.size;
+        self.bytes_in_flight -= token.size;
+        // JS:   }
+    }
+    // JS:
+    // JS:   // Called when an ack is received for a previously-sent write. Updates BDP estimates and
+    // JS:   // the window. Returns whether a blocked sender should now unblock.
+    // JS:   onAck(token: SendToken): boolean {
+    pub fn on_ack(&mut self, token: SendToken) -> bool {
+        // JS:     let ackTime = this.now();
+        let ack_time = (self.now)();
+        // JS:
+        // JS:     // Update delivery tracking metrics.
+        // JS:     this.delivered += token.size;
+        self.delivered += token.size;
+        // JS:     this.deliveredTime = ackTime;
+        self.delivered_time = ack_time;
+        // JS:     this.bytesInFlight -= token.size;
+        self.bytes_in_flight -= token.size;
+        // JS:
+        // JS:     // Update RTT estimate.
+        // JS:     let rtt = ackTime - token.sentTime;
+        let rtt = ack_time - token.sent_time;
+        // JS:     this.minRtt = Math.min(this.minRtt, rtt);
+        self.min_rtt = self.min_rtt.min(rtt);
+        // JS:
+        // JS:     // Update bandwidth estimate and window.
+        // JS:     if (this.firstAckTime === 0) {
+        if self.first_ack_time == 0.0 {
+            // JS:       // This is the very first ack. We can't estimate bandwidth yet since we need to look
+            // JS:       // at the interval between acks.
+            // JS:       this.firstAckTime = ackTime;
+            self.first_ack_time = ack_time;
+            // JS:       this.firstAckDelivered = this.delivered;
+            self.first_ack_delivered = self.delivered;
+        // JS:     } else {
+        } else {
+            // JS:       let baseTime;
+            let base_time;
+            // JS:       let baseDelivered;
+            let base_delivered;
+            // JS:
+            // JS:       if (token.deliveredTimeAtSend === 0) {
+            if token.delivered_time_at_send == 0.0 {
+                // JS:         // This write was sent before any acks had been received, but wasn't the very first
+                // JS:         // write. We can estimate bandwidth starting from the first ack.
+                // JS:         baseTime = this.firstAckTime;
+                base_time = self.first_ack_time;
+                // JS:         baseDelivered = this.firstAckDelivered;
+                base_delivered = self.first_ack_delivered;
+            // JS:       } else {
+            } else {
+                // JS:         baseTime = token.deliveredTimeAtSend;
+                base_time = token.delivered_time_at_send;
+                // JS:         baseDelivered = token.deliveredAtSend;
+                base_delivered = token.delivered_at_send;
+                // JS:       }
+            }
+            // JS:
+            // JS:       let interval = ackTime - baseTime;
+            let interval = ack_time - base_time;
+            // JS:       let bytes = this.delivered - baseDelivered;
+            let bytes = self.delivered - base_delivered;
+            // JS:       let bandwidth = bytes / interval;
+            let bandwidth = bytes / interval;
+            // JS:
+            // JS:       // Choose our target growth factor depending on whether we're at startup or steady
+            // JS:       // state.
+            // JS:       let growthFactor = this.inStartupPhase ? STARTUP_GROWTH_FACTOR : STEADY_GROWTH_FACTOR;
+            let growth_factor = if self.in_startup_phase {
+                STARTUP_GROWTH_FACTOR
+            } else {
+                STEADY_GROWTH_FACTOR
+            };
+            // JS:
+            // JS:       // Calculate new window to be our calculated bandwidth-delay product, plus a growth
+            // JS:       // factor to account for the possibility that bandwidth is constrained only due to
+            // JS:       // the window having been too small.
+            // JS:       let newWindow = bandwidth * this.minRtt * growthFactor;
+            let mut new_window = bandwidth * self.min_rtt * growth_factor;
+            // JS:
+            // JS:       // Don't allow the window to grow too quickly -- it can only grow by at most
+            // JS:       // `growthFactor` for each RTT.
+            // JS:       newWindow = Math.min(newWindow, token.windowAtSend * growthFactor);
+            new_window = new_window.min(token.window_at_send * growth_factor);
+            // JS:
+            // JS:       if (token.windowFullAtSend) {
+            if token.window_full_at_send {
+                // JS:         // Don't allow the window to shrink too quickly.
+                // JS:         newWindow = Math.max(newWindow, token.windowAtSend * DECAY_FACTOR);
+                new_window = new_window.max(token.window_at_send * DECAY_FACTOR);
+            // JS:       } else {
+            } else {
+                // JS:         // Don't allow the window to shrink at all if we weren't saturating it -- in this
+                // JS:         // case the sending app is not fully utilizing the connection, so no backpressure is
+                // JS:         // needed. We clamp to this.window here, not this.windowAtSend, since we don't want to
+                // JS:         // undo previous shrinkage, when alternating between sends that saturated and ones that
+                // JS:         // didn't.
+                // JS:         newWindow = Math.max(newWindow, this.window);
+                new_window = new_window.max(self.window);
+                // JS:       }
+            }
+            // JS:
+            // JS:       // Clamp to min/max values.
+            // JS:       this.window = Math.max(Math.min(newWindow, MAX_WINDOW), MIN_WINDOW);
+            self.window = new_window.min(MAX_WINDOW).max(MIN_WINDOW);
+            // JS:
+            // JS:       // Check if the startup phase is done.
+            // JS:       if (this.inStartupPhase && token.sentTime >= this.roundStartTime) {
+            if self.in_startup_phase && token.sent_time >= self.round_start_time {
+                // JS:         if (this.window > this.lastRoundWindow * STEADY_GROWTH_FACTOR) {
+                if self.window > self.last_round_window * STEADY_GROWTH_FACTOR {
+                    // JS:           // Saw a significant increase this round, so reset the counter.
+                    // JS:           this.roundsWithoutIncrease = 0;
+                    self.rounds_without_increase = 0;
+                // JS:         } else {
+                } else {
+                    // JS:           // Window size didn't increase enough this round.
+                    // JS:           if (++this.roundsWithoutIncrease >= STARTUP_EXIT_ROUNDS) {
+                    self.rounds_without_increase += 1;
+                    if self.rounds_without_increase >= STARTUP_EXIT_ROUNDS {
+                        // JS:             // After three rounds with insufficient increase, exit startup mode.
+                        // JS:             this.inStartupPhase = false;
+                        self.in_startup_phase = false;
+                        // JS:           }
+                    }
+                    // JS:         }
+                }
+                // JS:
+                // JS:         // Advance to next round.
+                // JS:         this.roundStartTime = ackTime;
+                self.round_start_time = ack_time;
+                // JS:         this.lastRoundWindow = this.window;
+                self.last_round_window = self.window;
+                // JS:       }
+            }
+            // JS:     }
+        }
+        // JS:
+        // JS:     return this.bytesInFlight < this.window;
+        self.bytes_in_flight < self.window
+        // JS:   }
+    }
+    // JS: }
+}
 // JS:
 // JS: // =======================================================================================
 // JS: // createWritableStreamFromHook - creates a proxy WritableStream that forwards to a remote hook
