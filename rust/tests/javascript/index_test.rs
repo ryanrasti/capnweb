@@ -2788,6 +2788,36 @@ impl RpcTargetInner for DisposableValueTarget {
     }
 }
 
+struct UseDisposableTarget;
+
+impl RpcTargetInner for UseDisposableTarget {
+    fn call(self: Arc<Self>, path: PropertyPath, args: RpcPayload) -> Result<StubHook> {
+        if !matches!(path.as_slice(), [PropertyKey::String(method)] if method == "useDisposableTarget")
+        {
+            return Err(Error::Type(format!("No such RPC method: {path:?}")));
+        }
+        Ok(PromiseStubHook::from_future(async move {
+            let mut arguments = match args.deliver_resolve().await? {
+                CapnwebValue::Array(arguments) => arguments,
+                _ => return Err(Error::Type("arguments are not an array".to_owned())),
+            };
+            let stub = RpcStub::from_value(arguments.remove(0));
+            let value = stub
+                .call(
+                    vec!["getValue".to_owned()],
+                    RpcPayload::from_app_params(CapnwebValue::Array(vec![])),
+                )
+                .pull()
+                .await?;
+            Ok(Arc::new(PayloadStubHook::new(RpcPayload::from_app_return(value))) as StubHook)
+        }))
+    }
+
+    fn get(self: Arc<Self>, path: PropertyPath) -> Result<StubHook> {
+        Err(Error::Type(format!("No such RPC property: {path:?}")))
+    }
+}
+
 struct DisposableMainTarget {
     disposed: Arc<std::sync::atomic::AtomicUsize>,
 }
@@ -4222,31 +4252,58 @@ mod stub_disposal_over_rpc {
     // JS:   });
     // JS:
     // JS:   it("disposes RpcTarget that was passed in params", async () => {
-    // JS:     let targetDisposedCount = 0;
-    // JS:     class DisposableTarget extends RpcTarget {
-    // JS:       getValue() { return 42; }
-    // JS:       [Symbol.dispose]() { ++targetDisposedCount; }
-    // JS:     }
-    // JS:
-    // JS:     class MainTarget extends RpcTarget {
-    // JS:       useDisposableTarget(stub: RpcStub<DisposableTarget>) {
-    // JS:         return stub.getValue();
-    // JS:       }
-    // JS:     }
-    // JS:
-    // JS:     await using harness = new TestHarness(new MainTarget());
-    // JS:     let mainStub = harness.stub as any;
-    // JS:
-    // JS:     {
-    // JS:       let result = await mainStub.useDisposableTarget(new DisposableTarget());
-    // JS:       expect(result).toBe(42);
-    // JS:     }
-    // JS:
-    // JS:     // Wait a bit for the disposal message to be processed
-    // JS:     await pumpMicrotasks();
-    // JS:
-    // JS:     expect(targetDisposedCount).toBe(1);
-    // JS:   });
+    #[tokio::test(flavor = "current_thread")]
+    async fn disposes_rpc_target_that_was_passed_in_params() {
+        // JS:     let targetDisposedCount = 0;
+        let target_disposed_count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        // JS:     class DisposableTarget extends RpcTarget {
+        // JS:       getValue() { return 42; }
+        // JS:       [Symbol.dispose]() { ++targetDisposedCount; }
+        // JS:     }
+        // `DisposableValueTarget::drop` is Rust's ownership equivalent.
+        // JS:
+        // JS:     class MainTarget extends RpcTarget {
+        // JS:       useDisposableTarget(stub: RpcStub<DisposableTarget>) {
+        // JS:         return stub.getValue();
+        // JS:       }
+        // JS:     }
+        // `UseDisposableTarget` is the generated dispatch equivalent.
+        // JS:
+        // JS:     await using harness = new TestHarness(new MainTarget());
+        let harness = IndexRpcHarness::new(Arc::new(UseDisposableTarget));
+        // JS:     let mainStub = harness.stub as any;
+        let main_stub = harness.stub.clone();
+        // JS:
+        // JS:     {
+        {
+            // JS:       let result = await mainStub.useDisposableTarget(new DisposableTarget());
+            let result = main_stub
+                .call(
+                    vec!["useDisposableTarget".to_owned()],
+                    RpcPayload::from_app_params(CapnwebValue::Array(vec![CapnwebValue::Target(
+                        Arc::new(DisposableValueTarget {
+                            disposed: target_disposed_count.clone(),
+                        }),
+                    )])),
+                )
+                .pull()
+                .await
+                .unwrap();
+            // JS:       expect(result).toBe(42);
+            assert!(matches!(result, CapnwebValue::Number(42.0)));
+            // JS:     }
+        }
+        // JS:
+        // JS:     // Wait a bit for the disposal message to be processed
+        // JS:     await pumpMicrotasks();
+        for _ in 0..4 {
+            tokio::task::yield_now().await;
+        }
+        // JS:
+        // JS:     expect(targetDisposedCount).toBe(1);
+        assert_eq!(target_disposed_count.load(Ordering::SeqCst), 1);
+        // JS:   });
+    }
     // JS:
     // JS:   it("dupes RpcTarget that was passed in params if it has a dup() method", async () => {
     // JS:     let dupCount = 0;
