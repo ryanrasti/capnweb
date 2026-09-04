@@ -16,7 +16,8 @@
 // JS: type CustomEncodingLevel = RpcTransportWithCustomEncoding["encodingLevel"];
 use crate::core::{
     CapnwebError, CapnwebValue, Error, PayloadStubHook, PromiseStubHook, PropertyKey, PropertyPath,
-    Result, RpcPayload, RpcStub, RpcTargetInner, StubHook, function_target, unwrap_stub_and_path,
+    Result, RpcPayload, RpcPromise, RpcStub, RpcTargetInner, StubHook, function_target,
+    unwrap_stub_and_path,
 };
 use crate::rpc::{AnyRpcTransport, RpcSession, RpcSessionOptions, TransportMessage, TransportSend};
 use crate::serialize::{EncodingLevel, deserialize, serialize, swap_byte_order};
@@ -2775,6 +2776,55 @@ impl RpcTargetInner for FixedResultTarget {
     }
 }
 
+fn order_function(order: Arc<std::sync::Mutex<Vec<i64>>>) -> CapnwebValue {
+    function_target(move |arguments| {
+        let order = order.clone();
+        async move {
+            let CapnwebValue::Array(values) = arguments.deliver_resolve().await? else {
+                return Err(Error::Type("arguments are not an array".to_owned()));
+            };
+            let Some(CapnwebValue::Number(id)) = values.first() else {
+                return Err(Error::Type("id is not a number".to_owned()));
+            };
+            order.lock().unwrap().push(*id as i64);
+            Ok(CapnwebValue::Number(*id))
+        }
+    })
+}
+
+struct OrderTarget {
+    order: Arc<std::sync::Mutex<Vec<i64>>>,
+    object: bool,
+}
+
+impl RpcTargetInner for OrderTarget {
+    fn call(self: Arc<Self>, path: PropertyPath, args: RpcPayload) -> Result<StubHook> {
+        if self.object
+            && matches!(path.as_slice(), [PropertyKey::String(method)] if method == "getObject")
+        {
+            return Ok(Arc::new(PayloadStubHook::new(RpcPayload::from_app_return(
+                CapnwebValue::Object(BTreeMap::from([
+                    ("method1".to_owned(), order_function(self.order.clone())),
+                    ("method2".to_owned(), order_function(self.order.clone())),
+                ])),
+            ))));
+        }
+        if !self.object
+            && matches!(path.as_slice(), [PropertyKey::String(method)] if method == "recordCall")
+        {
+            let CapnwebValue::Function(target) = order_function(self.order.clone()) else {
+                unreachable!()
+            };
+            return target.call(Vec::new(), args);
+        }
+        Err(Error::Type(format!("No such RPC method: {path:?}")))
+    }
+
+    fn get(self: Arc<Self>, path: PropertyPath) -> Result<StubHook> {
+        Err(Error::Type(format!("No such RPC property: {path:?}")))
+    }
+}
+
 struct DisposableValueTarget {
     disposed: Arc<std::sync::atomic::AtomicUsize>,
 }
@@ -5006,63 +5056,114 @@ mod stub_disposal_over_rpc {
 }
 // JS:
 // JS: describe("e-order", () => {
-// JS:   it("maintains e-order for concurrent calls on single stub", async () => {
-// JS:     let callOrder: number[] = [];
-// JS:     class OrderTarget extends RpcTarget {
-// JS:       recordCall(id: number) {
-// JS:         callOrder.push(id);
-// JS:         return id;
-// JS:       }
-// JS:     }
-// JS:
-// JS:     await using harness = new TestHarness(new OrderTarget());
-// JS:     let stub = harness.stub as any;
-// JS:
-// JS:     // Make multiple concurrent calls
-// JS:     let promises = [
-// JS:       stub.recordCall(1),
-// JS:       stub.recordCall(2),
-// JS:       stub.recordCall(3),
-// JS:       stub.recordCall(4)
-// JS:     ];
-// JS:
-// JS:     await Promise.all(promises);
-// JS:
-// JS:     // Calls should arrive in the order they were made
-// JS:     expect(callOrder).toEqual([1, 2, 3, 4]);
-// JS:   });
-// JS:
-// JS:   it("maintains e-order for promise-pipelined calls", async () => {
-// JS:     let callOrder: number[] = [];
-// JS:     class OrderTarget extends RpcTarget {
-// JS:       getObject() {
-// JS:         return {
-// JS:           method1: (id: number) => { callOrder.push(id); return id; },
-// JS:           method2: (id: number) => { callOrder.push(id); return id; }
-// JS:         };
-// JS:       }
-// JS:     }
-// JS:
-// JS:     await using harness = new TestHarness(new OrderTarget());
-// JS:     let stub = harness.stub as any;
-// JS:
-// JS:     // Get a promise for an object
-// JS:     using objectPromise = stub.getObject();
-// JS:
-// JS:     // Make pipelined calls on different methods of the same promise
-// JS:     let promises = [
-// JS:       objectPromise.method1(1),
-// JS:       objectPromise.method2(2),
-// JS:       objectPromise.method1(3),
-// JS:       objectPromise.method2(4)
-// JS:     ];
-// JS:
-// JS:     await Promise.all(promises);
-// JS:
-// JS:     // Calls should arrive in the order they were made, even across different methods
-// JS:     expect(callOrder).toEqual([1, 2, 3, 4]);
-// JS:   });
-// JS: });
+mod e_order {
+    use super::*;
+    // JS:   it("maintains e-order for concurrent calls on single stub", async () => {
+    #[tokio::test(flavor = "current_thread")]
+    async fn maintains_e_order_for_concurrent_calls_on_single_stub() {
+        // JS:     let callOrder: number[] = [];
+        let call_order = Arc::new(std::sync::Mutex::new(Vec::new()));
+        // JS:     class OrderTarget extends RpcTarget {
+        // JS:       recordCall(id: number) {
+        // JS:         callOrder.push(id);
+        // JS:         return id;
+        // JS:       }
+        // JS:     }
+        // `OrderTarget` is the generated dispatch equivalent.
+        // JS:
+        // JS:     await using harness = new TestHarness(new OrderTarget());
+        let harness = IndexRpcHarness::new(Arc::new(OrderTarget {
+            order: call_order.clone(),
+            object: false,
+        }));
+        // JS:     let stub = harness.stub as any;
+        let stub = harness.stub.clone();
+        // JS:
+        // JS:     // Make multiple concurrent calls
+        // JS:     let promises = [
+        let promises = vec![
+            // JS:       stub.recordCall(1),
+            stub.call(vec!["recordCall".to_owned()], one_number_argument(1.0)),
+            // JS:       stub.recordCall(2),
+            stub.call(vec!["recordCall".to_owned()], one_number_argument(2.0)),
+            // JS:       stub.recordCall(3),
+            stub.call(vec!["recordCall".to_owned()], one_number_argument(3.0)),
+            // JS:       stub.recordCall(4)
+            stub.call(vec!["recordCall".to_owned()], one_number_argument(4.0)),
+            // JS:     ];
+        ];
+        // JS:
+        // JS:     await Promise.all(promises);
+        futures::future::join_all(promises.into_iter().map(RpcPromise::pull))
+            .await
+            .into_iter()
+            .collect::<Result<Vec<_>>>()
+            .unwrap();
+        // JS:
+        // JS:     // Calls should arrive in the order they were made
+        // JS:     expect(callOrder).toEqual([1, 2, 3, 4]);
+        assert_eq!(*call_order.lock().unwrap(), [1, 2, 3, 4]);
+        // JS:   });
+    }
+    // JS:
+    // JS:   it("maintains e-order for promise-pipelined calls", async () => {
+    #[tokio::test(flavor = "current_thread")]
+    async fn maintains_e_order_for_promise_pipelined_calls() {
+        // JS:     let callOrder: number[] = [];
+        let call_order = Arc::new(std::sync::Mutex::new(Vec::new()));
+        // JS:     class OrderTarget extends RpcTarget {
+        // JS:       getObject() {
+        // JS:         return {
+        // JS:           method1: (id: number) => { callOrder.push(id); return id; },
+        // JS:           method2: (id: number) => { callOrder.push(id); return id; }
+        // JS:         };
+        // JS:       }
+        // JS:     }
+        // `OrderTarget` and `order_function` are the generated dispatch equivalents.
+        // JS:
+        // JS:     await using harness = new TestHarness(new OrderTarget());
+        let harness = IndexRpcHarness::new(Arc::new(OrderTarget {
+            order: call_order.clone(),
+            object: true,
+        }));
+        // JS:     let stub = harness.stub as any;
+        let stub = harness.stub.clone();
+        // JS:
+        // JS:     // Get a promise for an object
+        // JS:     using objectPromise = stub.getObject();
+        let object_promise = stub.call(
+            vec!["getObject".to_owned()],
+            RpcPayload::from_app_params(CapnwebValue::Array(vec![])),
+        );
+        // JS:
+        // JS:     // Make pipelined calls on different methods of the same promise
+        // JS:     let promises = [
+        let promises = vec![
+            // JS:       objectPromise.method1(1),
+            object_promise.call(vec!["method1".to_owned()], one_number_argument(1.0)),
+            // JS:       objectPromise.method2(2),
+            object_promise.call(vec!["method2".to_owned()], one_number_argument(2.0)),
+            // JS:       objectPromise.method1(3),
+            object_promise.call(vec!["method1".to_owned()], one_number_argument(3.0)),
+            // JS:       objectPromise.method2(4)
+            object_promise.call(vec!["method2".to_owned()], one_number_argument(4.0)),
+            // JS:     ];
+        ];
+        // JS:
+        // JS:     await Promise.all(promises);
+        futures::future::join_all(promises.into_iter().map(RpcPromise::pull))
+            .await
+            .into_iter()
+            .collect::<Result<Vec<_>>>()
+            .unwrap();
+        // JS:
+        // JS:     // Calls should arrive in the order they were made, even across different methods
+        // JS:     expect(callOrder).toEqual([1, 2, 3, 4]);
+        assert_eq!(*call_order.lock().unwrap(), [1, 2, 3, 4]);
+        // JS:   });
+    }
+    // JS: });
+}
 // JS:
 // JS: describe("error serialization", () => {
 // JS:   it("hides the stack by default", async () => {
