@@ -4074,78 +4074,314 @@ mod promise_pipelining {
 }
 // JS:
 // JS: describe("map() over RPC", () => {
-// JS:   it("supports map() on nulls", async () => {
-// JS:     let counter = new RpcStub(new Counter(0));
-// JS:
-// JS:     await using harness = new TestHarness(new TestTarget());
-// JS:     let stub = harness.stub;
-// JS:
-// JS:     {
-// JS:       using promise = stub.returnNull();
-// JS:       expect(await promise.map(_ => counter.increment(123))).toBe(null);
-// JS:     }
-// JS:
-// JS:     {
-// JS:       using promise = stub.returnUndefined();
-// JS:       expect(await promise.map(_ => counter.increment(456))).toBe(undefined);
-// JS:     }
-// JS:
-// JS:     {
-// JS:       using promise = stub.returnNumber(2);
-// JS:       expect(await promise.map(i => counter.increment(i))).toBe(2);
-// JS:     }
-// JS:
-// JS:     {
-// JS:       using promise = stub.returnNumber(4);
-// JS:       expect(await promise.map(i => counter.increment(i))).toBe(6);
-// JS:     }
-// JS:   });
-// JS:
-// JS:   it("supports map() on arrays", async () => {
-// JS:     let outerCounter = new RpcStub(new Counter(0));
-// JS:
-// JS:     await using harness = new TestHarness(new TestTarget());
-// JS:     let stub = harness.stub;
-// JS:
-// JS:     using fib = stub.generateFibonacci(6);
-// JS:     using counters = await fib.map(i => {
-// JS:       let counter = stub.makeCounter(i);
-// JS:       let val = counter.increment(3);
-// JS:       outerCounter.increment();
-// JS:       return {counter, val};
-// JS:     });
-// JS:
-// JS:     expect(counters.map(x => x.val)).toStrictEqual([3, 4, 4, 5, 6, 8]);
-// JS:
-// JS:     expect(await Promise.all(counters.map(x => x.counter.value)))
-// JS:         .toStrictEqual([3, 4, 4, 5, 6, 8]);
-// JS:
-// JS:     expect(await outerCounter.value).toBe(6);
-// JS:   });
-// JS:
-// JS:   it("supports nested map()", async () => {
-// JS:     await using harness = new TestHarness(new TestTarget());
-// JS:     let stub = harness.stub;
-// JS:
-// JS:     using fib = stub.generateFibonacci(7);
-// JS:     using result = await fib.map(i => {
-// JS:       return stub.generateFibonacci(i).map(j => {
-// JS:         return stub.generateFibonacci(j);
-// JS:       });
-// JS:     });
-// JS:
-// JS:     expect(result).toStrictEqual([
-// JS:       [],
-// JS:       [[]],
-// JS:       [[]],
-// JS:       [[], [0]],
-// JS:       [[], [0], [0]],
-// JS:       [[], [0], [0], [0, 1], [0, 1, 1]],
-// JS:       [[], [0], [0], [0, 1], [0, 1, 1], [0, 1, 1, 2, 3], [0, 1, 1, 2, 3, 5, 8, 13],
-// JS:           [0, 1, 1, 2, 3, 5, 8, 13, 21, 34, 55, 89, 144]],
-// JS:     ]);
-// JS:   });
-// JS: });
+mod map_over_rpc {
+    use super::*;
+    // JS:   it("supports map() on nulls", async () => {
+    #[tokio::test(flavor = "current_thread")]
+    async fn supports_map_on_nulls() {
+        // JS:     let counter = new RpcStub(new Counter(0));
+        let counter = local_counter(0.0);
+        // JS:
+        // JS:     await using harness = new TestHarness(new TestTarget());
+        let harness = IndexRpcHarness::new(Arc::new(LocalTestTarget));
+        // JS:     let stub = harness.stub;
+        let stub = harness.stub.clone();
+        // JS:
+        // JS:     {
+        {
+            // JS:       using promise = stub.returnNull();
+            let promise = stub.call(
+                vec!["returnNull".to_owned()],
+                RpcPayload::from_app_params(CapnwebValue::Array(vec![])),
+            );
+            // JS:       expect(await promise.map(_ => counter.increment(123))).toBe(null);
+            let mapped = promise
+                .as_stub()
+                .map({
+                    let counter = counter.clone();
+                    move |_| {
+                        Ok(CapnwebValue::RpcPromise(counter.call(
+                            vec!["increment".to_owned()],
+                            one_number_argument(123.0),
+                        )))
+                    }
+                })
+                .unwrap();
+            assert!(matches!(mapped.pull().await.unwrap(), CapnwebValue::Null));
+            // JS:     }
+        }
+        // JS:
+        // JS:     {
+        {
+            // JS:       using promise = stub.returnUndefined();
+            let promise = stub.call(
+                vec!["returnUndefined".to_owned()],
+                RpcPayload::from_app_params(CapnwebValue::Array(vec![])),
+            );
+            // JS:       expect(await promise.map(_ => counter.increment(456))).toBe(undefined);
+            let mapped = promise
+                .as_stub()
+                .map({
+                    let counter = counter.clone();
+                    move |_| {
+                        Ok(CapnwebValue::RpcPromise(counter.call(
+                            vec!["increment".to_owned()],
+                            one_number_argument(456.0),
+                        )))
+                    }
+                })
+                .unwrap();
+            assert!(matches!(
+                mapped.pull().await.unwrap(),
+                CapnwebValue::Undefined
+            ));
+            // JS:     }
+        }
+        // JS:
+        // JS:     {
+        {
+            // JS:       using promise = stub.returnNumber(2);
+            let promise = stub.call(vec!["returnNumber".to_owned()], one_number_argument(2.0));
+            // JS:       expect(await promise.map(i => counter.increment(i))).toBe(2);
+            let mapped = promise
+                .as_stub()
+                .map({
+                    let counter = counter.clone();
+                    move |i| {
+                        Ok(CapnwebValue::RpcPromise(counter.call(
+                            vec!["increment".to_owned()],
+                            RpcPayload::from_app_params(CapnwebValue::Array(vec![
+                                CapnwebValue::RpcPromise(i),
+                            ])),
+                        )))
+                    }
+                })
+                .unwrap();
+            assert!(matches!(
+                mapped.pull().await.unwrap(),
+                CapnwebValue::Number(2.0)
+            ));
+            // JS:     }
+        }
+        // JS:
+        // JS:     {
+        {
+            // JS:       using promise = stub.returnNumber(4);
+            let promise = stub.call(vec!["returnNumber".to_owned()], one_number_argument(4.0));
+            // JS:       expect(await promise.map(i => counter.increment(i))).toBe(6);
+            let mapped = promise
+                .as_stub()
+                .map({
+                    let counter = counter.clone();
+                    move |i| {
+                        Ok(CapnwebValue::RpcPromise(counter.call(
+                            vec!["increment".to_owned()],
+                            RpcPayload::from_app_params(CapnwebValue::Array(vec![
+                                CapnwebValue::RpcPromise(i),
+                            ])),
+                        )))
+                    }
+                })
+                .unwrap();
+            assert!(matches!(
+                mapped.pull().await.unwrap(),
+                CapnwebValue::Number(6.0)
+            ));
+            // JS:     }
+        }
+        // JS:   });
+    }
+    // JS:
+    // JS:   it("supports map() on arrays", async () => {
+    #[tokio::test(flavor = "current_thread")]
+    async fn supports_map_on_arrays() {
+        // JS:     let outerCounter = new RpcStub(new Counter(0));
+        let outer_counter = local_counter(0.0);
+        // JS:
+        // JS:     await using harness = new TestHarness(new TestTarget());
+        let harness = IndexRpcHarness::new(Arc::new(LocalTestTarget));
+        // JS:     let stub = harness.stub;
+        let stub = harness.stub.clone();
+        // JS:
+        // JS:     using fib = stub.generateFibonacci(6);
+        let fib = stub.call(
+            vec!["generateFibonacci".to_owned()],
+            one_number_argument(6.0),
+        );
+        // JS:     using counters = await fib.map(i => {
+        let counters = fib
+            .as_stub()
+            .map({
+                let stub = stub.clone();
+                let outer_counter = outer_counter.clone();
+                move |i| {
+                    // JS:       let counter = stub.makeCounter(i);
+                    let counter = stub.call(
+                        vec!["makeCounter".to_owned()],
+                        RpcPayload::from_app_params(CapnwebValue::Array(vec![
+                            CapnwebValue::RpcPromise(i),
+                        ])),
+                    );
+                    // JS:       let val = counter.increment(3);
+                    let val = counter.call(vec!["increment".to_owned()], one_number_argument(3.0));
+                    // JS:       outerCounter.increment();
+                    let _ = outer_counter.call(
+                        vec!["increment".to_owned()],
+                        RpcPayload::from_app_params(CapnwebValue::Array(vec![])),
+                    );
+                    // JS:       return {counter, val};
+                    Ok(object_value([
+                        ("counter", CapnwebValue::RpcPromise(counter)),
+                        ("val", CapnwebValue::RpcPromise(val)),
+                    ]))
+                    // JS:     });
+                }
+            })
+            .unwrap()
+            .pull()
+            .await
+            .unwrap();
+        // JS:
+        // JS:     expect(counters.map(x => x.val)).toStrictEqual([3, 4, 4, 5, 6, 8]);
+        let CapnwebValue::Array(counters) = counters else {
+            panic!()
+        };
+        let values = counters
+            .iter()
+            .map(|counter| {
+                let CapnwebValue::Object(counter) = counter else {
+                    panic!()
+                };
+                let CapnwebValue::Number(value) = counter["val"] else {
+                    panic!()
+                };
+                value
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(values, [3.0, 4.0, 4.0, 5.0, 6.0, 8.0]);
+        // JS:
+        // JS:     expect(await Promise.all(counters.map(x => x.counter.value)))
+        let mut counter_values = Vec::new();
+        for counter in &counters {
+            let CapnwebValue::Object(counter) = counter else {
+                panic!()
+            };
+            let stub = RpcStub::from_value(counter["counter"].clone());
+            let CapnwebValue::Number(value) =
+                stub.get(vec!["value".to_owned()]).pull().await.unwrap()
+            else {
+                panic!()
+            };
+            counter_values.push(value);
+        }
+        // JS:         .toStrictEqual([3, 4, 4, 5, 6, 8]);
+        assert_eq!(counter_values, [3.0, 4.0, 4.0, 5.0, 6.0, 8.0]);
+        // JS:
+        // JS:     expect(await outerCounter.value).toBe(6);
+        assert!(matches!(
+            outer_counter
+                .get(vec!["value".to_owned()])
+                .pull()
+                .await
+                .unwrap(),
+            CapnwebValue::Number(6.0)
+        ));
+        // JS:   });
+    }
+    // JS:
+    // JS:   it("supports nested map()", async () => {
+    #[tokio::test(flavor = "current_thread")]
+    async fn supports_nested_map() {
+        // JS:     await using harness = new TestHarness(new TestTarget());
+        let harness = IndexRpcHarness::new(Arc::new(LocalTestTarget));
+        // JS:     let stub = harness.stub;
+        let stub = harness.stub.clone();
+        // JS:
+        // JS:     using fib = stub.generateFibonacci(7);
+        let fib = stub.call(
+            vec!["generateFibonacci".to_owned()],
+            one_number_argument(7.0),
+        );
+        // JS:     using result = await fib.map(i => {
+        let result = fib
+            .as_stub()
+            .map({
+                let stub = stub.clone();
+                move |i| {
+                    // JS:       return stub.generateFibonacci(i).map(j => {
+                    let inner = stub.call(
+                        vec!["generateFibonacci".to_owned()],
+                        RpcPayload::from_app_params(CapnwebValue::Array(vec![
+                            CapnwebValue::RpcPromise(i),
+                        ])),
+                    );
+                    let nested = inner.as_stub().map({
+                        let stub = stub.clone();
+                        move |j| {
+                            // JS:         return stub.generateFibonacci(j);
+                            Ok(CapnwebValue::RpcPromise(stub.call(
+                                vec!["generateFibonacci".to_owned()],
+                                RpcPayload::from_app_params(CapnwebValue::Array(vec![
+                                    CapnwebValue::RpcPromise(j),
+                                ])),
+                            )))
+                            // JS:       });
+                        }
+                    })?;
+                    Ok(CapnwebValue::RpcPromise(nested))
+                    // JS:     });
+                }
+            })
+            .unwrap()
+            .pull()
+            .await
+            .unwrap();
+        // JS:
+        // JS:     expect(result).toStrictEqual([
+        let expected = CapnwebValue::Array(vec![
+            // JS:       [],
+            number_arrays(&[]),
+            // JS:       [[]],
+            CapnwebValue::Array(vec![number_arrays(&[])]),
+            // JS:       [[]],
+            CapnwebValue::Array(vec![number_arrays(&[])]),
+            // JS:       [[], [0]],
+            CapnwebValue::Array(vec![number_arrays(&[]), number_arrays(&[0.0])]),
+            // JS:       [[], [0], [0]],
+            CapnwebValue::Array(vec![
+                number_arrays(&[]),
+                number_arrays(&[0.0]),
+                number_arrays(&[0.0]),
+            ]),
+            // JS:       [[], [0], [0], [0, 1], [0, 1, 1]],
+            CapnwebValue::Array(vec![
+                number_arrays(&[]),
+                number_arrays(&[0.0]),
+                number_arrays(&[0.0]),
+                number_arrays(&[0.0, 1.0]),
+                number_arrays(&[0.0, 1.0, 1.0]),
+            ]),
+            // JS:       [[], [0], [0], [0, 1], [0, 1, 1], [0, 1, 1, 2, 3], [0, 1, 1, 2, 3, 5, 8, 13],
+            CapnwebValue::Array(vec![
+                number_arrays(&[]),
+                number_arrays(&[0.0]),
+                number_arrays(&[0.0]),
+                number_arrays(&[0.0, 1.0]),
+                number_arrays(&[0.0, 1.0, 1.0]),
+                number_arrays(&[0.0, 1.0, 1.0, 2.0, 3.0]),
+                number_arrays(&[0.0, 1.0, 1.0, 2.0, 3.0, 5.0, 8.0, 13.0]),
+                // JS:           [0, 1, 1, 2, 3, 5, 8, 13, 21, 34, 55, 89, 144]],
+                number_arrays(&[
+                    0.0, 1.0, 1.0, 2.0, 3.0, 5.0, 8.0, 13.0, 21.0, 34.0, 55.0, 89.0, 144.0,
+                ]),
+            ]),
+            // JS:     ]);
+        ]);
+        assert!(values_equal(&result, &expected));
+        // JS:   });
+    }
+    // JS: });
+}
 // JS:
 // JS: describe("stub disposal over RPC", () => {
 mod stub_disposal_over_rpc {

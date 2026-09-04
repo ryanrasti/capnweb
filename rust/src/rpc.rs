@@ -1408,12 +1408,13 @@ impl RpcSessionImpl {
                         MaybePromise::Immediate(payload) => payload,
                         MaybePromise::Pending(payload) => payload.await?,
                     };
+                    // JavaScript `await hook.pull()` resumes in a microtask even for an immediate payload.
+                    tokio::task::yield_now().await;
                     if let CapnwebValue::RpcPromise(promise) = &payload.value {
                         let (inner, path) = unwrap_stub_and_path(promise.as_stub());
                         let points_back = weak_state.upgrade().is_some_and(|state| {
                             let session_id = state.lock().expect("RPC session mutex poisoned").id;
-                            inner
-                                .rpc_import()
+                            hook.rpc_import()
                                 .is_some_and(|(owner, _)| owner == session_id)
                         });
                         if path.as_ref().is_some_and(Vec::is_empty) && !points_back {
