@@ -2762,6 +2762,56 @@ impl RpcTargetInner for FixedResultTarget {
     }
 }
 
+struct DisposableValueTarget {
+    disposed: Arc<std::sync::atomic::AtomicUsize>,
+}
+
+impl Drop for DisposableValueTarget {
+    fn drop(&mut self) {
+        self.disposed.fetch_add(1, Ordering::SeqCst);
+    }
+}
+
+impl RpcTargetInner for DisposableValueTarget {
+    fn call(self: Arc<Self>, path: PropertyPath, _args: RpcPayload) -> Result<StubHook> {
+        let value = match path.as_slice() {
+            [PropertyKey::String(method)] if method == "getValue" => CapnwebValue::Number(42.0),
+            _ => return Err(Error::Type(format!("No such RPC method: {path:?}"))),
+        };
+        Ok(Arc::new(PayloadStubHook::new(RpcPayload::from_app_return(
+            value,
+        ))))
+    }
+
+    fn get(self: Arc<Self>, path: PropertyPath) -> Result<StubHook> {
+        Err(Error::Type(format!("No such RPC property: {path:?}")))
+    }
+}
+
+struct DisposableMainTarget {
+    disposed: Arc<std::sync::atomic::AtomicUsize>,
+}
+
+impl RpcTargetInner for DisposableMainTarget {
+    fn call(self: Arc<Self>, path: PropertyPath, _args: RpcPayload) -> Result<StubHook> {
+        let value = match path.as_slice() {
+            [PropertyKey::String(method)] if method == "getDisposableTarget" => {
+                CapnwebValue::Target(Arc::new(DisposableValueTarget {
+                    disposed: self.disposed.clone(),
+                }))
+            }
+            _ => return Err(Error::Type(format!("No such RPC method: {path:?}"))),
+        };
+        Ok(Arc::new(PayloadStubHook::new(RpcPayload::from_app_return(
+            value,
+        ))))
+    }
+
+    fn get(self: Arc<Self>, path: PropertyPath) -> Result<StubHook> {
+        Err(Error::Type(format!("No such RPC property: {path:?}")))
+    }
+}
+
 struct ErrorProcessingTarget(&'static str);
 
 impl RpcTargetInner for ErrorProcessingTarget {
@@ -4068,258 +4118,336 @@ mod promise_pipelining {
 // JS: });
 // JS:
 // JS: describe("stub disposal over RPC", () => {
-// JS:   it("disposes remote RpcTarget when stub is disposed", async () => {
-// JS:     let targetDisposedCount = 0;
-// JS:     class DisposableTarget extends RpcTarget {
-// JS:       getValue() { return 42; }
-// JS:       [Symbol.dispose]() { ++targetDisposedCount; }
-// JS:     }
-// JS:
-// JS:     class MainTarget extends RpcTarget {
-// JS:       getDisposableTarget() {
-// JS:         return new DisposableTarget();
-// JS:       }
-// JS:     }
-// JS:
-// JS:     await using harness = new TestHarness(new MainTarget());
-// JS:     let mainStub = harness.stub as any;
-// JS:
-// JS:     {
-// JS:       using disposableStub = await mainStub.getDisposableTarget();
-// JS:       expect(await disposableStub.getValue()).toBe(42);
-// JS:       expect(targetDisposedCount).toBe(0);
-// JS:     } // disposer runs here
-// JS:
-// JS:     // Wait a bit for the disposal message to be processed
-// JS:     await pumpMicrotasks();
-// JS:
-// JS:     expect(targetDisposedCount).toBe(1);
-// JS:   });
-// JS:
-// JS:   it("disposes a returned RpcTarget for every time it appears in a result", async () => {
-// JS:     let targetDisposedCount = 0;
-// JS:     class DisposableTarget extends RpcTarget {
-// JS:       getValue() { return 42; }
-// JS:       [Symbol.dispose]() { ++targetDisposedCount; }
-// JS:     }
-// JS:
-// JS:     class MainTarget extends RpcTarget {
-// JS:       getDisposableTarget() {
-// JS:         let result = new DisposableTarget();
-// JS:         return [result, result, result];
-// JS:       }
-// JS:     }
-// JS:
-// JS:     await using harness = new TestHarness(new MainTarget());
-// JS:     let mainStub = harness.stub as any;
-// JS:
-// JS:     {
-// JS:       using disposableStub = await mainStub.getDisposableTarget();
-// JS:       expect(await disposableStub[0].getValue()).toBe(42);
-// JS:       expect(await disposableStub[1].getValue()).toBe(42);
-// JS:       expect(await disposableStub[2].getValue()).toBe(42);
-// JS:
-// JS:       // The current implementation will actually call the disposer twice as soon as the pipeline
-// JS:       // is done, but the last call won't happen until the stubs are disposed.
-// JS:       expect(targetDisposedCount).toBeLessThan(3);
-// JS:     } // final disposer runs here
-// JS:
-// JS:     // Wait a bit for the disposal message to be processed
-// JS:     await pumpMicrotasks();
-// JS:
-// JS:     // Disposer is called three times.
-// JS:     expect(targetDisposedCount).toBe(3);
-// JS:   });
-// JS:
-// JS:   it("disposes RpcTarget that was passed in params", async () => {
-// JS:     let targetDisposedCount = 0;
-// JS:     class DisposableTarget extends RpcTarget {
-// JS:       getValue() { return 42; }
-// JS:       [Symbol.dispose]() { ++targetDisposedCount; }
-// JS:     }
-// JS:
-// JS:     class MainTarget extends RpcTarget {
-// JS:       useDisposableTarget(stub: RpcStub<DisposableTarget>) {
-// JS:         return stub.getValue();
-// JS:       }
-// JS:     }
-// JS:
-// JS:     await using harness = new TestHarness(new MainTarget());
-// JS:     let mainStub = harness.stub as any;
-// JS:
-// JS:     {
-// JS:       let result = await mainStub.useDisposableTarget(new DisposableTarget());
-// JS:       expect(result).toBe(42);
-// JS:     }
-// JS:
-// JS:     // Wait a bit for the disposal message to be processed
-// JS:     await pumpMicrotasks();
-// JS:
-// JS:     expect(targetDisposedCount).toBe(1);
-// JS:   });
-// JS:
-// JS:   it("dupes RpcTarget that was passed in params if it has a dup() method", async () => {
-// JS:     let dupCount = 0;
-// JS:     let disposeCount = 0;
-// JS:     class DisposableTarget extends RpcTarget {
-// JS:       getValue() { return 42; }
-// JS:
-// JS:       dup() {
-// JS:         ++dupCount;
-// JS:         return new DisposableTarget();
-// JS:       }
-// JS:
-// JS:       disposed = false;
-// JS:       [Symbol.dispose]() {
-// JS:         if (this.disposed) throw new Error("double disposed");
-// JS:         this.disposed = true;
-// JS:         ++disposeCount;
-// JS:       }
-// JS:     }
-// JS:
-// JS:     class MainTarget extends RpcTarget {
-// JS:       useDisposableTarget(stub: RpcStub<DisposableTarget>) {
-// JS:         return stub.getValue();
-// JS:       }
-// JS:     }
-// JS:
-// JS:     await using harness = new TestHarness(new MainTarget());
-// JS:     let mainStub = harness.stub as any;
-// JS:
-// JS:     let disposableTarget = new DisposableTarget();
-// JS:
-// JS:     {
-// JS:       let result = await mainStub.useDisposableTarget(disposableTarget);
-// JS:       expect(dupCount).toBe(1);
-// JS:       expect(result).toBe(42);
-// JS:     }
-// JS:
-// JS:     {
-// JS:       let result = await mainStub.useDisposableTarget(disposableTarget);
-// JS:       expect(dupCount).toBe(2);
-// JS:       expect(result).toBe(42);
-// JS:     }
-// JS:
-// JS:     // Wait a bit for the disposal message to be processed
-// JS:     await pumpMicrotasks();
-// JS:
-// JS:     expect(dupCount).toBe(2);
-// JS:     expect(disposeCount).toBe(2);
-// JS:     expect(disposableTarget.disposed).toBe(false);
-// JS:   });
-// JS:
-// JS:   it("only disposes remote target when all RPC dups are disposed", async () => {
-// JS:     let targetDisposed = false;
-// JS:     class DisposableTarget extends RpcTarget {
-// JS:       getValue() { return 42; }
-// JS:       [Symbol.dispose]() { targetDisposed = true; }
-// JS:     }
-// JS:
-// JS:     class MainTarget extends RpcTarget {
-// JS:       getDisposableTarget() {
-// JS:         return new DisposableTarget();
-// JS:       }
-// JS:     }
-// JS:
-// JS:     await using harness = new TestHarness(new MainTarget());
-// JS:     let mainStub = harness.stub as any;
-// JS:
-// JS:     let disposableStub = await mainStub.getDisposableTarget();
-// JS:     let dup1 = disposableStub.dup();
-// JS:     let dup2 = disposableStub.dup();
-// JS:
-// JS:     disposableStub[Symbol.dispose]();
-// JS:     await pumpMicrotasks();
-// JS:     expect(targetDisposed).toBe(false);
-// JS:
-// JS:     dup1[Symbol.dispose]();
-// JS:     await pumpMicrotasks();
-// JS:     expect(targetDisposed).toBe(false);
-// JS:
-// JS:     dup2[Symbol.dispose]();
-// JS:     await pumpMicrotasks();
-// JS:     expect(targetDisposed).toBe(true);
-// JS:   });
-// JS:
-// JS:   it("makes RPC disposal idempotent", async () => {
-// JS:     let targetDisposed = false;
-// JS:     class DisposableTarget extends RpcTarget {
-// JS:       getValue() { return 42; }
-// JS:       [Symbol.dispose]() { targetDisposed = true; }
-// JS:     }
-// JS:
-// JS:     class MainTarget extends RpcTarget {
-// JS:       getDisposableTarget() {
-// JS:         return new DisposableTarget();
-// JS:       }
-// JS:     }
-// JS:
-// JS:     await using harness = new TestHarness(new MainTarget());
-// JS:     let mainStub = harness.stub as any;
-// JS:
-// JS:     let disposableStub = await mainStub.getDisposableTarget();
-// JS:     let dup1 = disposableStub.dup();
-// JS:
-// JS:     // Dispose the duplicate twice
-// JS:     dup1[Symbol.dispose]();
-// JS:     dup1[Symbol.dispose]();
-// JS:     await pumpMicrotasks();
-// JS:     expect(targetDisposed).toBe(false);
-// JS:
-// JS:     // Only when original is also disposed should the target be disposed
-// JS:     disposableStub[Symbol.dispose]();
-// JS:     await pumpMicrotasks();
-// JS:     expect(targetDisposed).toBe(true);
-// JS:   });
-// JS:
-// JS:   it("disposes targets automatically on disconnect", async () => {
-// JS:     let targetDisposed = false;
-// JS:     class DisposableTarget extends RpcTarget {
-// JS:       getValue() { return 42; }
-// JS:       hangingCall(): Promise<number> {
-// JS:         // This call will hang and be interrupted by disconnect
-// JS:         return new Promise(() => {}); // Never resolves
-// JS:       }
-// JS:       [Symbol.dispose]() { targetDisposed = true; }
-// JS:     }
-// JS:
-// JS:     // Intentionally don't use `using` here because we expect the stats to be wrong after a
-// JS:     // disconnect.
-// JS:     let harness = new TestHarness(new DisposableTarget());
-// JS:     let stub = harness.stub;
-// JS:     expect(await stub.getValue()).toBe(42);
-// JS:
-// JS:     // Start a hanging call
-// JS:     let hangingPromise = stub.hangingCall();
-// JS:
-// JS:     // Simulate disconnect by making the transport fail
-// JS:     harness.clientTransport.forceReceiveError(new Error("test error"));
-// JS:
-// JS:     // The hanging call should be rejected
-// JS:     await expect(() => hangingPromise).rejects.toThrow(new Error("test error"));
-// JS:
-// JS:     // Further calls should also fail immediately
-// JS:     await expect(() => stub.getValue()).rejects.toThrow(new Error("test error"));
-// JS:
-// JS:     // Targets should be disposed
-// JS:     expect(targetDisposed).toBe(true);
-// JS:   });
-// JS:
-// JS:   it("shuts down the connection if the main capability is disposed", async () => {
-// JS:     // Intentionally don't use `using` here because we expect the stats to be wrong after a
-// JS:     // disconnect.
-// JS:     let harness = new TestHarness(new TestTarget());
-// JS:     let stub = harness.stub;
-// JS:
-// JS:     let counter = await stub.makeCounter(0);
-// JS:
-// JS:     stub[Symbol.dispose]();
-// JS:
-// JS:     await expect(() => counter.increment(1)).rejects.toThrow(
-// JS:       new Error("RPC session was shut down by disposing the main stub")
-// JS:     );
-// JS:   });
-// JS: });
+mod stub_disposal_over_rpc {
+    use super::*;
+    // JS:   it("disposes remote RpcTarget when stub is disposed", async () => {
+    #[tokio::test(flavor = "current_thread")]
+    async fn disposes_remote_rpc_target_when_stub_is_disposed() {
+        // JS:     let targetDisposedCount = 0;
+        let target_disposed_count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        // JS:     class DisposableTarget extends RpcTarget {
+        // JS:       getValue() { return 42; }
+        // JS:       [Symbol.dispose]() { ++targetDisposedCount; }
+        // JS:     }
+        // `DisposableValueTarget::drop` is Rust's ownership equivalent.
+        // JS:
+        // JS:     class MainTarget extends RpcTarget {
+        // JS:       getDisposableTarget() {
+        // JS:         return new DisposableTarget();
+        // JS:       }
+        // JS:     }
+        // `DisposableMainTarget` is the generated dispatch equivalent.
+        // JS:
+        // JS:     await using harness = new TestHarness(new MainTarget());
+        let harness = IndexRpcHarness::new(Arc::new(DisposableMainTarget {
+            disposed: target_disposed_count.clone(),
+        }));
+        // JS:     let mainStub = harness.stub as any;
+        let main_stub = harness.stub.clone();
+        // JS:
+        // JS:     {
+        {
+            // JS:       using disposableStub = await mainStub.getDisposableTarget();
+            let disposable_stub = RpcStub::from_value(
+                main_stub
+                    .call(
+                        vec!["getDisposableTarget".to_owned()],
+                        RpcPayload::from_app_params(CapnwebValue::Array(vec![])),
+                    )
+                    .pull()
+                    .await
+                    .unwrap(),
+            );
+            // JS:       expect(await disposableStub.getValue()).toBe(42);
+            assert!(matches!(
+                disposable_stub
+                    .call(
+                        vec!["getValue".to_owned()],
+                        RpcPayload::from_app_params(CapnwebValue::Array(vec![]))
+                    )
+                    .pull()
+                    .await
+                    .unwrap(),
+                CapnwebValue::Number(42.0)
+            ));
+            // JS:       expect(targetDisposedCount).toBe(0);
+            assert_eq!(target_disposed_count.load(Ordering::SeqCst), 0);
+            // JS:     } // disposer runs here
+        }
+        // JS:
+        // JS:     // Wait a bit for the disposal message to be processed
+        // JS:     await pumpMicrotasks();
+        for _ in 0..4 {
+            tokio::task::yield_now().await;
+        }
+        // JS:
+        // JS:     expect(targetDisposedCount).toBe(1);
+        assert_eq!(target_disposed_count.load(Ordering::SeqCst), 1);
+        // JS:   });
+    }
+    // JS:
+    // JS:   it("disposes a returned RpcTarget for every time it appears in a result", async () => {
+    // JS:     let targetDisposedCount = 0;
+    // JS:     class DisposableTarget extends RpcTarget {
+    // JS:       getValue() { return 42; }
+    // JS:       [Symbol.dispose]() { ++targetDisposedCount; }
+    // JS:     }
+    // JS:
+    // JS:     class MainTarget extends RpcTarget {
+    // JS:       getDisposableTarget() {
+    // JS:         let result = new DisposableTarget();
+    // JS:         return [result, result, result];
+    // JS:       }
+    // JS:     }
+    // JS:
+    // JS:     await using harness = new TestHarness(new MainTarget());
+    // JS:     let mainStub = harness.stub as any;
+    // JS:
+    // JS:     {
+    // JS:       using disposableStub = await mainStub.getDisposableTarget();
+    // JS:       expect(await disposableStub[0].getValue()).toBe(42);
+    // JS:       expect(await disposableStub[1].getValue()).toBe(42);
+    // JS:       expect(await disposableStub[2].getValue()).toBe(42);
+    // JS:
+    // JS:       // The current implementation will actually call the disposer twice as soon as the pipeline
+    // JS:       // is done, but the last call won't happen until the stubs are disposed.
+    // JS:       expect(targetDisposedCount).toBeLessThan(3);
+    // JS:     } // final disposer runs here
+    // JS:
+    // JS:     // Wait a bit for the disposal message to be processed
+    // JS:     await pumpMicrotasks();
+    // JS:
+    // JS:     // Disposer is called three times.
+    // JS:     expect(targetDisposedCount).toBe(3);
+    // JS:   });
+    // JS:
+    // JS:   it("disposes RpcTarget that was passed in params", async () => {
+    // JS:     let targetDisposedCount = 0;
+    // JS:     class DisposableTarget extends RpcTarget {
+    // JS:       getValue() { return 42; }
+    // JS:       [Symbol.dispose]() { ++targetDisposedCount; }
+    // JS:     }
+    // JS:
+    // JS:     class MainTarget extends RpcTarget {
+    // JS:       useDisposableTarget(stub: RpcStub<DisposableTarget>) {
+    // JS:         return stub.getValue();
+    // JS:       }
+    // JS:     }
+    // JS:
+    // JS:     await using harness = new TestHarness(new MainTarget());
+    // JS:     let mainStub = harness.stub as any;
+    // JS:
+    // JS:     {
+    // JS:       let result = await mainStub.useDisposableTarget(new DisposableTarget());
+    // JS:       expect(result).toBe(42);
+    // JS:     }
+    // JS:
+    // JS:     // Wait a bit for the disposal message to be processed
+    // JS:     await pumpMicrotasks();
+    // JS:
+    // JS:     expect(targetDisposedCount).toBe(1);
+    // JS:   });
+    // JS:
+    // JS:   it("dupes RpcTarget that was passed in params if it has a dup() method", async () => {
+    // JS:     let dupCount = 0;
+    // JS:     let disposeCount = 0;
+    // JS:     class DisposableTarget extends RpcTarget {
+    // JS:       getValue() { return 42; }
+    // JS:
+    // JS:       dup() {
+    // JS:         ++dupCount;
+    // JS:         return new DisposableTarget();
+    // JS:       }
+    // JS:
+    // JS:       disposed = false;
+    // JS:       [Symbol.dispose]() {
+    // JS:         if (this.disposed) throw new Error("double disposed");
+    // JS:         this.disposed = true;
+    // JS:         ++disposeCount;
+    // JS:       }
+    // JS:     }
+    // JS:
+    // JS:     class MainTarget extends RpcTarget {
+    // JS:       useDisposableTarget(stub: RpcStub<DisposableTarget>) {
+    // JS:         return stub.getValue();
+    // JS:       }
+    // JS:     }
+    // JS:
+    // JS:     await using harness = new TestHarness(new MainTarget());
+    // JS:     let mainStub = harness.stub as any;
+    // JS:
+    // JS:     let disposableTarget = new DisposableTarget();
+    // JS:
+    // JS:     {
+    // JS:       let result = await mainStub.useDisposableTarget(disposableTarget);
+    // JS:       expect(dupCount).toBe(1);
+    // JS:       expect(result).toBe(42);
+    // JS:     }
+    // JS:
+    // JS:     {
+    // JS:       let result = await mainStub.useDisposableTarget(disposableTarget);
+    // JS:       expect(dupCount).toBe(2);
+    // JS:       expect(result).toBe(42);
+    // JS:     }
+    // JS:
+    // JS:     // Wait a bit for the disposal message to be processed
+    // JS:     await pumpMicrotasks();
+    // JS:
+    // JS:     expect(dupCount).toBe(2);
+    // JS:     expect(disposeCount).toBe(2);
+    // JS:     expect(disposableTarget.disposed).toBe(false);
+    // JS:   });
+    // JS:
+    // JS:   it("only disposes remote target when all RPC dups are disposed", async () => {
+    #[tokio::test(flavor = "current_thread")]
+    async fn only_disposes_remote_target_when_all_rpc_dups_are_disposed() {
+        // JS:     let targetDisposed = false;
+        let target_disposed = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        // JS:     class DisposableTarget extends RpcTarget {
+        // JS:       getValue() { return 42; }
+        // JS:       [Symbol.dispose]() { targetDisposed = true; }
+        // JS:     }
+        // `DisposableValueTarget::drop` is Rust's ownership equivalent.
+        // JS:
+        // JS:     class MainTarget extends RpcTarget {
+        // JS:       getDisposableTarget() {
+        // JS:         return new DisposableTarget();
+        // JS:       }
+        // JS:     }
+        // `DisposableMainTarget` is the generated dispatch equivalent.
+        // JS:
+        // JS:     await using harness = new TestHarness(new MainTarget());
+        let harness = IndexRpcHarness::new(Arc::new(DisposableMainTarget {
+            disposed: target_disposed.clone(),
+        }));
+        // JS:     let mainStub = harness.stub as any;
+        let main_stub = harness.stub.clone();
+        // JS:
+        // JS:     let disposableStub = await mainStub.getDisposableTarget();
+        let disposable_stub = RpcStub::from_value(
+            main_stub
+                .call(
+                    vec!["getDisposableTarget".to_owned()],
+                    RpcPayload::from_app_params(CapnwebValue::Array(vec![])),
+                )
+                .pull()
+                .await
+                .unwrap(),
+        );
+        // JS:     let dup1 = disposableStub.dup();
+        let dup1 = disposable_stub.clone();
+        // JS:     let dup2 = disposableStub.dup();
+        let dup2 = disposable_stub.clone();
+        // JS:
+        // JS:     disposableStub[Symbol.dispose]();
+        drop(disposable_stub);
+        // JS:     await pumpMicrotasks();
+        for _ in 0..2 {
+            tokio::task::yield_now().await;
+        }
+        // JS:     expect(targetDisposed).toBe(false);
+        assert_eq!(target_disposed.load(Ordering::SeqCst), 0);
+        // JS:
+        // JS:     dup1[Symbol.dispose]();
+        drop(dup1);
+        // JS:     await pumpMicrotasks();
+        for _ in 0..2 {
+            tokio::task::yield_now().await;
+        }
+        // JS:     expect(targetDisposed).toBe(false);
+        assert_eq!(target_disposed.load(Ordering::SeqCst), 0);
+        // JS:
+        // JS:     dup2[Symbol.dispose]();
+        drop(dup2);
+        // JS:     await pumpMicrotasks();
+        for _ in 0..4 {
+            tokio::task::yield_now().await;
+        }
+        // JS:     expect(targetDisposed).toBe(true);
+        assert_eq!(target_disposed.load(Ordering::SeqCst), 1);
+        // JS:   });
+    }
+    // JS:
+    // JS:   it("makes RPC disposal idempotent", async () => {
+    // JS:     let targetDisposed = false;
+    // JS:     class DisposableTarget extends RpcTarget {
+    // JS:       getValue() { return 42; }
+    // JS:       [Symbol.dispose]() { targetDisposed = true; }
+    // JS:     }
+    // JS:
+    // JS:     class MainTarget extends RpcTarget {
+    // JS:       getDisposableTarget() {
+    // JS:         return new DisposableTarget();
+    // JS:       }
+    // JS:     }
+    // JS:
+    // JS:     await using harness = new TestHarness(new MainTarget());
+    // JS:     let mainStub = harness.stub as any;
+    // JS:
+    // JS:     let disposableStub = await mainStub.getDisposableTarget();
+    // JS:     let dup1 = disposableStub.dup();
+    // JS:
+    // JS:     // Dispose the duplicate twice
+    // JS:     dup1[Symbol.dispose]();
+    // JS:     dup1[Symbol.dispose]();
+    // JS:     await pumpMicrotasks();
+    // JS:     expect(targetDisposed).toBe(false);
+    // JS:
+    // JS:     // Only when original is also disposed should the target be disposed
+    // JS:     disposableStub[Symbol.dispose]();
+    // JS:     await pumpMicrotasks();
+    // JS:     expect(targetDisposed).toBe(true);
+    // JS:   });
+    // JS:
+    // JS:   it("disposes targets automatically on disconnect", async () => {
+    // JS:     let targetDisposed = false;
+    // JS:     class DisposableTarget extends RpcTarget {
+    // JS:       getValue() { return 42; }
+    // JS:       hangingCall(): Promise<number> {
+    // JS:         // This call will hang and be interrupted by disconnect
+    // JS:         return new Promise(() => {}); // Never resolves
+    // JS:       }
+    // JS:       [Symbol.dispose]() { targetDisposed = true; }
+    // JS:     }
+    // JS:
+    // JS:     // Intentionally don't use `using` here because we expect the stats to be wrong after a
+    // JS:     // disconnect.
+    // JS:     let harness = new TestHarness(new DisposableTarget());
+    // JS:     let stub = harness.stub;
+    // JS:     expect(await stub.getValue()).toBe(42);
+    // JS:
+    // JS:     // Start a hanging call
+    // JS:     let hangingPromise = stub.hangingCall();
+    // JS:
+    // JS:     // Simulate disconnect by making the transport fail
+    // JS:     harness.clientTransport.forceReceiveError(new Error("test error"));
+    // JS:
+    // JS:     // The hanging call should be rejected
+    // JS:     await expect(() => hangingPromise).rejects.toThrow(new Error("test error"));
+    // JS:
+    // JS:     // Further calls should also fail immediately
+    // JS:     await expect(() => stub.getValue()).rejects.toThrow(new Error("test error"));
+    // JS:
+    // JS:     // Targets should be disposed
+    // JS:     expect(targetDisposed).toBe(true);
+    // JS:   });
+    // JS:
+    // JS:   it("shuts down the connection if the main capability is disposed", async () => {
+    // JS:     // Intentionally don't use `using` here because we expect the stats to be wrong after a
+    // JS:     // disconnect.
+    // JS:     let harness = new TestHarness(new TestTarget());
+    // JS:     let stub = harness.stub;
+    // JS:
+    // JS:     let counter = await stub.makeCounter(0);
+    // JS:
+    // JS:     stub[Symbol.dispose]();
+    // JS:
+    // JS:     await expect(() => counter.increment(1)).rejects.toThrow(
+    // JS:       new Error("RPC session was shut down by disposing the main stub")
+    // JS:     );
+    // JS:   });
+    // JS: });
+}
 // JS:
 // JS: describe("e-order", () => {
 // JS:   it("maintains e-order for concurrent calls on single stub", async () => {
