@@ -110,6 +110,14 @@ pub enum TransportMessage {
     Value(CapnwebValue),
 }
 
+/// Result of starting a transport send.
+pub enum TransportSend {
+    /// The send completed synchronously; the optional value is the encoded byte size.
+    Done(Option<usize>),
+    /// The send continues asynchronously. String transports may use this form.
+    Pending(Pin<Box<dyn Future<Output = Result<()>> + Send + 'static>>),
+}
+
 /// Object-safe union of the string and custom-encoding transport interfaces.
 pub trait AnyRpcTransport: Send + Sync + 'static {
     /// Returns this transport's encoding level.
@@ -118,7 +126,7 @@ pub trait AnyRpcTransport: Send + Sync + 'static {
     }
 
     /// Sends one message and optionally reports its encoded byte size.
-    fn send(&self, message: TransportMessage) -> Result<Option<usize>>;
+    fn send(&self, message: TransportMessage) -> Result<TransportSend>;
 
     /// Receives one message.
     fn receive(
@@ -1656,6 +1664,32 @@ impl RpcSessionImpl {
     // JS:   // Serializes and sends a message. Returns the byte length reported by the transport, or
     // JS:   // undefined if the transport doesn't report size.
     // JS:   private send(msg: any): number | undefined {
+    fn observe_send(
+        state: &Arc<Mutex<RpcSessionState>>,
+        pending: Pin<Box<dyn Future<Output = Result<()>> + Send + 'static>>,
+    ) {
+        let weak_state = Arc::downgrade(state);
+        let promise = EagerPromise::new(pending);
+        let _reaction = promise.then(move |result| {
+            if let Err(error) = result {
+                if let Some(state) = weak_state.upgrade() {
+                    Self::abort(&state, error, false);
+                }
+            }
+            Ok(())
+        });
+    }
+
+    fn defer_abort(state: &Arc<Mutex<RpcSessionState>>, error: Error) {
+        Self::observe_send(
+            state,
+            Box::pin(async move {
+                tokio::task::yield_now().await;
+                Err(error)
+            }),
+        );
+    }
+
     fn send(state: &Arc<Mutex<RpcSessionState>>, message: CapnwebValue) -> Result<Option<usize>> {
         // JS:     if (this.abortReason !== undefined) {
         let (transport, encoding_level, aborted) = {
@@ -1678,10 +1712,19 @@ impl RpcSessionImpl {
             // JS:       let msgText: string;
             // JS:       try {
             // JS:         msgText = JSON.stringify(msg);
-            let json = capnweb_to_json(&message)?;
-            let message_text = serde_json::to_string(&json).map_err(|error| {
-                Error::Message(format!("failed to encode RPC message: {error}"))
-            })?;
+            let message_text = (|| {
+                let json = capnweb_to_json(&message)?;
+                serde_json::to_string(&json).map_err(|error| {
+                    Error::Message(format!("failed to encode RPC message: {error}"))
+                })
+            })();
+            let message_text = match message_text {
+                Ok(message_text) => message_text,
+                Err(error) => {
+                    Self::abort(state, error.clone(), true);
+                    return Err(error);
+                }
+            };
             // JS:       } catch (err) {
             // JS:         // If JSON stringification failed, there's something wrong with the devaluator, as it
             // JS:         // should not allow non-JSONable values to be injected in the first place.
@@ -1691,8 +1734,10 @@ impl RpcSessionImpl {
             // JS:
             // JS:       try {
             // JS:         let sent = (this.transport as RpcTransport).send(msgText) as Promise<void> | undefined;
-            if let Err(error) = transport.send(TransportMessage::Text(message_text.clone())) {
-                Self::abort(state, error, false);
+            match transport.send(TransportMessage::Text(message_text.clone())) {
+                Ok(TransportSend::Done(_)) => {}
+                Ok(TransportSend::Pending(pending)) => Self::observe_send(state, pending),
+                Err(error) => Self::defer_abort(state, error),
             }
             // JS:         if (sent !== undefined && typeof sent.catch === "function") {
             // JS:           // If send fails, abort the connection, but don't try to send an abort message since
@@ -1715,9 +1760,13 @@ impl RpcSessionImpl {
             // JS:       try {
             // JS:         let size = (this.transport as RpcTransportWithCustomEncoding).send(msg);
             let size = match transport.send(TransportMessage::Value(message)) {
-                Ok(size) => size,
+                Ok(TransportSend::Done(size)) => size,
+                Ok(TransportSend::Pending(pending)) => {
+                    Self::observe_send(state, pending);
+                    None
+                }
                 Err(error) => {
-                    Self::abort(state, error, false);
+                    Self::defer_abort(state, error);
                     None
                 }
             };
@@ -2487,18 +2536,23 @@ impl RpcSessionImpl {
                     .imports
                     .get(&import_id)
                     .cloned();
-                let mut session = RpcSessionImpl {
-                    state: Arc::clone(state),
-                };
-                let payload =
-                    Evaluator::new(&mut session, encoding).evaluate(message[2].clone())?;
                 if let Some(entry) = entry {
+                    let mut session = RpcSessionImpl {
+                        state: Arc::clone(state),
+                    };
+                    let payload =
+                        Evaluator::new(&mut session, encoding).evaluate(message[2].clone())?;
                     let resolution: StubHook = if tag == "resolve" {
                         Arc::new(PayloadStubHook::new(payload))
                     } else {
                         Arc::new(ErrorStubHook::new(value_to_error(payload.value)))
                     };
                     ImportTableEntry::resolve(&entry, resolution)?;
+                } else if tag == "resolve" {
+                    let mut session = RpcSessionImpl {
+                        state: Arc::clone(state),
+                    };
+                    drop(Evaluator::new(&mut session, encoding).evaluate(message[2].clone())?);
                 }
                 Ok(())
             }
