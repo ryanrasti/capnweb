@@ -2683,7 +2683,9 @@ pub struct RpcSession {
     // JS:   #session: RpcSessionImpl;
     session: RpcSessionImpl,
     // JS:   #mainStub: RpcStub;
-    main_stub: RpcStub,
+    // RUST-DIFF(local refcount): a weak cache preserves facade identity without keeping the main
+    // capability alive after its final application-owned `RpcStub` is dropped.
+    main_stub: Mutex<Option<Weak<dyn StubHookInner>>>,
 }
 
 /// Current sparse import/export table occupancy.
@@ -2721,15 +2723,28 @@ impl RpcSession {
         // JS:     this.#session = new RpcSessionImpl(transport, mainHook, options);
         let session = RpcSessionImpl::new(transport, main_hook, options)?;
         // JS:     this.#mainStub = new RpcStub(this.#session.getMainImport());
-        let main_stub = session.get_main_import()?;
-        Ok(Self { session, main_stub })
+        // The weak Rust cache is populated lazily by `get_remote_main()`.
+        Ok(Self {
+            session,
+            main_stub: Mutex::new(None),
+        })
         // JS:   }
     }
     // JS:
     // JS:   getRemoteMain(): RpcStub {
     pub fn get_remote_main(&self) -> RpcStub {
         // JS:     return this.#mainStub;
-        self.main_stub.clone()
+        let mut cached = self.main_stub.lock().expect("main stub mutex poisoned");
+        if let Some(hook) = cached.as_ref().and_then(Weak::upgrade) {
+            return RpcStub::from_hook(hook, None);
+        }
+        let stub = self
+            .session
+            .get_main_import()
+            .expect("RPC session main import must exist");
+        let (hook, _) = unwrap_stub_and_path(&stub);
+        *cached = Some(Arc::downgrade(&hook));
+        stub
         // JS:   }
     }
     // JS:

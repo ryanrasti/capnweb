@@ -4433,19 +4433,44 @@ mod stub_disposal_over_rpc {
     // JS:   });
     // JS:
     // JS:   it("shuts down the connection if the main capability is disposed", async () => {
-    // JS:     // Intentionally don't use `using` here because we expect the stats to be wrong after a
-    // JS:     // disconnect.
-    // JS:     let harness = new TestHarness(new TestTarget());
-    // JS:     let stub = harness.stub;
-    // JS:
-    // JS:     let counter = await stub.makeCounter(0);
-    // JS:
-    // JS:     stub[Symbol.dispose]();
-    // JS:
-    // JS:     await expect(() => counter.increment(1)).rejects.toThrow(
-    // JS:       new Error("RPC session was shut down by disposing the main stub")
-    // JS:     );
-    // JS:   });
+    #[tokio::test(flavor = "current_thread")]
+    async fn shuts_down_the_connection_if_the_main_capability_is_disposed() {
+        // JS:     // Intentionally don't use `using` here because we expect the stats to be wrong after a
+        // JS:     // disconnect.
+        // JS:     let harness = new TestHarness(new TestTarget());
+        let harness = IndexRpcHarness::new(Arc::new(LocalTestTarget));
+        // JS:     let stub = harness.stub;
+        let IndexRpcHarness {
+            _client,
+            _server,
+            stub,
+        } = harness;
+        // JS:
+        // JS:     let counter = await stub.makeCounter(0);
+        let counter = RpcStub::from_value(
+            stub.call(vec!["makeCounter".to_owned()], one_number_argument(0.0))
+                .pull()
+                .await
+                .unwrap(),
+        );
+        // JS:
+        // JS:     stub[Symbol.dispose]();
+        drop(stub);
+        // JS:
+        // JS:     await expect(() => counter.increment(1)).rejects.toThrow(
+        let error = counter
+            .call(vec!["increment".to_owned()], one_number_argument(1.0))
+            .pull()
+            .await
+            .unwrap_err();
+        // JS:       new Error("RPC session was shut down by disposing the main stub")
+        assert!(
+            format!("{error}").contains("RPC session was shut down by disposing the main stub")
+        );
+        // JS:     );
+        // The assertion above checks the complete rejection.
+        // JS:   });
+    }
     // JS: });
 }
 // JS:
