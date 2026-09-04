@@ -1507,6 +1507,20 @@ impl RpcTargetInner for LocalTestTarget {
                     };
                     CapnwebValue::Target(Arc::new(LocalCounter(std::sync::Mutex::new(value))))
                 }
+                [PropertyKey::String(method)] if method == "incrementCounter" => {
+                    let counter = RpcStub::from_value(arguments.remove(0));
+                    let amount = arguments
+                        .into_iter()
+                        .next()
+                        .unwrap_or(CapnwebValue::Number(1.0));
+                    counter
+                        .call(
+                            vec!["increment".to_owned()],
+                            RpcPayload::from_app_params(CapnwebValue::Array(vec![amount])),
+                        )
+                        .pull()
+                        .await?
+                }
                 [PropertyKey::String(method)] if method == "callFunction" => {
                     let function = RpcStub::from_value(arguments.remove(0));
                     let argument = arguments.remove(0);
@@ -3400,116 +3414,149 @@ mod basic_rpc {
 }
 // JS:
 // JS: describe("capability-passing", () => {
-// JS:   it("supports returning an RpcTarget", async () => {
-// JS:     await using harness = new TestHarness(new TestTarget());
-// JS:     let stub = harness.stub;
-// JS:     using counter = await stub.makeCounter(4);
-// JS:     expect(await counter.increment()).toBe(5);
-// JS:     expect(await counter.increment(4)).toBe(9);
-// JS:   });
-// JS:
-// JS:   it("supports passing a stub back over the connection", async () => {
-// JS:     await using harness = new TestHarness(new TestTarget());
-// JS:     let stub = harness.stub;
-// JS:
-// JS:     using counter = await stub.makeCounter(4);
-// JS:     expect(await stub.incrementCounter(counter)).toBe(5);
-// JS:     expect(await stub.incrementCounter(counter, 4)).toBe(9);
-// JS:   });
-// JS:
-// JS:   it("supports three-party capability passing", async () => {
-// JS:     // Create two parallel connections: Alice and Bob
-// JS:     class AliceTarget extends RpcTarget {
-// JS:       getCounter() {
-// JS:         return new Counter(10);
-// JS:       }
-// JS:     }
-// JS:
-// JS:     class BobTarget extends RpcTarget {
-// JS:       // Bob actually uses the counter, causing calls to proxy through Bob to Alice
-// JS:       incrementCounter(counter: RpcStub<Counter>, amount: number) {
-// JS:         return counter.increment(amount);
-// JS:       }
-// JS:     }
-// JS:
-// JS:     await using aliceHarness = new TestHarness(new AliceTarget());
-// JS:     await using bobHarness = new TestHarness(new BobTarget());
-// JS:
-// JS:     let aliceStub = aliceHarness.stub;
-// JS:     let bobStub = bobHarness.stub;
-// JS:
-// JS:     // Get counter from Alice.
-// JS:     using counter = await aliceStub.getCounter();
-// JS:
-// JS:     // Bob increments the counter - this call proxies from Bob through the client to Alice
-// JS:     let result = await bobStub.incrementCounter(counter, 3);
-// JS:     expect(result).toBe(13);
-// JS:   });
-// JS:
-// JS:   it("supports proxying", async () => {
-// JS:     // Create two connections in series: us -> Bob -> Alice
-// JS:     class AliceTarget extends RpcTarget {
-// JS:       getCounter(i: number) {
-// JS:         return new Counter(i);
-// JS:       }
-// JS:
-// JS:       incrementCounter(counter: RpcStub<Counter>, amount: number) {
-// JS:         return counter.increment(amount);
-// JS:       }
-// JS:     }
-// JS:
-// JS:     class BobTarget extends RpcTarget {
-// JS:       constructor(private alice: RpcStub<AliceTarget>) {
-// JS:         super();
-// JS:       }
-// JS:
-// JS:       async getCounter(i: number) {
-// JS:         return await this.alice.getCounter(i);
-// JS:       }
-// JS:
-// JS:       getCounterPromise(i: number) {
-// JS:         return this.alice.getCounter(i);
-// JS:       }
-// JS:
-// JS:       incrementCounter(counter: RpcStub<Counter>, amount: number) {
-// JS:         return this.alice.incrementCounter(counter, amount);
-// JS:       }
-// JS:     }
-// JS:
-// JS:     await using aliceHarness = new TestHarness(new AliceTarget());
-// JS:     await using bobHarness = new TestHarness(new BobTarget(aliceHarness.stub));
-// JS:
-// JS:     let bobStub = bobHarness.stub;
-// JS:
-// JS:     // Return capability through proxy.
-// JS:     {
-// JS:       using result = await bobStub.getCounter(4);
-// JS:       expect(await result.increment(2)).toBe(6)
-// JS:     }
-// JS:
-// JS:     // Return capability through proxy, pipeline.
-// JS:     {
-// JS:       using result = bobStub.getCounter(4);
-// JS:       expect(await result.increment(2)).toBe(6)
-// JS:     }
-// JS:
-// JS:     // Return promise through proxy.
-// JS:     {
-// JS:       using result = bobStub.getCounterPromise(4);
-// JS:       expect(await result.increment(2)).toBe(6)
-// JS:     }
-// JS:
-// JS:     // Send capability through proxy.
-// JS:     {
-// JS:       let counter = new Counter(10);
-// JS:
-// JS:       let result = await bobStub.incrementCounter(counter, 3);
-// JS:
-// JS:       expect(result).toBe(13);
-// JS:       expect(counter.increment(1)).toBe(14);
-// JS:     }
-// JS:   });
-// JS: });
+mod capability_passing {
+    use super::*;
+    // JS:   it("supports returning an RpcTarget", async () => {
+    #[tokio::test(flavor = "current_thread")]
+    async fn supports_returning_an_rpc_target() {
+        // JS:     await using harness = new TestHarness(new TestTarget());
+        let harness = IndexRpcHarness::new(Arc::new(LocalTestTarget));
+        // JS:     let stub = harness.stub;
+        let stub = harness.stub.clone();
+        // JS:     using counter = await stub.makeCounter(4);
+        let counter = RpcStub::from_value(
+            stub.call(vec!["makeCounter".to_owned()], one_number_argument(4.0))
+                .pull()
+                .await
+                .unwrap(),
+        );
+        // JS:     expect(await counter.increment()).toBe(5);
+        assert!(matches!(
+            counter
+                .call(
+                    vec!["increment".to_owned()],
+                    RpcPayload::from_app_params(CapnwebValue::Array(vec![]))
+                )
+                .pull()
+                .await
+                .unwrap(),
+            CapnwebValue::Number(5.0)
+        ));
+        // JS:     expect(await counter.increment(4)).toBe(9);
+        assert!(matches!(
+            counter
+                .call(vec!["increment".to_owned()], one_number_argument(4.0))
+                .pull()
+                .await
+                .unwrap(),
+            CapnwebValue::Number(9.0)
+        ));
+        // JS:   });
+    }
+    // JS:
+    // JS:   it("supports passing a stub back over the connection", async () => {
+    // JS:     await using harness = new TestHarness(new TestTarget());
+    // JS:     let stub = harness.stub;
+    // JS:
+    // JS:     using counter = await stub.makeCounter(4);
+    // JS:     expect(await stub.incrementCounter(counter)).toBe(5);
+    // JS:     expect(await stub.incrementCounter(counter, 4)).toBe(9);
+    // JS:   });
+    // JS:
+    // JS:   it("supports three-party capability passing", async () => {
+    // JS:     // Create two parallel connections: Alice and Bob
+    // JS:     class AliceTarget extends RpcTarget {
+    // JS:       getCounter() {
+    // JS:         return new Counter(10);
+    // JS:       }
+    // JS:     }
+    // JS:
+    // JS:     class BobTarget extends RpcTarget {
+    // JS:       // Bob actually uses the counter, causing calls to proxy through Bob to Alice
+    // JS:       incrementCounter(counter: RpcStub<Counter>, amount: number) {
+    // JS:         return counter.increment(amount);
+    // JS:       }
+    // JS:     }
+    // JS:
+    // JS:     await using aliceHarness = new TestHarness(new AliceTarget());
+    // JS:     await using bobHarness = new TestHarness(new BobTarget());
+    // JS:
+    // JS:     let aliceStub = aliceHarness.stub;
+    // JS:     let bobStub = bobHarness.stub;
+    // JS:
+    // JS:     // Get counter from Alice.
+    // JS:     using counter = await aliceStub.getCounter();
+    // JS:
+    // JS:     // Bob increments the counter - this call proxies from Bob through the client to Alice
+    // JS:     let result = await bobStub.incrementCounter(counter, 3);
+    // JS:     expect(result).toBe(13);
+    // JS:   });
+    // JS:
+    // JS:   it("supports proxying", async () => {
+    // JS:     // Create two connections in series: us -> Bob -> Alice
+    // JS:     class AliceTarget extends RpcTarget {
+    // JS:       getCounter(i: number) {
+    // JS:         return new Counter(i);
+    // JS:       }
+    // JS:
+    // JS:       incrementCounter(counter: RpcStub<Counter>, amount: number) {
+    // JS:         return counter.increment(amount);
+    // JS:       }
+    // JS:     }
+    // JS:
+    // JS:     class BobTarget extends RpcTarget {
+    // JS:       constructor(private alice: RpcStub<AliceTarget>) {
+    // JS:         super();
+    // JS:       }
+    // JS:
+    // JS:       async getCounter(i: number) {
+    // JS:         return await this.alice.getCounter(i);
+    // JS:       }
+    // JS:
+    // JS:       getCounterPromise(i: number) {
+    // JS:         return this.alice.getCounter(i);
+    // JS:       }
+    // JS:
+    // JS:       incrementCounter(counter: RpcStub<Counter>, amount: number) {
+    // JS:         return this.alice.incrementCounter(counter, amount);
+    // JS:       }
+    // JS:     }
+    // JS:
+    // JS:     await using aliceHarness = new TestHarness(new AliceTarget());
+    // JS:     await using bobHarness = new TestHarness(new BobTarget(aliceHarness.stub));
+    // JS:
+    // JS:     let bobStub = bobHarness.stub;
+    // JS:
+    // JS:     // Return capability through proxy.
+    // JS:     {
+    // JS:       using result = await bobStub.getCounter(4);
+    // JS:       expect(await result.increment(2)).toBe(6)
+    // JS:     }
+    // JS:
+    // JS:     // Return capability through proxy, pipeline.
+    // JS:     {
+    // JS:       using result = bobStub.getCounter(4);
+    // JS:       expect(await result.increment(2)).toBe(6)
+    // JS:     }
+    // JS:
+    // JS:     // Return promise through proxy.
+    // JS:     {
+    // JS:       using result = bobStub.getCounterPromise(4);
+    // JS:       expect(await result.increment(2)).toBe(6)
+    // JS:     }
+    // JS:
+    // JS:     // Send capability through proxy.
+    // JS:     {
+    // JS:       let counter = new Counter(10);
+    // JS:
+    // JS:       let result = await bobStub.incrementCounter(counter, 3);
+    // JS:
+    // JS:       expect(result).toBe(13);
+    // JS:       expect(counter.increment(1)).toBe(14);
+    // JS:     }
+    // JS:   });
+    // JS: });
+}
 // JS:
 // JS: describe("promise pipelining", () => {
 // JS:   it("supports passing a promise in arguments", async () => {
