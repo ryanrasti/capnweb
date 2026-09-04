@@ -17,6 +17,7 @@
 use crate::core::{
     CapnwebError, CapnwebValue, Error, PayloadStubHook, PromiseStubHook, PropertyKey, PropertyPath,
     Result, RpcPayload, RpcStub, RpcTargetInner, StubHook, function_target,
+    unwrap_stub_and_path,
 };
 use crate::rpc::{AnyRpcTransport, RpcSession, RpcSessionOptions, TransportMessage, TransportSend};
 use crate::serialize::{EncodingLevel, deserialize, serialize, swap_byte_order};
@@ -1501,9 +1502,13 @@ impl RpcTargetInner for LocalTestTarget {
                             .collect(),
                     )
                 }
-                [PropertyKey::String(method)] if method == "makeCounter" => {
-                    let CapnwebValue::Number(value) = arguments.remove(0) else {
-                        panic!()
+                [PropertyKey::String(method)]
+                    if method == "makeCounter" || method == "getCounter" =>
+                {
+                    let value = match arguments.into_iter().next() {
+                        Some(CapnwebValue::Number(value)) => value,
+                        None if method == "getCounter" => 10.0,
+                        _ => panic!(),
                     };
                     CapnwebValue::Target(Arc::new(LocalCounter(std::sync::Mutex::new(value))))
                 }
@@ -2747,6 +2752,47 @@ impl RpcTargetInner for FixedResultTarget {
     }
 }
 
+struct ProxyTarget {
+    alice: RpcStub,
+}
+
+impl RpcTargetInner for ProxyTarget {
+    fn call(self: Arc<Self>, path: PropertyPath, args: RpcPayload) -> Result<StubHook> {
+        let method = match path.as_slice() {
+            [PropertyKey::String(method)] => method.as_str(),
+            _ => return Err(Error::Type(format!("No such RPC method: {path:?}"))),
+        };
+        match method {
+            "getCounter" => {
+                let alice = self.alice.clone();
+                Ok(PromiseStubHook::from_future(async move {
+                    let value = alice
+                        .call(vec!["getCounter".to_owned()], args)
+                        .pull()
+                        .await?;
+                    Ok(
+                        Arc::new(PayloadStubHook::new(RpcPayload::from_app_return(value)))
+                            as StubHook,
+                    )
+                }))
+            }
+            "getCounterPromise" => {
+                let promise = self.alice.call(vec!["getCounter".to_owned()], args);
+                Ok(unwrap_stub_and_path(promise.as_stub()).0)
+            }
+            "incrementCounter" => {
+                let promise = self.alice.call(vec!["incrementCounter".to_owned()], args);
+                Ok(unwrap_stub_and_path(promise.as_stub()).0)
+            }
+            _ => Err(Error::Type(format!("No such RPC method: {method}"))),
+        }
+    }
+
+    fn get(self: Arc<Self>, path: PropertyPath) -> Result<StubHook> {
+        Err(Error::Type(format!("No such RPC property: {path:?}")))
+    }
+}
+
 struct IndexRpcHarness {
     _client: RpcSession,
     _server: RpcSession,
@@ -3500,97 +3546,201 @@ mod capability_passing {
     }
     // JS:
     // JS:   it("supports three-party capability passing", async () => {
-    // JS:     // Create two parallel connections: Alice and Bob
-    // JS:     class AliceTarget extends RpcTarget {
-    // JS:       getCounter() {
-    // JS:         return new Counter(10);
-    // JS:       }
-    // JS:     }
-    // JS:
-    // JS:     class BobTarget extends RpcTarget {
-    // JS:       // Bob actually uses the counter, causing calls to proxy through Bob to Alice
-    // JS:       incrementCounter(counter: RpcStub<Counter>, amount: number) {
-    // JS:         return counter.increment(amount);
-    // JS:       }
-    // JS:     }
-    // JS:
-    // JS:     await using aliceHarness = new TestHarness(new AliceTarget());
-    // JS:     await using bobHarness = new TestHarness(new BobTarget());
-    // JS:
-    // JS:     let aliceStub = aliceHarness.stub;
-    // JS:     let bobStub = bobHarness.stub;
-    // JS:
-    // JS:     // Get counter from Alice.
-    // JS:     using counter = await aliceStub.getCounter();
-    // JS:
-    // JS:     // Bob increments the counter - this call proxies from Bob through the client to Alice
-    // JS:     let result = await bobStub.incrementCounter(counter, 3);
-    // JS:     expect(result).toBe(13);
-    // JS:   });
+    #[tokio::test(flavor = "current_thread")]
+    async fn supports_three_party_capability_passing() {
+        // JS:     // Create two parallel connections: Alice and Bob
+        // JS:     class AliceTarget extends RpcTarget {
+        // JS:       getCounter() {
+        // JS:         return new Counter(10);
+        // JS:       }
+        // JS:     }
+        // Rust generated dispatch uses `LocalTestTarget::getCounter`.
+        // JS:
+        // JS:     class BobTarget extends RpcTarget {
+        // JS:       // Bob actually uses the counter, causing calls to proxy through Bob to Alice
+        // JS:       incrementCounter(counter: RpcStub<Counter>, amount: number) {
+        // JS:         return counter.increment(amount);
+        // JS:       }
+        // JS:     }
+        // Rust generated dispatch uses `LocalTestTarget::incrementCounter`.
+        // JS:
+        // JS:     await using aliceHarness = new TestHarness(new AliceTarget());
+        let alice_harness = IndexRpcHarness::new(Arc::new(LocalTestTarget));
+        // JS:     await using bobHarness = new TestHarness(new BobTarget());
+        let bob_harness = IndexRpcHarness::new(Arc::new(LocalTestTarget));
+        // JS:
+        // JS:     let aliceStub = aliceHarness.stub;
+        let alice_stub = alice_harness.stub.clone();
+        // JS:     let bobStub = bobHarness.stub;
+        let bob_stub = bob_harness.stub.clone();
+        // JS:
+        // JS:     // Get counter from Alice.
+        // JS:     using counter = await aliceStub.getCounter();
+        let counter = RpcStub::from_value(
+            alice_stub
+                .call(
+                    vec!["getCounter".to_owned()],
+                    RpcPayload::from_app_params(CapnwebValue::Array(vec![])),
+                )
+                .pull()
+                .await
+                .unwrap(),
+        );
+        // JS:
+        // JS:     // Bob increments the counter - this call proxies from Bob through the client to Alice
+        // JS:     let result = await bobStub.incrementCounter(counter, 3);
+        let result = bob_stub
+            .call(
+                vec!["incrementCounter".to_owned()],
+                RpcPayload::from_app_params(CapnwebValue::Array(vec![
+                    CapnwebValue::Stub(counter),
+                    CapnwebValue::Number(3.0),
+                ])),
+            )
+            .pull()
+            .await
+            .unwrap();
+        // JS:     expect(result).toBe(13);
+        assert!(matches!(result, CapnwebValue::Number(13.0)));
+        // JS:   });
+    }
     // JS:
     // JS:   it("supports proxying", async () => {
-    // JS:     // Create two connections in series: us -> Bob -> Alice
-    // JS:     class AliceTarget extends RpcTarget {
-    // JS:       getCounter(i: number) {
-    // JS:         return new Counter(i);
-    // JS:       }
-    // JS:
-    // JS:       incrementCounter(counter: RpcStub<Counter>, amount: number) {
-    // JS:         return counter.increment(amount);
-    // JS:       }
-    // JS:     }
-    // JS:
-    // JS:     class BobTarget extends RpcTarget {
-    // JS:       constructor(private alice: RpcStub<AliceTarget>) {
-    // JS:         super();
-    // JS:       }
-    // JS:
-    // JS:       async getCounter(i: number) {
-    // JS:         return await this.alice.getCounter(i);
-    // JS:       }
-    // JS:
-    // JS:       getCounterPromise(i: number) {
-    // JS:         return this.alice.getCounter(i);
-    // JS:       }
-    // JS:
-    // JS:       incrementCounter(counter: RpcStub<Counter>, amount: number) {
-    // JS:         return this.alice.incrementCounter(counter, amount);
-    // JS:       }
-    // JS:     }
-    // JS:
-    // JS:     await using aliceHarness = new TestHarness(new AliceTarget());
-    // JS:     await using bobHarness = new TestHarness(new BobTarget(aliceHarness.stub));
-    // JS:
-    // JS:     let bobStub = bobHarness.stub;
-    // JS:
-    // JS:     // Return capability through proxy.
-    // JS:     {
-    // JS:       using result = await bobStub.getCounter(4);
-    // JS:       expect(await result.increment(2)).toBe(6)
-    // JS:     }
-    // JS:
-    // JS:     // Return capability through proxy, pipeline.
-    // JS:     {
-    // JS:       using result = bobStub.getCounter(4);
-    // JS:       expect(await result.increment(2)).toBe(6)
-    // JS:     }
-    // JS:
-    // JS:     // Return promise through proxy.
-    // JS:     {
-    // JS:       using result = bobStub.getCounterPromise(4);
-    // JS:       expect(await result.increment(2)).toBe(6)
-    // JS:     }
-    // JS:
-    // JS:     // Send capability through proxy.
-    // JS:     {
-    // JS:       let counter = new Counter(10);
-    // JS:
-    // JS:       let result = await bobStub.incrementCounter(counter, 3);
-    // JS:
-    // JS:       expect(result).toBe(13);
-    // JS:       expect(counter.increment(1)).toBe(14);
-    // JS:     }
-    // JS:   });
+    #[tokio::test(flavor = "current_thread")]
+    async fn supports_proxying() {
+        // JS:     // Create two connections in series: us -> Bob -> Alice
+        // JS:     class AliceTarget extends RpcTarget {
+        // JS:       getCounter(i: number) {
+        // JS:         return new Counter(i);
+        // JS:       }
+        // JS:
+        // JS:       incrementCounter(counter: RpcStub<Counter>, amount: number) {
+        // JS:         return counter.increment(amount);
+        // JS:       }
+        // JS:     }
+        // JS:
+        // JS:     class BobTarget extends RpcTarget {
+        // JS:       constructor(private alice: RpcStub<AliceTarget>) {
+        // JS:         super();
+        // JS:       }
+        // JS:
+        // JS:       async getCounter(i: number) {
+        // JS:         return await this.alice.getCounter(i);
+        // JS:       }
+        // JS:
+        // JS:       getCounterPromise(i: number) {
+        // JS:         return this.alice.getCounter(i);
+        // JS:       }
+        // JS:
+        // JS:       incrementCounter(counter: RpcStub<Counter>, amount: number) {
+        // JS:         return this.alice.incrementCounter(counter, amount);
+        // JS:       }
+        // JS:     }
+        // JS:
+        // JS:     await using aliceHarness = new TestHarness(new AliceTarget());
+        let alice_harness = IndexRpcHarness::new(Arc::new(LocalTestTarget));
+        // JS:     await using bobHarness = new TestHarness(new BobTarget(aliceHarness.stub));
+        let bob_harness = IndexRpcHarness::new(Arc::new(ProxyTarget {
+            alice: alice_harness.stub.clone(),
+        }));
+        // JS:
+        // JS:     let bobStub = bobHarness.stub;
+        let bob_stub = bob_harness.stub.clone();
+        // JS:
+        // JS:     // Return capability through proxy.
+        // JS:     {
+        {
+            // JS:       using result = await bobStub.getCounter(4);
+            let result = RpcStub::from_value(
+                bob_stub
+                    .call(vec!["getCounter".to_owned()], one_number_argument(4.0))
+                    .pull()
+                    .await
+                    .unwrap(),
+            );
+            // JS:       expect(await result.increment(2)).toBe(6)
+            assert!(matches!(
+                result
+                    .call(vec!["increment".to_owned()], one_number_argument(2.0))
+                    .pull()
+                    .await
+                    .unwrap(),
+                CapnwebValue::Number(6.0)
+            ));
+            // JS:     }
+        }
+        // JS:
+        // JS:     // Return capability through proxy, pipeline.
+        // JS:     {
+        {
+            // JS:       using result = bobStub.getCounter(4);
+            let result = bob_stub.call(vec!["getCounter".to_owned()], one_number_argument(4.0));
+            // JS:       expect(await result.increment(2)).toBe(6)
+            assert!(matches!(
+                result
+                    .call(vec!["increment".to_owned()], one_number_argument(2.0))
+                    .pull()
+                    .await
+                    .unwrap(),
+                CapnwebValue::Number(6.0)
+            ));
+            // JS:     }
+        }
+        // JS:
+        // JS:     // Return promise through proxy.
+        // JS:     {
+        {
+            // JS:       using result = bobStub.getCounterPromise(4);
+            let result = bob_stub.call(
+                vec!["getCounterPromise".to_owned()],
+                one_number_argument(4.0),
+            );
+            // JS:       expect(await result.increment(2)).toBe(6)
+            assert!(matches!(
+                result
+                    .call(vec!["increment".to_owned()], one_number_argument(2.0))
+                    .pull()
+                    .await
+                    .unwrap(),
+                CapnwebValue::Number(6.0)
+            ));
+            // JS:     }
+        }
+        // JS:
+        // JS:     // Send capability through proxy.
+        // JS:     {
+        {
+            // JS:       let counter = new Counter(10);
+            let counter = RpcStub::from_target(Arc::new(LocalCounter(std::sync::Mutex::new(10.0))));
+            // JS:
+            // JS:       let result = await bobStub.incrementCounter(counter, 3);
+            let result = bob_stub
+                .call(
+                    vec!["incrementCounter".to_owned()],
+                    RpcPayload::from_app_params(CapnwebValue::Array(vec![
+                        CapnwebValue::Stub(counter.clone()),
+                        CapnwebValue::Number(3.0),
+                    ])),
+                )
+                .pull()
+                .await
+                .unwrap();
+            // JS:
+            // JS:       expect(result).toBe(13);
+            assert!(matches!(result, CapnwebValue::Number(13.0)));
+            // JS:       expect(counter.increment(1)).toBe(14);
+            assert!(matches!(
+                counter
+                    .call(vec!["increment".to_owned()], one_number_argument(1.0))
+                    .pull()
+                    .await
+                    .unwrap(),
+                CapnwebValue::Number(14.0)
+            ));
+            // JS:     }
+        }
+        // JS:   });
+    }
     // JS: });
 }
 // JS:
