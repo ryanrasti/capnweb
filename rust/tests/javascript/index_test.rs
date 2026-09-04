@@ -2725,6 +2725,7 @@ struct IndexPairTransport {
     receive_error: std::sync::Mutex<Option<Error>>,
     receive_error_ready: tokio::sync::Notify,
     encoding: EncodingLevel,
+    sent_log: Arc<std::sync::Mutex<Vec<String>>>,
 }
 
 impl IndexPairTransport {
@@ -2740,6 +2741,9 @@ impl AnyRpcTransport for IndexPairTransport {
     }
 
     fn send(&self, message: TransportMessage) -> Result<TransportSend> {
+        if let TransportMessage::Text(text) = &message {
+            self.sent_log.lock().unwrap().push(text.clone());
+        }
         self.sender
             .send(message)
             .map_err(|_| Error::Message("transport closed".to_owned()))?;
@@ -2812,7 +2816,7 @@ impl RpcTargetInner for OrderTarget {
             ))));
         }
         if !self.object
-            && matches!(path.as_slice(), [PropertyKey::String(method)] if method == "recordCall")
+            && matches!(path.as_slice(), [PropertyKey::String(method)] if method == "recordCall" || method == "record")
         {
             let CapnwebValue::Function(target) = order_function(self.order.clone()) else {
                 unreachable!()
@@ -2824,6 +2828,24 @@ impl RpcTargetInner for OrderTarget {
 
     fn get(self: Arc<Self>, path: PropertyPath) -> Result<StubHook> {
         Err(Error::Type(format!("No such RPC property: {path:?}")))
+    }
+}
+
+struct GetterTarget(Arc<std::sync::atomic::AtomicUsize>);
+
+impl RpcTargetInner for GetterTarget {
+    fn call(self: Arc<Self>, path: PropertyPath, _args: RpcPayload) -> Result<StubHook> {
+        Err(Error::Type(format!("No such RPC method: {path:?}")))
+    }
+
+    fn get(self: Arc<Self>, path: PropertyPath) -> Result<StubHook> {
+        if path != vec![PropertyKey::String("prop".to_owned())] {
+            return Err(Error::Type(format!("No such RPC property: {path:?}")));
+        }
+        self.0.fetch_add(1, Ordering::SeqCst);
+        Ok(Arc::new(PayloadStubHook::new(RpcPayload::from_app_return(
+            CapnwebValue::Number(42.0),
+        ))))
     }
 }
 
@@ -3048,6 +3070,7 @@ struct IndexRpcHarness {
     _server: RpcSession,
     stub: RpcStub,
     client_transport: Arc<IndexPairTransport>,
+    client_sent_log: Arc<std::sync::Mutex<Vec<String>>>,
 }
 
 impl IndexRpcHarness {
@@ -3062,12 +3085,14 @@ impl IndexRpcHarness {
     ) -> Self {
         let (to_client, client_receiver) = tokio::sync::mpsc::unbounded_channel();
         let (to_server, server_receiver) = tokio::sync::mpsc::unbounded_channel();
+        let client_sent_log = Arc::new(std::sync::Mutex::new(Vec::new()));
         let client_transport = Arc::new(IndexPairTransport {
             sender: to_server,
             receiver: tokio::sync::Mutex::new(client_receiver),
             receive_error: std::sync::Mutex::new(None),
             receive_error_ready: tokio::sync::Notify::new(),
             encoding,
+            sent_log: client_sent_log.clone(),
         });
         let server_transport = Arc::new(IndexPairTransport {
             sender: to_client,
@@ -3075,6 +3100,7 @@ impl IndexRpcHarness {
             receive_error: std::sync::Mutex::new(None),
             receive_error_ready: tokio::sync::Notify::new(),
             encoding,
+            sent_log: Arc::new(std::sync::Mutex::new(Vec::new())),
         });
         let client =
             RpcSession::new(client_transport.clone(), None, RpcSessionOptions::default()).unwrap();
@@ -3090,6 +3116,7 @@ impl IndexRpcHarness {
             _server: server,
             stub,
             client_transport,
+            client_sent_log,
         }
     }
 }
@@ -5069,6 +5096,7 @@ mod stub_disposal_over_rpc {
             _server,
             stub,
             client_transport: _,
+            client_sent_log: _,
         } = harness;
         // JS:
         // JS:     let counter = await stub.makeCounter(0);
@@ -6406,245 +6434,624 @@ mod rpc_import_hook_argument_disposal {
 // JS: // =======================================================================================
 // JS:
 // JS: describe("constructing RpcPromise from a promise", () => {
-// JS:   it("pipelines through a pending promise without pulling the resolution", async () => {
-// JS:     await using harness = new TestHarness(new TestTarget());
-// JS:
-// JS:     let {promise, resolve} = Promise.withResolvers<RpcStub<TestTarget>>();
-// JS:     using stub = new RpcPromise<TestTarget>(promise);
-// JS:
-// JS:     using counter = stub.makeCounter(1);
-// JS:     let result = counter.increment(2);
-// JS:     resolve(harness.stub.dup());
-// JS:     expect(await result).toBe(3);
-// JS:
-// JS:     // Only the final result was pulled: neither the promise's resolution nor the intermediate
-// JS:     // counter was transmitted.
-// JS:     let sent = harness.clientTransport.sentLog;
-// JS:     expect(sent.some(msg => msg.startsWith('["push"'))).toBe(true);
-// JS:     expect(sent.filter(msg => msg.startsWith('["pull"'))).toHaveLength(1);
-// JS:   });
-// JS:
-// JS:   it("queues calls made before resolution and delivers them in order", async () => {
-// JS:     let calls: number[] = [];
-// JS:     class Recorder extends RpcTarget {
-// JS:       record(i: number) { calls.push(i); return i; }
-// JS:     }
-// JS:
-// JS:     let {promise, resolve} = Promise.withResolvers<Recorder>();
-// JS:     using stub = new RpcPromise<Recorder>(promise);
-// JS:
-// JS:     let results = [stub.record(1), stub.record(2), stub.record(3)];
-// JS:     expect(calls).toStrictEqual([]);
-// JS:
-// JS:     resolve(new Recorder());
-// JS:     expect(await Promise.all(results)).toStrictEqual([1, 2, 3]);
-// JS:     expect(calls).toStrictEqual([1, 2, 3]);
-// JS:   });
-// JS:
-// JS:   it("accepts a promise for a target, a remote stub, or a plain value", async () => {
-// JS:     await using harness = new TestHarness(new TestTarget());
-// JS:
-// JS:     using target = new RpcPromise<Counter>(Promise.resolve(new Counter(1)));
-// JS:     expect(await target.increment()).toBe(2);
-// JS:
-// JS:     using remote = new RpcPromise<TestTarget>(Promise.resolve(harness.stub.dup()));
-// JS:     expect(await remote.square(3)).toBe(9);
-// JS:
-// JS:     using value = new RpcPromise<{foo: number}>(Promise.resolve({foo: 123}));
-// JS:     expect(await value.foo).toBe(123);
-// JS:   });
-// JS:
-// JS:   it("awaiting the RpcPromise yields the resolution", async () => {
-// JS:     using plain = new RpcPromise<{foo: number}>(Promise.resolve({foo: 123}));
-// JS:     expect(await plain).toStrictEqual({foo: 123});
-// JS:
-// JS:     await using harness = new TestHarness(new TestTarget());
-// JS:     using remote = new RpcPromise<TestTarget>(Promise.resolve(harness.stub.dup()));
-// JS:     let resolved = await remote;
-// JS:     expect(await resolved.square(4)).toBe(16);
-// JS:   });
-// JS:
-// JS:   it("reports rejection to queued calls, await, and onRpcBroken", async () => {
-// JS:     let error = new Error("nope");
-// JS:     using stub = new RpcPromise<Counter>(Promise.reject(error));
-// JS:
-// JS:     let broken: any[] = [];
-// JS:     stub.onRpcBroken(err => { broken.push(err); });
-// JS:
-// JS:     await expect(() => stub.increment()).rejects.toThrow("nope");
-// JS:     await expect(Promise.resolve(stub)).rejects.toThrow("nope");
-// JS:     expect(broken).toStrictEqual([error]);
-// JS:   });
-// JS:
-// JS:   it("does not report an unhandled rejection for an unused promise", async () => {
-// JS:     new RpcPromise<Counter>(Promise.reject(new Error("ignored")));
-// JS:     await pumpMicrotasks();
-// JS:   });
-// JS:
-// JS:   it("does not report an unhandled rejection for a disposed, unawaited queued call", async () => {
-// JS:     using stub = new RpcPromise<Counter>(Promise.reject(new Error("ignored")));
-// JS:     using result = stub.increment();  // never awaited; disposal alone must observe the error
-// JS:     await pumpMicrotasks();
-// JS:   });
-// JS:
-// JS:   it("does not report an unhandled rejection for a disposed, unawaited map() result", async () => {
-// JS:     using stub = new RpcPromise<number>(Promise.reject(new Error("ignored")));
-// JS:     using result = stub.map(i => i);  // never awaited; disposal alone must observe the error
-// JS:     await pumpMicrotasks();
-// JS:   });
-// JS:
-// JS:   it("disposes the eventual target when disposed before resolution", async () => {
-// JS:     let disposed = false;
-// JS:     class Disposable extends RpcTarget {
-// JS:       [Symbol.dispose]() { disposed = true; }
-// JS:     }
-// JS:
-// JS:     let {promise, resolve} = Promise.withResolvers<Disposable>();
-// JS:     let stub = new RpcPromise<Disposable>(promise);
-// JS:     stub[Symbol.dispose]();
-// JS:
-// JS:     resolve(new Disposable());
-// JS:     await pumpMicrotasks();
-// JS:     expect(disposed).toBe(true);
-// JS:   });
-// JS:
-// JS:   it("delivers a call initiated before disposal", async () => {
-// JS:     let disposed = false;
-// JS:     class DisposableCounter extends Counter {
-// JS:       [Symbol.dispose]() { disposed = true; }
-// JS:     }
-// JS:
-// JS:     let stub = new RpcPromise<DisposableCounter>(Promise.resolve(new DisposableCounter(1)));
-// JS:     await pumpMicrotasks();
-// JS:
-// JS:     let result = stub.increment(2);
-// JS:     stub[Symbol.dispose]();
-// JS:
-// JS:     expect(disposed).toBe(false);
-// JS:     expect(await result).toBe(3);
-// JS:     expect(disposed).toBe(true);
-// JS:   });
-// JS:
-// JS:   it("keeps an adopted RpcPromise lazy", async () => {
-// JS:     await using harness = new TestHarness(new TestTarget());
-// JS:
-// JS:     using counter = new RpcPromise<Counter>(harness.stub.makeCounter(1));
-// JS:     expect(await counter.increment(2)).toBe(3);
-// JS:
-// JS:     let sent = harness.clientTransport.sentLog;
-// JS:     expect(sent.filter(msg => msg.startsWith('["pull"'))).toHaveLength(1);
-// JS:   });
-// JS:
-// JS:   it("transmits nothing when constructed from a remote property promise", async () => {
-// JS:     await using harness = new TestHarness(new TestTarget());
-// JS:
-// JS:     using counter = harness.stub.makeCounter(5);
-// JS:     await pumpMicrotasks();  // let the makeCounter push flush
-// JS:
-// JS:     let source = counter.value;
-// JS:     let wrapped = new RpcPromise<number>(source);
-// JS:
-// JS:     // Construction shares the source's hook and path; the get() producing an independent hook
-// JS:     // happens lazily on first await, so nothing goes over the wire yet.
-// JS:     let sentBefore = harness.clientTransport.sentLog.length;
-// JS:     await pumpMicrotasks();
-// JS:     expect(harness.clientTransport.sentLog.length).toBe(sentBefore);
-// JS:
-// JS:     expect(await wrapped).toBe(5);
-// JS:
-// JS:     // The source property promise remains usable.
-// JS:     expect(await source).toBe(5);
-// JS:   });
-// JS:
-// JS:   it("does not invoke a local getter when constructed from a property promise", async () => {
-// JS:     let reads = 0;
-// JS:     class Gettable extends RpcTarget {
-// JS:       get prop() { ++reads; return 42; }
-// JS:     }
-// JS:
-// JS:     using stub = new RpcStub(new Gettable());
-// JS:     let source = stub.prop;
-// JS:     let wrapped = new RpcPromise<number>(source);
-// JS:
-// JS:     await pumpMicrotasks();
-// JS:     expect(reads).toBe(0);
-// JS:
-// JS:     expect(await wrapped).toBe(42);
-// JS:     expect(await source).toBe(42);
-// JS:   });
-// JS:
-// JS:   it("consumes the source when adopting an existing RpcPromise", async () => {
-// JS:     await using harness = new TestHarness(new TestTarget());
-// JS:
-// JS:     let source = harness.stub.makeCounter(1);
-// JS:     using wrapper = new RpcPromise<Counter>(source);
-// JS:
-// JS:     // The source was neutered: using it now reports the standard disposed error, and disposing
-// JS:     // it is a harmless no-op that doesn't affect the wrapper.
-// JS:     await expect(source.increment(1)).rejects.toThrow(
-// JS:         "Attempted to use RPC stub after it has been disposed.");
-// JS:     source[Symbol.dispose]();
-// JS:
-// JS:     expect(await wrapper.increment(2)).toBe(3);
-// JS:   });
-// JS:
-// JS:   it("stays lazy when a deferred promise is resolved with dup()", async () => {
-// JS:     await using harness = new TestHarness(new TestTarget());
-// JS:
-// JS:     using counter = harness.stub.makeCounter(1);
-// JS:
-// JS:     // Resolving with the RpcPromise itself would let the native promise machinery assimilate it
-// JS:     // as a thenable, pulling the resolution. dup() returns a non-thenable stub, which the
-// JS:     // resolution adopts, keeping calls pipelined.
-// JS:     let {promise, resolve} = Promise.withResolvers<RpcStub<Counter>>();
-// JS:     using stub = new RpcPromise<Counter>(promise);
-// JS:
-// JS:     let result = stub.increment(2);
-// JS:     resolve(counter.dup());
-// JS:     expect(await result).toBe(3);
-// JS:
-// JS:     let sent = harness.clientTransport.sentLog;
-// JS:     expect(sent.filter(msg => msg.startsWith('["pull"'))).toHaveLength(1);
-// JS:   });
-// JS:
-// JS:   it("preserves brokenness of a bare stub it was constructed from", async () => {
-// JS:     await using harness = new TestHarness(new TestTarget());
-// JS:     using stub = new RpcPromise<TestTarget>(<any>harness.stub.dup());
-// JS:
-// JS:     let errors: any[] = [];
-// JS:     stub.onRpcBroken(error => { errors.push(error); });
-// JS:
-// JS:     harness.clientTransport.forceReceiveError(new Error("test disconnect"));
-// JS:     await pumpMicrotasks();
-// JS:     expect(errors).toStrictEqual([new Error("test disconnect")]);
-// JS:   });
-// JS:
-// JS:   it("keeps disposal idempotent when constructed from a bare stub", async () => {
-// JS:     let disposals = 0;
-// JS:     class Disposable extends RpcTarget {
-// JS:       [Symbol.dispose]() { ++disposals; }
-// JS:     }
-// JS:
-// JS:     let inner = new RpcStub(new Disposable());
-// JS:     let outer = new RpcPromise<Disposable>(<any>inner);
-// JS:     inner[Symbol.dispose]();
-// JS:     outer[Symbol.dispose]();
-// JS:
-// JS:     await pumpMicrotasks();
-// JS:     expect(disposals).toBe(1);
-// JS:   });
-// JS:
-// JS:   it("resolves when awaited after construction from a bare local stub", async () => {
-// JS:     // Regression test: the constructor previously adopted a bare stub's hook directly, producing
-// JS:     // a promise whose pipelined calls worked but whose await rejected, because non-promise hooks
-// JS:     // don't implement pull().
-// JS:     using stub = new RpcPromise<Counter>(<any>new RpcStub(new Counter(1)));
-// JS:
-// JS:     expect(await stub.increment(2)).toBe(3);
-// JS:     let resolved = await stub;
-// JS:     expect(await resolved.increment(3)).toBe(6);
-// JS:   });
-// JS: });
+mod constructing_rpc_promise {
+    use super::*;
+    // JS:   it("pipelines through a pending promise without pulling the resolution", async () => {
+    #[tokio::test(flavor = "current_thread")]
+    async fn pipelines_through_pending_promise_without_pulling_resolution() {
+        // JS:     await using harness = new TestHarness(new TestTarget());
+        let harness = IndexRpcHarness::new(Arc::new(LocalTestTarget));
+        // JS:
+        // JS:     let {promise, resolve} = Promise.withResolvers<RpcStub<TestTarget>>();
+        let (resolve, promise) = tokio::sync::oneshot::channel();
+        // JS:     using stub = new RpcPromise<TestTarget>(promise);
+        let stub = RpcPromise::from_future(async move {
+            promise
+                .await
+                .map_err(|_| Error::Message("resolver dropped".to_owned()))
+        });
+        // JS:
+        // JS:     using counter = stub.makeCounter(1);
+        let counter = stub.call(vec!["makeCounter".to_owned()], one_number_argument(1.0));
+        // JS:     let result = counter.increment(2);
+        let result = counter.call(vec!["increment".to_owned()], one_number_argument(2.0));
+        // JS:     resolve(harness.stub.dup());
+        resolve
+            .send(CapnwebValue::Stub(harness.stub.clone()))
+            .unwrap();
+        // JS:     expect(await result).toBe(3);
+        assert!(matches!(
+            result.pull().await.unwrap(),
+            CapnwebValue::Number(3.0)
+        ));
+        // JS:
+        // JS:     // Only the final result was pulled: neither the promise's resolution nor the intermediate
+        // JS:     // counter was transmitted.
+        // JS:     let sent = harness.clientTransport.sentLog;
+        let sent = harness.client_sent_log.lock().unwrap().clone();
+        // JS:     expect(sent.some(msg => msg.startsWith('["push"'))).toBe(true);
+        assert!(sent.iter().any(|message| message.starts_with("[\"push\"")));
+        // JS:     expect(sent.filter(msg => msg.startsWith('["pull"'))).toHaveLength(1);
+        assert_eq!(
+            sent.iter()
+                .filter(|message| message.starts_with("[\"pull\""))
+                .count(),
+            1
+        );
+        // JS:   });
+    }
+    // JS:
+    // JS:   it("queues calls made before resolution and delivers them in order", async () => {
+    #[tokio::test(flavor = "current_thread")]
+    async fn queues_calls_before_resolution_and_delivers_in_order() {
+        // JS:     let calls: number[] = [];
+        let calls = Arc::new(std::sync::Mutex::new(Vec::new()));
+        // JS:     class Recorder extends RpcTarget {
+        // JS:       record(i: number) { calls.push(i); return i; }
+        // JS:     }
+        // `OrderTarget` is the generated dispatch equivalent.
+        // JS:
+        // JS:     let {promise, resolve} = Promise.withResolvers<Recorder>();
+        let (resolve, promise) = tokio::sync::oneshot::channel();
+        // JS:     using stub = new RpcPromise<Recorder>(promise);
+        let stub = RpcPromise::from_future(async move {
+            promise
+                .await
+                .map_err(|_| Error::Message("resolver dropped".to_owned()))
+        });
+        // JS:
+        // JS:     let results = [stub.record(1), stub.record(2), stub.record(3)];
+        let results = vec![
+            stub.call(vec!["record".to_owned()], one_number_argument(1.0)),
+            stub.call(vec!["record".to_owned()], one_number_argument(2.0)),
+            stub.call(vec!["record".to_owned()], one_number_argument(3.0)),
+        ];
+        // JS:     expect(calls).toStrictEqual([]);
+        assert!(calls.lock().unwrap().is_empty());
+        // JS:
+        // JS:     resolve(new Recorder());
+        resolve
+            .send(CapnwebValue::Target(Arc::new(OrderTarget {
+                order: calls.clone(),
+                object: false,
+            })))
+            .unwrap();
+        // JS:     expect(await Promise.all(results)).toStrictEqual([1, 2, 3]);
+        let results = futures::future::join_all(results.into_iter().map(RpcPromise::pull))
+            .await
+            .into_iter()
+            .collect::<Result<Vec<_>>>()
+            .unwrap();
+        assert!(matches!(
+            results.as_slice(),
+            [
+                CapnwebValue::Number(1.0),
+                CapnwebValue::Number(2.0),
+                CapnwebValue::Number(3.0)
+            ]
+        ));
+        // JS:     expect(calls).toStrictEqual([1, 2, 3]);
+        assert_eq!(*calls.lock().unwrap(), [1, 2, 3]);
+        // JS:   });
+    }
+    // JS:
+    // JS:   it("accepts a promise for a target, a remote stub, or a plain value", async () => {
+    #[tokio::test(flavor = "current_thread")]
+    async fn accepts_a_promise_for_target_remote_stub_or_plain_value() {
+        // JS:     await using harness = new TestHarness(new TestTarget());
+        let harness = IndexRpcHarness::new(Arc::new(LocalTestTarget));
+        // JS:
+        // JS:     using target = new RpcPromise<Counter>(Promise.resolve(new Counter(1)));
+        let target = RpcPromise::from_value(CapnwebValue::Target(Arc::new(LocalCounter(
+            std::sync::Mutex::new(1.0),
+        ))));
+        // JS:     expect(await target.increment()).toBe(2);
+        assert!(matches!(
+            target
+                .call(
+                    vec!["increment".to_owned()],
+                    RpcPayload::from_app_params(CapnwebValue::Array(vec![]))
+                )
+                .pull()
+                .await
+                .unwrap(),
+            CapnwebValue::Number(2.0)
+        ));
+        // JS:
+        // JS:     using remote = new RpcPromise<TestTarget>(Promise.resolve(harness.stub.dup()));
+        let remote = RpcPromise::from_value(CapnwebValue::Stub(harness.stub.clone()));
+        // JS:     expect(await remote.square(3)).toBe(9);
+        assert!(matches!(
+            remote
+                .call(vec!["square".to_owned()], one_number_argument(3.0))
+                .pull()
+                .await
+                .unwrap(),
+            CapnwebValue::Number(9.0)
+        ));
+        // JS:
+        // JS:     using value = new RpcPromise<{foo: number}>(Promise.resolve({foo: 123}));
+        let value = RpcPromise::from_value(object_value([("foo", CapnwebValue::Number(123.0))]));
+        // JS:     expect(await value.foo).toBe(123);
+        assert!(matches!(
+            value.get(vec!["foo".to_owned()]).pull().await.unwrap(),
+            CapnwebValue::Number(123.0)
+        ));
+        // JS:   });
+    }
+    // JS:
+    // JS:   it("awaiting the RpcPromise yields the resolution", async () => {
+    #[tokio::test(flavor = "current_thread")]
+    async fn awaiting_rpc_promise_yields_resolution() {
+        // JS:     using plain = new RpcPromise<{foo: number}>(Promise.resolve({foo: 123}));
+        let plain = RpcPromise::from_value(object_value([("foo", CapnwebValue::Number(123.0))]));
+        // JS:     expect(await plain).toStrictEqual({foo: 123});
+        let plain = plain.pull().await.unwrap();
+        assert!(values_equal(
+            &plain,
+            &object_value([("foo", CapnwebValue::Number(123.0))])
+        ));
+        // JS:
+        // JS:     await using harness = new TestHarness(new TestTarget());
+        let harness = IndexRpcHarness::new(Arc::new(LocalTestTarget));
+        // JS:     using remote = new RpcPromise<TestTarget>(Promise.resolve(harness.stub.dup()));
+        let remote = RpcPromise::from_value(CapnwebValue::Stub(harness.stub.clone()));
+        // JS:     let resolved = await remote;
+        let resolved = RpcStub::from_value(remote.pull().await.unwrap());
+        // JS:     expect(await resolved.square(4)).toBe(16);
+        assert!(matches!(
+            resolved
+                .call(vec!["square".to_owned()], one_number_argument(4.0))
+                .pull()
+                .await
+                .unwrap(),
+            CapnwebValue::Number(16.0)
+        ));
+        // JS:   });
+    }
+    // JS:
+    // JS:   it("reports rejection to queued calls, await, and onRpcBroken", async () => {
+    #[tokio::test(flavor = "current_thread")]
+    async fn reports_rejection_to_queued_calls_await_and_on_rpc_broken() {
+        // JS:     let error = new Error("nope");
+        let error = Error::Message("nope".to_owned());
+        // JS:     using stub = new RpcPromise<Counter>(Promise.reject(error));
+        let stub = RpcPromise::from_future(async move { Err(error) });
+        // JS:
+        // JS:     let broken: any[] = [];
+        let broken = Arc::new(std::sync::Mutex::new(Vec::new()));
+        // JS:     stub.onRpcBroken(err => { broken.push(err); });
+        stub.as_stub().on_rpc_broken({
+            let broken = broken.clone();
+            move |error| broken.lock().unwrap().push(format!("{error}"))
+        });
+        // JS:
+        // JS:     await expect(() => stub.increment()).rejects.toThrow("nope");
+        assert!(
+            format!(
+                "{}",
+                stub.call(
+                    vec!["increment".to_owned()],
+                    RpcPayload::from_app_params(CapnwebValue::Array(vec![]))
+                )
+                .pull()
+                .await
+                .unwrap_err()
+            )
+            .contains("nope")
+        );
+        // JS:     await expect(Promise.resolve(stub)).rejects.toThrow("nope");
+        assert!(format!("{}", stub.clone().pull().await.unwrap_err()).contains("nope"));
+        // JS:     expect(broken).toStrictEqual([error]);
+        assert_eq!(*broken.lock().unwrap(), ["nope"]);
+        // JS:   });
+    }
+    // JS:
+    // JS:   it("does not report an unhandled rejection for an unused promise", async () => {
+    #[tokio::test(flavor = "current_thread")]
+    async fn does_not_report_unhandled_rejection_for_unused_promise() {
+        // JS:     new RpcPromise<Counter>(Promise.reject(new Error("ignored")));
+        drop(RpcPromise::from_future(async {
+            Err(Error::Message("ignored".to_owned()))
+        }));
+        // JS:     await pumpMicrotasks();
+        tokio::task::yield_now().await;
+        // JS:   });
+    }
+    // JS:
+    // JS:   it("does not report an unhandled rejection for a disposed, unawaited queued call", async () => {
+    #[tokio::test(flavor = "current_thread")]
+    async fn does_not_report_unhandled_rejection_for_disposed_queued_call() {
+        // JS:     using stub = new RpcPromise<Counter>(Promise.reject(new Error("ignored")));
+        let stub = RpcPromise::from_future(async { Err(Error::Message("ignored".to_owned())) });
+        // JS:     using result = stub.increment();  // never awaited; disposal alone must observe the error
+        drop(stub.call(
+            vec!["increment".to_owned()],
+            RpcPayload::from_app_params(CapnwebValue::Array(vec![])),
+        ));
+        // JS:     await pumpMicrotasks();
+        tokio::task::yield_now().await;
+        // JS:   });
+    }
+    // JS:
+    // JS:   it("does not report an unhandled rejection for a disposed, unawaited map() result", async () => {
+    #[tokio::test(flavor = "current_thread")]
+    async fn does_not_report_unhandled_rejection_for_disposed_map_result() {
+        // JS:     using stub = new RpcPromise<number>(Promise.reject(new Error("ignored")));
+        let stub = RpcPromise::from_future(async { Err(Error::Message("ignored".to_owned())) });
+        // JS:     using result = stub.map(i => i);  // never awaited; disposal alone must observe the error
+        drop(
+            stub.as_stub()
+                .map(|i| Ok(CapnwebValue::RpcPromise(i)))
+                .unwrap(),
+        );
+        // JS:     await pumpMicrotasks();
+        tokio::task::yield_now().await;
+        // JS:   });
+    }
+    // JS:
+    // JS:   it("disposes the eventual target when disposed before resolution", async () => {
+    #[tokio::test(flavor = "current_thread")]
+    async fn disposes_eventual_target_when_disposed_before_resolution() {
+        // JS:     let disposed = false;
+        let disposed = Arc::new(AtomicBool::new(false));
+        // JS:     class Disposable extends RpcTarget {
+        // JS:       [Symbol.dispose]() { disposed = true; }
+        // JS:     }
+        // `DisposalSpyTarget::drop` is Rust's ownership equivalent.
+        // JS:
+        // JS:     let {promise, resolve} = Promise.withResolvers<Disposable>();
+        let (resolve, promise) = tokio::sync::oneshot::channel();
+        // JS:     let stub = new RpcPromise<Disposable>(promise);
+        let stub = RpcPromise::from_future(async move {
+            promise
+                .await
+                .map_err(|_| Error::Message("resolver dropped".to_owned()))
+        });
+        // JS:     stub[Symbol.dispose]();
+        drop(stub);
+        // JS:
+        // JS:     resolve(new Disposable());
+        resolve
+            .send(CapnwebValue::Target(Arc::new(DisposalSpyTarget(
+                disposed.clone(),
+            ))))
+            .unwrap();
+        // JS:     await pumpMicrotasks();
+        for _ in 0..3 {
+            tokio::task::yield_now().await;
+        }
+        // JS:     expect(disposed).toBe(true);
+        assert!(disposed.load(Ordering::SeqCst));
+        // JS:   });
+    }
+    // JS:
+    // JS:   it("delivers a call initiated before disposal", async () => {
+    #[tokio::test(flavor = "current_thread")]
+    async fn delivers_call_initiated_before_disposal() {
+        // JS:     let disposed = false;
+        let disposed = Arc::new(AtomicBool::new(false));
+        // JS:     class DisposableCounter extends Counter {
+        // JS:       [Symbol.dispose]() { disposed = true; }
+        // JS:     }
+        // `DisposableCounterTarget::drop` is Rust's ownership equivalent.
+        // JS:
+        // JS:     let stub = new RpcPromise<DisposableCounter>(Promise.resolve(new DisposableCounter(1)));
+        let stub =
+            RpcPromise::from_value(CapnwebValue::Target(Arc::new(DisposableCounterTarget {
+                value: std::sync::Mutex::new(1.0),
+                disposed: disposed.clone(),
+            })));
+        // JS:     await pumpMicrotasks();
+        tokio::task::yield_now().await;
+        // JS:
+        // JS:     let result = stub.increment(2);
+        let result = stub.call(vec!["increment".to_owned()], one_number_argument(2.0));
+        // JS:     stub[Symbol.dispose]();
+        drop(stub);
+        // JS:
+        // JS:     expect(disposed).toBe(false);
+        assert!(!disposed.load(Ordering::SeqCst));
+        // JS:     expect(await result).toBe(3);
+        assert!(matches!(
+            result.pull().await.unwrap(),
+            CapnwebValue::Number(3.0)
+        ));
+        // JS:     expect(disposed).toBe(true);
+        assert!(disposed.load(Ordering::SeqCst));
+        // JS:   });
+    }
+    // JS:
+    // JS:   it("keeps an adopted RpcPromise lazy", async () => {
+    #[tokio::test(flavor = "current_thread")]
+    async fn keeps_an_adopted_rpc_promise_lazy() {
+        // JS:     await using harness = new TestHarness(new TestTarget());
+        let harness = IndexRpcHarness::new(Arc::new(LocalTestTarget));
+        // JS:
+        // JS:     using counter = new RpcPromise<Counter>(harness.stub.makeCounter(1));
+        let source = harness
+            .stub
+            .call(vec!["makeCounter".to_owned()], one_number_argument(1.0));
+        let counter = RpcPromise::from_value(CapnwebValue::RpcPromise(source));
+        // JS:     expect(await counter.increment(2)).toBe(3);
+        assert!(matches!(
+            counter
+                .call(vec!["increment".to_owned()], one_number_argument(2.0))
+                .pull()
+                .await
+                .unwrap(),
+            CapnwebValue::Number(3.0)
+        ));
+        // JS:
+        // JS:     let sent = harness.clientTransport.sentLog;
+        let sent = harness.client_sent_log.lock().unwrap().clone();
+        // JS:     expect(sent.filter(msg => msg.startsWith('["pull"'))).toHaveLength(1);
+        assert_eq!(
+            sent.iter()
+                .filter(|message| message.starts_with("[\"pull\""))
+                .count(),
+            1
+        );
+        // JS:   });
+    }
+    // JS:
+    // JS:   it("transmits nothing when constructed from a remote property promise", async () => {
+    #[tokio::test(flavor = "current_thread")]
+    async fn transmits_nothing_when_constructed_from_remote_property_promise() {
+        // JS:     await using harness = new TestHarness(new TestTarget());
+        let harness = IndexRpcHarness::new(Arc::new(LocalTestTarget));
+        // JS:
+        // JS:     using counter = harness.stub.makeCounter(5);
+        let counter = harness
+            .stub
+            .call(vec!["makeCounter".to_owned()], one_number_argument(5.0));
+        // JS:     await pumpMicrotasks();  // let the makeCounter push flush
+        tokio::task::yield_now().await;
+        // JS:
+        // JS:     let source = counter.value;
+        let source = counter.get(vec!["value".to_owned()]);
+        // JS:     let wrapped = new RpcPromise<number>(source);
+        let wrapped = RpcPromise::from_value(CapnwebValue::RpcPromise(source.clone()));
+        // JS:
+        // JS:     // Construction shares the source's hook and path; the get() producing an independent hook
+        // JS:     // happens lazily on first await, so nothing goes over the wire yet.
+        // JS:     let sentBefore = harness.clientTransport.sentLog.length;
+        let sent_before = harness.client_sent_log.lock().unwrap().len();
+        // JS:     await pumpMicrotasks();
+        tokio::task::yield_now().await;
+        // JS:     expect(harness.clientTransport.sentLog.length).toBe(sentBefore);
+        assert_eq!(harness.client_sent_log.lock().unwrap().len(), sent_before);
+        // JS:
+        // JS:     expect(await wrapped).toBe(5);
+        assert!(matches!(
+            wrapped.pull().await.unwrap(),
+            CapnwebValue::Number(5.0)
+        ));
+        // JS:
+        // JS:     // The source property promise remains usable.
+        // JS:     expect(await source).toBe(5);
+        assert!(matches!(
+            source.pull().await.unwrap(),
+            CapnwebValue::Number(5.0)
+        ));
+        // JS:   });
+    }
+    // JS:
+    // JS:   it("does not invoke a local getter when constructed from a property promise", async () => {
+    #[tokio::test(flavor = "current_thread")]
+    async fn does_not_invoke_local_getter_when_constructed_from_property_promise() {
+        // JS:     let reads = 0;
+        let reads = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        // JS:     class Gettable extends RpcTarget {
+        // JS:       get prop() { ++reads; return 42; }
+        // JS:     }
+        // `GetterTarget` is the generated dispatch equivalent.
+        // JS:
+        // JS:     using stub = new RpcStub(new Gettable());
+        let stub = RpcStub::from_target(Arc::new(GetterTarget(reads.clone())));
+        // JS:     let source = stub.prop;
+        let source = stub.get(vec!["prop".to_owned()]);
+        // JS:     let wrapped = new RpcPromise<number>(source);
+        let wrapped = RpcPromise::from_value(CapnwebValue::RpcPromise(source.clone()));
+        // JS:
+        // JS:     await pumpMicrotasks();
+        tokio::task::yield_now().await;
+        // JS:     expect(reads).toBe(0);
+        assert_eq!(reads.load(Ordering::SeqCst), 0);
+        // JS:
+        // JS:     expect(await wrapped).toBe(42);
+        assert!(matches!(
+            wrapped.pull().await.unwrap(),
+            CapnwebValue::Number(42.0)
+        ));
+        // JS:     expect(await source).toBe(42);
+        assert!(matches!(
+            source.pull().await.unwrap(),
+            CapnwebValue::Number(42.0)
+        ));
+        // JS:   });
+    }
+    // JS:
+    // JS:   it("consumes the source when adopting an existing RpcPromise", async () => {
+    #[tokio::test(flavor = "current_thread")]
+    async fn consumes_source_when_adopting_existing_rpc_promise() {
+        // JS:     await using harness = new TestHarness(new TestTarget());
+        let harness = IndexRpcHarness::new(Arc::new(LocalTestTarget));
+        // JS:
+        // JS:     let source = harness.stub.makeCounter(1);
+        let source = harness
+            .stub
+            .call(vec!["makeCounter".to_owned()], one_number_argument(1.0));
+        // JS:     using wrapper = new RpcPromise<Counter>(source);
+        let wrapper = RpcPromise::from_value(CapnwebValue::RpcPromise(source));
+        // JS:
+        // JS:     // The source was neutered: using it now reports the standard disposed error, and disposing
+        // JS:     // it is a harmless no-op that doesn't affect the wrapper.
+        // JS:     await expect(source.increment(1)).rejects.toThrow(
+        // RUST-DIFF(local refcount): moving `source` into the wrapper makes further use a compile-time error.
+        // JS:         "Attempted to use RPC stub after it has been disposed.");
+        // The Rust ownership error is static rather than a runtime string.
+        // JS:     source[Symbol.dispose]();
+        // The moved source has no separate disposal operation.
+        // JS:
+        // JS:     expect(await wrapper.increment(2)).toBe(3);
+        assert!(matches!(
+            wrapper
+                .call(vec!["increment".to_owned()], one_number_argument(2.0))
+                .pull()
+                .await
+                .unwrap(),
+            CapnwebValue::Number(3.0)
+        ));
+        // JS:   });
+    }
+    // JS:
+    // JS:   it("stays lazy when a deferred promise is resolved with dup()", async () => {
+    #[tokio::test(flavor = "current_thread")]
+    async fn stays_lazy_when_deferred_promise_is_resolved_with_dup() {
+        // JS:     await using harness = new TestHarness(new TestTarget());
+        let harness = IndexRpcHarness::new(Arc::new(LocalTestTarget));
+        // JS:
+        // JS:     using counter = harness.stub.makeCounter(1);
+        let counter = harness
+            .stub
+            .call(vec!["makeCounter".to_owned()], one_number_argument(1.0));
+        // JS:
+        // JS:     // Resolving with the RpcPromise itself would let the native promise machinery assimilate it
+        // JS:     // as a thenable, pulling the resolution. dup() returns a non-thenable stub, which the
+        // JS:     // resolution adopts, keeping calls pipelined.
+        // JS:     let {promise, resolve} = Promise.withResolvers<RpcStub<Counter>>();
+        let (resolve, promise) = tokio::sync::oneshot::channel();
+        // JS:     using stub = new RpcPromise<Counter>(promise);
+        let stub = RpcPromise::from_future(async move {
+            promise
+                .await
+                .map_err(|_| Error::Message("resolver dropped".to_owned()))
+        });
+        // JS:
+        // JS:     let result = stub.increment(2);
+        let result = stub.call(vec!["increment".to_owned()], one_number_argument(2.0));
+        // JS:     resolve(counter.dup());
+        resolve
+            .send(CapnwebValue::Stub(RpcStub::from_value(
+                CapnwebValue::RpcPromise(counter.clone()),
+            )))
+            .unwrap();
+        // JS:     expect(await result).toBe(3);
+        assert!(matches!(
+            result.pull().await.unwrap(),
+            CapnwebValue::Number(3.0)
+        ));
+        // JS:
+        // JS:     let sent = harness.clientTransport.sentLog;
+        let sent = harness.client_sent_log.lock().unwrap().clone();
+        // JS:     expect(sent.filter(msg => msg.startsWith('["pull"'))).toHaveLength(1);
+        assert_eq!(
+            sent.iter()
+                .filter(|message| message.starts_with("[\"pull\""))
+                .count(),
+            1
+        );
+        // JS:   });
+    }
+    // JS:
+    // JS:   it("preserves brokenness of a bare stub it was constructed from", async () => {
+    #[tokio::test(flavor = "current_thread")]
+    async fn preserves_brokenness_of_bare_stub_it_was_constructed_from() {
+        // JS:     await using harness = new TestHarness(new TestTarget());
+        let harness = IndexRpcHarness::new(Arc::new(LocalTestTarget));
+        // JS:     using stub = new RpcPromise<TestTarget>(<any>harness.stub.dup());
+        let stub = RpcPromise::from_value(CapnwebValue::Stub(harness.stub.clone()));
+        // JS:
+        // JS:     let errors: any[] = [];
+        let errors = Arc::new(std::sync::Mutex::new(Vec::new()));
+        // JS:     stub.onRpcBroken(error => { errors.push(error); });
+        stub.as_stub().on_rpc_broken({
+            let errors = errors.clone();
+            move |error| {
+                let message = match error {
+                    Error::Serialized(error) => error.message,
+                    error => format!("{error}"),
+                };
+                errors.lock().unwrap().push(message);
+            }
+        });
+        // JS:
+        // JS:     harness.clientTransport.forceReceiveError(new Error("test disconnect"));
+        harness
+            .client_transport
+            .force_receive_error(Error::Message("test disconnect".to_owned()));
+        // JS:     await pumpMicrotasks();
+        for _ in 0..6 {
+            tokio::task::yield_now().await;
+        }
+        // JS:     expect(errors).toStrictEqual([new Error("test disconnect")]);
+        assert_eq!(*errors.lock().unwrap(), ["test disconnect"]);
+        // JS:   });
+    }
+    // JS:
+    // JS:   it("keeps disposal idempotent when constructed from a bare stub", async () => {
+    #[tokio::test(flavor = "current_thread")]
+    async fn keeps_disposal_idempotent_when_constructed_from_bare_stub() {
+        // JS:     let disposals = 0;
+        let disposals = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        // JS:     class Disposable extends RpcTarget {
+        // JS:       [Symbol.dispose]() { ++disposals; }
+        // JS:     }
+        // `DisposableValueTarget::drop` is Rust's ownership equivalent.
+        // JS:
+        // JS:     let inner = new RpcStub(new Disposable());
+        let inner = RpcStub::from_target(Arc::new(DisposableValueTarget {
+            disposed: disposals.clone(),
+        }));
+        // JS:     let outer = new RpcPromise<Disposable>(<any>inner);
+        let outer = RpcPromise::from_value(CapnwebValue::Stub(inner.clone()));
+        // JS:     inner[Symbol.dispose]();
+        drop(inner);
+        // JS:     outer[Symbol.dispose]();
+        drop(outer);
+        // JS:
+        // JS:     await pumpMicrotasks();
+        for _ in 0..3 {
+            tokio::task::yield_now().await;
+        }
+        // JS:     expect(disposals).toBe(1);
+        assert_eq!(disposals.load(Ordering::SeqCst), 1);
+        // JS:   });
+    }
+    // JS:
+    // JS:   it("resolves when awaited after construction from a bare local stub", async () => {
+    #[tokio::test(flavor = "current_thread")]
+    async fn resolves_when_awaited_after_construction_from_bare_local_stub() {
+        // JS:     // Regression test: the constructor previously adopted a bare stub's hook directly, producing
+        // JS:     // a promise whose pipelined calls worked but whose await rejected, because non-promise hooks
+        // JS:     // don't implement pull().
+        // JS:     using stub = new RpcPromise<Counter>(<any>new RpcStub(new Counter(1)));
+        let stub = RpcPromise::from_value(CapnwebValue::Stub(local_counter(1.0)));
+        // JS:
+        // JS:     expect(await stub.increment(2)).toBe(3);
+        assert!(matches!(
+            stub.call(vec!["increment".to_owned()], one_number_argument(2.0))
+                .pull()
+                .await
+                .unwrap(),
+            CapnwebValue::Number(3.0)
+        ));
+        // JS:     let resolved = await stub;
+        let resolved = RpcStub::from_value(stub.pull().await.unwrap());
+        // JS:     expect(await resolved.increment(3)).toBe(6);
+        assert!(matches!(
+            resolved
+                .call(vec!["increment".to_owned()], one_number_argument(3.0))
+                .pull()
+                .await
+                .unwrap(),
+            CapnwebValue::Number(6.0)
+        ));
+        // JS:   });
+    }
+    // JS: });
+}
 // JS:
 // JS: // =======================================================================================
 // JS:
