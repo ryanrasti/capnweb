@@ -1056,6 +1056,16 @@ pub(crate) fn capnweb_to_json(value: &CapnwebValue) -> Result<serde_json::Value>
     match value {
         CapnwebValue::Null => Ok(serde_json::Value::Null),
         CapnwebValue::Bool(value) => Ok(serde_json::Value::Bool(*value)),
+        CapnwebValue::Number(value)
+            if value.is_finite()
+                && value.fract() == 0.0
+                && *value >= i64::MIN as f64
+                && *value <= i64::MAX as f64 =>
+        {
+            Ok(serde_json::Value::Number(serde_json::Number::from(
+                *value as i64,
+            )))
+        }
         CapnwebValue::Number(value) if value.is_finite() => serde_json::Number::from_f64(*value)
             .map(serde_json::Value::Number)
             .ok_or_else(|| Error::Type("invalid finite number".to_owned())),
@@ -2042,9 +2052,17 @@ fn is_blocked_object_property(property: &str) -> bool {
 }
 
 fn validate_byte_marker(marker: &CapnwebValue, byte_len: usize) -> Result<()> {
-    let marker = marker
-        .as_str()
-        .ok_or_else(|| Error::Type("bytes type marker must be a string".to_owned()))?;
+    let marker = marker.as_str().ok_or_else(|| {
+        let marker_type = match marker {
+            CapnwebValue::Number(_) => "number",
+            CapnwebValue::Bool(_) => "boolean",
+            CapnwebValue::Null => "object",
+            CapnwebValue::Undefined => "undefined",
+            CapnwebValue::String(_) => "string",
+            _ => "object",
+        };
+        Error::Type(format!("Unknown bytes type marker type: {marker_type}"))
+    })?;
     let element_size = match marker {
         "ArrayBuffer" | "DataView" | "Int8Array" | "Uint8Array" | "Uint8ClampedArray" => None,
         "Int16Array" | "Uint16Array" => Some(2),

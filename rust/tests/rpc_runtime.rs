@@ -121,10 +121,7 @@ async fn final_import_drop_sends_one_release_for_the_remote_count() {
     assert!(transport.sent.lock().unwrap().is_empty());
 
     drop(second);
-    assert_eq!(
-        &transport.sent.lock().unwrap()[..],
-        &["[\"release\",7.0,1.0]"]
-    );
+    assert_eq!(&transport.sent.lock().unwrap()[..], &["[\"release\",7,1]"]);
 }
 
 async fn assert_send_failure_is_deferred(behavior: SendBehavior, expected: &str) {
