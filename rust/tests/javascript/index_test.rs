@@ -2720,10 +2720,11 @@ mod stub_disposal {
 }
 // JS:
 struct IndexPairTransport {
-    sender: tokio::sync::mpsc::UnboundedSender<String>,
-    receiver: tokio::sync::Mutex<tokio::sync::mpsc::UnboundedReceiver<String>>,
+    sender: tokio::sync::mpsc::UnboundedSender<TransportMessage>,
+    receiver: tokio::sync::Mutex<tokio::sync::mpsc::UnboundedReceiver<TransportMessage>>,
     receive_error: std::sync::Mutex<Option<Error>>,
     receive_error_ready: tokio::sync::Notify,
+    encoding: EncodingLevel,
 }
 
 impl IndexPairTransport {
@@ -2734,10 +2735,11 @@ impl IndexPairTransport {
 }
 
 impl AnyRpcTransport for IndexPairTransport {
+    fn encoding_level(&self) -> EncodingLevel {
+        self.encoding
+    }
+
     fn send(&self, message: TransportMessage) -> Result<TransportSend> {
-        let TransportMessage::Text(message) = message else {
-            return Err(Error::Type("expected text".to_owned()));
-        };
         self.sender
             .send(message)
             .map_err(|_| Error::Message("transport closed".to_owned()))?;
@@ -2753,7 +2755,7 @@ impl AnyRpcTransport for IndexPairTransport {
                     Err(self.receive_error.lock().unwrap().take().unwrap_or_else(|| Error::Message("transport failed".to_owned())))
                 }
                 message = async { self.receiver.lock().await.recv().await } => {
-                    message.map(TransportMessage::Text).ok_or_else(|| Error::Message("transport closed".to_owned()))
+                    message.ok_or_else(|| Error::Message("transport closed".to_owned()))
                 }
             }
         })
@@ -3018,6 +3020,14 @@ struct IndexRpcHarness {
 
 impl IndexRpcHarness {
     fn new(target: Arc<dyn RpcTargetInner>) -> Self {
+        Self::with_options(target, RpcSessionOptions::default(), EncodingLevel::String)
+    }
+
+    fn with_options(
+        target: Arc<dyn RpcTargetInner>,
+        server_options: RpcSessionOptions,
+        encoding: EncodingLevel,
+    ) -> Self {
         let (to_client, client_receiver) = tokio::sync::mpsc::unbounded_channel();
         let (to_server, server_receiver) = tokio::sync::mpsc::unbounded_channel();
         let client_transport = Arc::new(IndexPairTransport {
@@ -3025,19 +3035,21 @@ impl IndexRpcHarness {
             receiver: tokio::sync::Mutex::new(client_receiver),
             receive_error: std::sync::Mutex::new(None),
             receive_error_ready: tokio::sync::Notify::new(),
+            encoding,
         });
         let server_transport = Arc::new(IndexPairTransport {
             sender: to_client,
             receiver: tokio::sync::Mutex::new(server_receiver),
             receive_error: std::sync::Mutex::new(None),
             receive_error_ready: tokio::sync::Notify::new(),
+            encoding,
         });
         let client =
             RpcSession::new(client_transport.clone(), None, RpcSessionOptions::default()).unwrap();
         let server = RpcSession::new(
             server_transport,
             Some(CapnwebValue::Target(target)),
-            RpcSessionOptions::default(),
+            server_options,
         )
         .unwrap();
         let stub = client.get_remote_main();
@@ -5166,153 +5178,417 @@ mod e_order {
 }
 // JS:
 // JS: describe("error serialization", () => {
-// JS:   it("hides the stack by default", async () => {
-// JS:     await using harness = new TestHarness(new TestTarget(), {
-// JS:       onSendError: (error) => {
-// JS:         // default behavior
-// JS:       }
-// JS:     });
-// JS:     let stub = harness.stub;
-// JS:
-// JS:     let result = await stub.throwError()
-// JS:       .catch(err => {
-// JS:         expect(err).toBeInstanceOf(RangeError);
-// JS:         expect((err as Error).message).toBe("test error");
-// JS:
-// JS:         // By default, the stack isn't sent. A stack may be added client-side, though. So we
-// JS:         // verify that it doesn't contain the function name `throwErrorImpl` nor the file name
-// JS:         // `test-util.ts`, which should only appear on the server.
-// JS:         expect((err as Error).stack).not.toContain("throwErrorImpl");
-// JS:         expect((err as Error).stack).not.toContain("test-util.ts");
-// JS:
-// JS:         return "caught";
-// JS:       });
-// JS:     expect(result).toBe("caught");
-// JS:   });
-// JS:
-// JS:   it("hides the stack by default with structured clone transports", async () => {
-// JS:     let clientTransport = new ObjectTestTransport(undefined, "structuredClonable");
-// JS:     let serverTransport = new ObjectTestTransport(clientTransport, "structuredClonable");
-// JS:     let client = new RpcSession<TestTarget>(clientTransport);
-// JS:     new RpcSession(serverTransport, new TestTarget());
-// JS:     using stub = client.getRemoteMain();
-// JS:
-// JS:     let result = await stub.throwError()
-// JS:       .catch(err => {
-// JS:         expect(err).toBeInstanceOf(RangeError);
-// JS:         expect((err as Error).message).toBe("test error");
-// JS:         expect((err as Error).stack).not.toContain("throwErrorImpl");
-// JS:         expect((err as Error).stack).not.toContain("test-util.ts");
-// JS:
-// JS:         return "caught";
-// JS:       });
-// JS:     expect(result).toBe("caught");
-// JS:   });
-// JS:
-// JS:   it("reveals the stack if the callback returns the error", async () => {
-// JS:     await using harness = new TestHarness(new TestTarget(), {
-// JS:       onSendError: (error) => {
-// JS:         return error;
-// JS:       }
-// JS:     });
-// JS:     let stub = harness.stub;
-// JS:
-// JS:     let result = await stub.throwError()
-// JS:       .catch(err => {
-// JS:         expect(err).toBeInstanceOf(RangeError);
-// JS:         expect((err as Error).message).toBe("test error");
-// JS:
-// JS:         // Now the error function and source file should be in the stack.
-// JS:         expect((err as Error).stack).toContain("throwErrorImpl");
-// JS:         expect((err as Error).stack).toContain("test-util.ts");
-// JS:
-// JS:         return "caught";
-// JS:       });
-// JS:     expect(result).toBe("caught");
-// JS:   });
-// JS:
-// JS:   it("allows errors to be rewritten", async () => {
-// JS:     await using harness = new TestHarness(new TestTarget(), {
-// JS:       onSendError: (error) => {
-// JS:         let rewritten = new TypeError("rewritten error");
-// JS:         rewritten.stack = "test stack";
-// JS:         return rewritten;
-// JS:       }
-// JS:     });
-// JS:     let stub = harness.stub;
-// JS:
-// JS:     let result = await stub.throwError()
-// JS:       .catch(err => {
-// JS:         expect(err).toBeInstanceOf(TypeError);
-// JS:         expect((err as Error).message).toBe("rewritten error");
-// JS:         expect((err as Error).stack).toBe("test stack");
-// JS:         return "caught";
-// JS:       });
-// JS:     expect(result).toBe("caught");
-// JS:   });
-// JS:
-// JS:   it("sends own properties from the rewritten error, not the original", async () => {
-// JS:     class ErrorTarget extends RpcTarget {
-// JS:       throwError() {
-// JS:         let err = new Error("original") as any;
-// JS:         err.code = "E_ORIGINAL";
-// JS:         throw err;
-// JS:       }
-// JS:     }
-// JS:     await using harness = new TestHarness(new ErrorTarget(), {
-// JS:       onSendError: _error => {
-// JS:         let rewritten = new TypeError("rewritten") as Error & Record<string, unknown>;
-// JS:         rewritten.code = "E_REWRITTEN";
-// JS:         return rewritten;
-// JS:       }
-// JS:     });
-// JS:     let stub = harness.stub as any;
-// JS:
-// JS:     let caught: unknown;
-// JS:     try {
-// JS:       await stub.throwError();
-// JS:     } catch (e) {
-// JS:       caught = e;
-// JS:     }
-// JS:
-// JS:     if (!(caught instanceof Error)) throw new Error("invariant");
-// JS:     expect(caught).toBeInstanceOf(TypeError);
-// JS:     expect(caught.message).toBe("rewritten");
-// JS:     expect((caught as Error & Record<string, unknown>).code).toBe("E_REWRITTEN");
-// JS:   });
-// JS:
-// JS:   it("respects in-place mutation by onSendError to scrub heavy properties", async () => {
-// JS:     class ErrorTarget extends RpcTarget {
-// JS:       throwError() {
-// JS:         let err = new Error("with-secret") as Error & Record<string, unknown>;
-// JS:         err.code = "E_OK";
-// JS:         err.secret = "super-sensitive-data";
-// JS:         throw err;
-// JS:       }
-// JS:     }
-// JS:     await using harness = new TestHarness(new ErrorTarget(), {
-// JS:       onSendError: error => {
-// JS:         // Returning the same error after mutating it is a documented escape hatch for
-// JS:         // scrubbing fields the caller doesn't want to send.
-// JS:         delete (error as any).secret;
-// JS:         return error;
-// JS:       }
-// JS:     });
-// JS:     let stub = harness.stub;
-// JS:
-// JS:     let caught: unknown;
-// JS:     try {
-// JS:       await stub.throwError();
-// JS:     } catch (e) {
-// JS:       caught = e;
-// JS:     }
-// JS:
-// JS:     if (!(caught instanceof Error)) throw new Error("invariant");
-// JS:     expect(caught.message).toBe("with-secret");
-// JS:     expect((caught as Error & Record<string, unknown>).code).toBe("E_OK");
-// JS:     expect("secret" in caught).toBe(false);
-// JS:   });
-// JS: });
+mod remote_error_serialization {
+    use super::*;
+
+    fn throwing_target(error: CapnwebError) -> Arc<dyn RpcTargetInner> {
+        Arc::new(FixedResultTarget(Err(Error::Serialized(error))))
+    }
+
+    fn remote_error(error: Error) -> CapnwebError {
+        let Error::Serialized(error) = error else {
+            panic!()
+        };
+        error
+    }
+
+    fn range_error() -> CapnwebError {
+        CapnwebError {
+            name: "RangeError".to_owned(),
+            message: "test error".to_owned(),
+            stack: Some("at throwErrorImpl (test-util.ts:1:1)".to_owned()),
+            properties: BTreeMap::new(),
+        }
+    }
+    // JS:   it("hides the stack by default", async () => {
+    #[tokio::test(flavor = "current_thread")]
+    async fn hides_the_stack_by_default() {
+        // JS:     await using harness = new TestHarness(new TestTarget(), {
+        let options = RpcSessionOptions {
+            // JS:       onSendError: (error) => {
+            on_send_error: Some(Arc::new(|_error| {
+                // JS:         // default behavior
+                None
+                // JS:       }
+            })),
+            // JS:     });
+            ..RpcSessionOptions::default()
+        };
+        let harness = IndexRpcHarness::with_options(
+            throwing_target(range_error()),
+            options,
+            EncodingLevel::String,
+        );
+        // JS:     let stub = harness.stub;
+        let stub = harness.stub.clone();
+        // JS:
+        // JS:     let result = await stub.throwError()
+        let error = stub
+            .call(
+                vec!["throwError".to_owned()],
+                RpcPayload::from_app_params(CapnwebValue::Array(vec![])),
+            )
+            .pull()
+            .await
+            .unwrap_err();
+        // JS:       .catch(err => {
+        let error = remote_error(error);
+        // JS:         expect(err).toBeInstanceOf(RangeError);
+        assert_eq!(error.name, "RangeError");
+        // JS:         expect((err as Error).message).toBe("test error");
+        assert_eq!(error.message, "test error");
+        // JS:
+        // JS:         // By default, the stack isn't sent. A stack may be added client-side, though. So we
+        // JS:         // verify that it doesn't contain the function name `throwErrorImpl` nor the file name
+        // JS:         // `test-util.ts`, which should only appear on the server.
+        // JS:         expect((err as Error).stack).not.toContain("throwErrorImpl");
+        assert!(
+            !error
+                .stack
+                .as_deref()
+                .unwrap_or_default()
+                .contains("throwErrorImpl")
+        );
+        // JS:         expect((err as Error).stack).not.toContain("test-util.ts");
+        assert!(
+            !error
+                .stack
+                .as_deref()
+                .unwrap_or_default()
+                .contains("test-util.ts")
+        );
+        // JS:
+        // JS:         return "caught";
+        let result = "caught";
+        // JS:       });
+        // The preceding assertions are Rust's `catch` branch.
+        // JS:     expect(result).toBe("caught");
+        assert_eq!(result, "caught");
+        // JS:   });
+    }
+    // JS:
+    // JS:   it("hides the stack by default with structured clone transports", async () => {
+    #[tokio::test(flavor = "current_thread")]
+    async fn hides_the_stack_by_default_with_structured_clone_transports() {
+        // JS:     let clientTransport = new ObjectTestTransport(undefined, "structuredClonable");
+        let options = RpcSessionOptions::default();
+        // JS:     let serverTransport = new ObjectTestTransport(clientTransport, "structuredClonable");
+        let encoding = EncodingLevel::StructuredClonable;
+        // JS:     let client = new RpcSession<TestTarget>(clientTransport);
+        // JS:     new RpcSession(serverTransport, new TestTarget());
+        let harness =
+            IndexRpcHarness::with_options(throwing_target(range_error()), options, encoding);
+        // JS:     using stub = client.getRemoteMain();
+        let stub = harness.stub.clone();
+        // JS:
+        // JS:     let result = await stub.throwError()
+        let error = stub
+            .call(
+                vec!["throwError".to_owned()],
+                RpcPayload::from_app_params(CapnwebValue::Array(vec![])),
+            )
+            .pull()
+            .await
+            .unwrap_err();
+        // JS:       .catch(err => {
+        let error = remote_error(error);
+        // JS:         expect(err).toBeInstanceOf(RangeError);
+        assert_eq!(error.name, "RangeError");
+        // JS:         expect((err as Error).message).toBe("test error");
+        assert_eq!(error.message, "test error");
+        // JS:         expect((err as Error).stack).not.toContain("throwErrorImpl");
+        assert!(
+            !error
+                .stack
+                .as_deref()
+                .unwrap_or_default()
+                .contains("throwErrorImpl")
+        );
+        // JS:         expect((err as Error).stack).not.toContain("test-util.ts");
+        assert!(
+            !error
+                .stack
+                .as_deref()
+                .unwrap_or_default()
+                .contains("test-util.ts")
+        );
+        // JS:
+        // JS:         return "caught";
+        let result = "caught";
+        // JS:       });
+        // The preceding assertions are Rust's `catch` branch.
+        // JS:     expect(result).toBe("caught");
+        assert_eq!(result, "caught");
+        // JS:   });
+    }
+    // JS:
+    // JS:   it("reveals the stack if the callback returns the error", async () => {
+    #[tokio::test(flavor = "current_thread")]
+    async fn reveals_the_stack_if_the_callback_returns_the_error() {
+        // JS:     await using harness = new TestHarness(new TestTarget(), {
+        let options = RpcSessionOptions {
+            // JS:       onSendError: (error) => {
+            on_send_error: Some(Arc::new(|error| {
+                // JS:         return error;
+                Some(error)
+                // JS:       }
+            })),
+            // JS:     });
+            ..RpcSessionOptions::default()
+        };
+        let harness = IndexRpcHarness::with_options(
+            throwing_target(range_error()),
+            options,
+            EncodingLevel::String,
+        );
+        // JS:     let stub = harness.stub;
+        let stub = harness.stub.clone();
+        // JS:
+        // JS:     let result = await stub.throwError()
+        let error = stub
+            .call(
+                vec!["throwError".to_owned()],
+                RpcPayload::from_app_params(CapnwebValue::Array(vec![])),
+            )
+            .pull()
+            .await
+            .unwrap_err();
+        // JS:       .catch(err => {
+        let error = remote_error(error);
+        // JS:         expect(err).toBeInstanceOf(RangeError);
+        assert_eq!(error.name, "RangeError");
+        // JS:         expect((err as Error).message).toBe("test error");
+        assert_eq!(error.message, "test error");
+        // JS:
+        // JS:         // Now the error function and source file should be in the stack.
+        // JS:         expect((err as Error).stack).toContain("throwErrorImpl");
+        assert!(
+            error
+                .stack
+                .as_deref()
+                .unwrap_or_default()
+                .contains("throwErrorImpl")
+        );
+        // JS:         expect((err as Error).stack).toContain("test-util.ts");
+        assert!(
+            error
+                .stack
+                .as_deref()
+                .unwrap_or_default()
+                .contains("test-util.ts")
+        );
+        // JS:
+        // JS:         return "caught";
+        let result = "caught";
+        // JS:       });
+        // The preceding assertions are Rust's `catch` branch.
+        // JS:     expect(result).toBe("caught");
+        assert_eq!(result, "caught");
+        // JS:   });
+    }
+    // JS:
+    // JS:   it("allows errors to be rewritten", async () => {
+    #[tokio::test(flavor = "current_thread")]
+    async fn allows_errors_to_be_rewritten() {
+        // JS:     await using harness = new TestHarness(new TestTarget(), {
+        let options = RpcSessionOptions {
+            // JS:       onSendError: (error) => {
+            on_send_error: Some(Arc::new(|_error| {
+                // JS:         let rewritten = new TypeError("rewritten error");
+                let mut rewritten = make_error("TypeError", "rewritten error");
+                // JS:         rewritten.stack = "test stack";
+                rewritten.stack = Some("test stack".to_owned());
+                // JS:         return rewritten;
+                Some(rewritten)
+                // JS:       }
+            })),
+            // JS:     });
+            ..RpcSessionOptions::default()
+        };
+        let harness = IndexRpcHarness::with_options(
+            throwing_target(range_error()),
+            options,
+            EncodingLevel::String,
+        );
+        // JS:     let stub = harness.stub;
+        let stub = harness.stub.clone();
+        // JS:
+        // JS:     let result = await stub.throwError()
+        let error = stub
+            .call(
+                vec!["throwError".to_owned()],
+                RpcPayload::from_app_params(CapnwebValue::Array(vec![])),
+            )
+            .pull()
+            .await
+            .unwrap_err();
+        // JS:       .catch(err => {
+        let error = remote_error(error);
+        // JS:         expect(err).toBeInstanceOf(TypeError);
+        assert_eq!(error.name, "TypeError");
+        // JS:         expect((err as Error).message).toBe("rewritten error");
+        assert_eq!(error.message, "rewritten error");
+        // JS:         expect((err as Error).stack).toBe("test stack");
+        assert_eq!(error.stack.as_deref(), Some("test stack"));
+        // JS:         return "caught";
+        let result = "caught";
+        // JS:       });
+        // The preceding assertions are Rust's `catch` branch.
+        // JS:     expect(result).toBe("caught");
+        assert_eq!(result, "caught");
+        // JS:   });
+    }
+    // JS:
+    // JS:   it("sends own properties from the rewritten error, not the original", async () => {
+    #[tokio::test(flavor = "current_thread")]
+    async fn sends_own_properties_from_the_rewritten_error() {
+        // JS:     class ErrorTarget extends RpcTarget {
+        // JS:       throwError() {
+        // JS:         let err = new Error("original") as any;
+        let mut original = make_error("Error", "original");
+        // JS:         err.code = "E_ORIGINAL";
+        original.properties.insert(
+            "code".to_owned(),
+            CapnwebValue::String("E_ORIGINAL".to_owned()),
+        );
+        // JS:         throw err;
+        // JS:       }
+        // JS:     }
+        // `throwing_target` is the generated dispatch equivalent.
+        // JS:     await using harness = new TestHarness(new ErrorTarget(), {
+        let options = RpcSessionOptions {
+            // JS:       onSendError: _error => {
+            on_send_error: Some(Arc::new(|_error| {
+                // JS:         let rewritten = new TypeError("rewritten") as Error & Record<string, unknown>;
+                let mut rewritten = make_error("TypeError", "rewritten");
+                // JS:         rewritten.code = "E_REWRITTEN";
+                rewritten.properties.insert(
+                    "code".to_owned(),
+                    CapnwebValue::String("E_REWRITTEN".to_owned()),
+                );
+                // JS:         return rewritten;
+                Some(rewritten)
+                // JS:       }
+            })),
+            // JS:     });
+            ..RpcSessionOptions::default()
+        };
+        let harness = IndexRpcHarness::with_options(
+            throwing_target(original),
+            options,
+            EncodingLevel::String,
+        );
+        // JS:     let stub = harness.stub as any;
+        let stub = harness.stub.clone();
+        // JS:
+        // JS:     let caught: unknown;
+        let caught;
+        // JS:     try {
+        {
+            // JS:       await stub.throwError();
+            let result = stub
+                .call(
+                    vec!["throwError".to_owned()],
+                    RpcPayload::from_app_params(CapnwebValue::Array(vec![])),
+                )
+                .pull()
+                .await;
+            // JS:     } catch (e) {
+            caught = result.unwrap_err();
+            // JS:       caught = e;
+            // Assigned above.
+            // JS:     }
+        }
+        // JS:
+        // JS:     if (!(caught instanceof Error)) throw new Error("invariant");
+        let caught = remote_error(caught);
+        // JS:     expect(caught).toBeInstanceOf(TypeError);
+        assert_eq!(caught.name, "TypeError");
+        // JS:     expect(caught.message).toBe("rewritten");
+        assert_eq!(caught.message, "rewritten");
+        // JS:     expect((caught as Error & Record<string, unknown>).code).toBe("E_REWRITTEN");
+        assert!(
+            matches!(caught.properties.get("code"), Some(CapnwebValue::String(code)) if code == "E_REWRITTEN")
+        );
+        // JS:   });
+    }
+    // JS:
+    // JS:   it("respects in-place mutation by onSendError to scrub heavy properties", async () => {
+    #[tokio::test(flavor = "current_thread")]
+    async fn respects_in_place_mutation_to_scrub_heavy_properties() {
+        // JS:     class ErrorTarget extends RpcTarget {
+        // JS:       throwError() {
+        // JS:         let err = new Error("with-secret") as Error & Record<string, unknown>;
+        let mut original = make_error("Error", "with-secret");
+        // JS:         err.code = "E_OK";
+        original
+            .properties
+            .insert("code".to_owned(), CapnwebValue::String("E_OK".to_owned()));
+        // JS:         err.secret = "super-sensitive-data";
+        original.properties.insert(
+            "secret".to_owned(),
+            CapnwebValue::String("super-sensitive-data".to_owned()),
+        );
+        // JS:         throw err;
+        // JS:       }
+        // JS:     }
+        // `throwing_target` is the generated dispatch equivalent.
+        // JS:     await using harness = new TestHarness(new ErrorTarget(), {
+        let options = RpcSessionOptions {
+            // JS:       onSendError: error => {
+            on_send_error: Some(Arc::new(|mut error| {
+                // JS:         // Returning the same error after mutating it is a documented escape hatch for
+                // JS:         // scrubbing fields the caller doesn't want to send.
+                // JS:         delete (error as any).secret;
+                error.properties.remove("secret");
+                // JS:         return error;
+                Some(error)
+                // JS:       }
+            })),
+            // JS:     });
+            ..RpcSessionOptions::default()
+        };
+        let harness = IndexRpcHarness::with_options(
+            throwing_target(original),
+            options,
+            EncodingLevel::String,
+        );
+        // JS:     let stub = harness.stub;
+        let stub = harness.stub.clone();
+        // JS:
+        // JS:     let caught: unknown;
+        let caught;
+        // JS:     try {
+        {
+            // JS:       await stub.throwError();
+            let result = stub
+                .call(
+                    vec!["throwError".to_owned()],
+                    RpcPayload::from_app_params(CapnwebValue::Array(vec![])),
+                )
+                .pull()
+                .await;
+            // JS:     } catch (e) {
+            caught = result.unwrap_err();
+            // JS:       caught = e;
+            // Assigned above.
+            // JS:     }
+        }
+        // JS:
+        // JS:     if (!(caught instanceof Error)) throw new Error("invariant");
+        let caught = remote_error(caught);
+        // JS:     expect(caught.message).toBe("with-secret");
+        assert_eq!(caught.message, "with-secret");
+        // JS:     expect((caught as Error & Record<string, unknown>).code).toBe("E_OK");
+        assert!(
+            matches!(caught.properties.get("code"), Some(CapnwebValue::String(code)) if code == "E_OK")
+        );
+        // JS:     expect("secret" in caught).toBe(false);
+        assert!(!caught.properties.contains_key("secret"));
+        // JS:   });
+    }
+    // JS: });
+}
 // JS:
 // JS: describe("onRpcBroken", () => {
 // JS:   it("signals when the connection is lost", async () => {
