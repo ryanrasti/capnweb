@@ -6321,44 +6321,87 @@ mod promise_stub_hook {
 }
 // JS:
 // JS: describe("RpcImportHook argument disposal", () => {
-// JS:   it("call() disposes owned args when argument serialization fails", async () => {
-// JS:     await using harness = new TestHarness(new TestTarget());
-// JS:
-// JS:     let spy = disposalSpy();
-// JS:     let argument = new RpcStub(spy.target);
-// JS:
-// JS:     let hook = unwrapStubTakingOwnership(<any>harness.stub.dup());
-// JS:
-// JS:     // The stub is serialized (and exported) before the Symbol makes devaluation fail, so this
-// JS:     // exercises both the Devaluator's export rollback and the disposal of the owned payload.
-// JS:     let payload = RpcPayload.fromAppParams([argument, Symbol("unserializable")]);
-// JS:     payload.ensureDeepCopied();
-// JS:
-// JS:     expect(() => hook.call(["square"], payload)).toThrow("Cannot serialize value");
-// JS:
-// JS:     hook.dispose();
-// JS:     argument[Symbol.dispose]();
-// JS:     expect(spy.wasDisposed()).toBe(true);
-// JS:   });
-// JS:
-// JS:   it("stream() disposes owned args when argument serialization fails", async () => {
-// JS:     await using harness = new TestHarness(new TestTarget());
-// JS:
-// JS:     let spy = disposalSpy();
-// JS:     let argument = new RpcStub(spy.target);
-// JS:
-// JS:     let hook = unwrapStubTakingOwnership(<any>harness.stub.dup());
-// JS:
-// JS:     let payload = RpcPayload.fromAppParams([argument, Symbol("unserializable")]);
-// JS:     payload.ensureDeepCopied();
-// JS:
-// JS:     expect(() => hook.stream(["square"], payload)).toThrow("Cannot serialize value");
-// JS:
-// JS:     hook.dispose();
-// JS:     argument[Symbol.dispose]();
-// JS:     expect(spy.wasDisposed()).toBe(true);
-// JS:   });
-// JS: });
+mod rpc_import_hook_argument_disposal {
+    use super::*;
+    // JS:   it("call() disposes owned args when argument serialization fails", async () => {
+    #[tokio::test(flavor = "current_thread")]
+    async fn call_disposes_owned_args_when_argument_serialization_fails() {
+        // JS:     await using harness = new TestHarness(new TestTarget());
+        let harness = IndexRpcHarness::new(Arc::new(LocalTestTarget));
+        // JS:
+        // JS:     let spy = disposalSpy();
+        let (target, disposed) = disposal_spy();
+        // JS:     let argument = new RpcStub(spy.target);
+        let argument = RpcStub::from_value(target);
+        // JS:
+        // JS:     let hook = unwrapStubTakingOwnership(<any>harness.stub.dup());
+        let hook = unwrap_stub_and_path(&harness.stub).0;
+        // JS:
+        // JS:     // The stub is serialized (and exported) before the Symbol makes devaluation fail, so this
+        // JS:     // exercises both the Devaluator's export rollback and the disposal of the owned payload.
+        // JS:     let payload = RpcPayload.fromAppParams([argument, Symbol("unserializable")]);
+        let payload = RpcPayload::from_app_params(CapnwebValue::Array(vec![
+            CapnwebValue::Stub(argument.clone()),
+            CapnwebValue::Unsupported("symbol".to_owned()),
+        ]));
+        // JS:     payload.ensureDeepCopied();
+        // `from_app_params` already owns the Rust value tree.
+        // JS:
+        // JS:     expect(() => hook.call(["square"], payload)).toThrow("Cannot serialize value");
+        let error = match hook.call(vec![PropertyKey::String("square".to_owned())], payload) {
+            Err(error) => error,
+            Ok(_) => panic!("call unexpectedly succeeded"),
+        };
+        assert!(format!("{error}").contains("Cannot serialize value"));
+        // JS:
+        // JS:     hook.dispose();
+        drop(hook);
+        // JS:     argument[Symbol.dispose]();
+        drop(argument);
+        // JS:     expect(spy.wasDisposed()).toBe(true);
+        assert!(disposed.load(Ordering::SeqCst));
+        // JS:   });
+    }
+    // JS:
+    // JS:   it("stream() disposes owned args when argument serialization fails", async () => {
+    #[tokio::test(flavor = "current_thread")]
+    async fn stream_disposes_owned_args_when_argument_serialization_fails() {
+        // JS:     await using harness = new TestHarness(new TestTarget());
+        let harness = IndexRpcHarness::new(Arc::new(LocalTestTarget));
+        // JS:
+        // JS:     let spy = disposalSpy();
+        let (target, disposed) = disposal_spy();
+        // JS:     let argument = new RpcStub(spy.target);
+        let argument = RpcStub::from_value(target);
+        // JS:
+        // JS:     let hook = unwrapStubTakingOwnership(<any>harness.stub.dup());
+        let hook = unwrap_stub_and_path(&harness.stub).0;
+        // JS:
+        // JS:     let payload = RpcPayload.fromAppParams([argument, Symbol("unserializable")]);
+        let payload = RpcPayload::from_app_params(CapnwebValue::Array(vec![
+            CapnwebValue::Stub(argument.clone()),
+            CapnwebValue::Unsupported("symbol".to_owned()),
+        ]));
+        // JS:     payload.ensureDeepCopied();
+        // `from_app_params` already owns the Rust value tree.
+        // JS:
+        // JS:     expect(() => hook.stream(["square"], payload)).toThrow("Cannot serialize value");
+        let error = match hook.stream(vec![PropertyKey::String("square".to_owned())], payload) {
+            Err(error) => error,
+            Ok(_) => panic!("stream unexpectedly succeeded"),
+        };
+        assert!(format!("{error}").contains("Cannot serialize value"));
+        // JS:
+        // JS:     hook.dispose();
+        drop(hook);
+        // JS:     argument[Symbol.dispose]();
+        drop(argument);
+        // JS:     expect(spy.wasDisposed()).toBe(true);
+        assert!(disposed.load(Ordering::SeqCst));
+        // JS:   });
+    }
+    // JS: });
+}
 // JS:
 // JS: // =======================================================================================
 // JS:
