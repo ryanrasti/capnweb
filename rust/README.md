@@ -1,6 +1,7 @@
 # Cap'n Web for Rust
 
-An idiomatic Rust implementation of the Cap'n Web RPC protocol.
+An idiomatic Rust implementation of the Cap'n Web RPC protocol. The Cargo package is named
+`capnweb-rs` (the library is imported as `capnweb`).
 
 The current v0 spike implements dynamic values, immediate generated-style stub methods, target
 dispatch macros, import/export tables, promise pipelining, and in-memory, newline-delimited I/O, and

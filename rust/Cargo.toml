@@ -3,7 +3,7 @@ members = ["macros"]
 resolver = "3"
 
 [package]
-name = "capnweb"
+name = "capnweb-rs"
 version = "0.1.0"
 edition = "2024"
 rust-version = "1.85"
@@ -11,6 +11,9 @@ description = "An idiomatic Rust implementation of the Cap'n Web RPC protocol"
 license = "MIT"
 repository = "https://github.com/cloudflare/capnweb"
 publish = false
+
+[lib]
+name = "capnweb"
 
 [dependencies]
 async-trait = "0.1"
