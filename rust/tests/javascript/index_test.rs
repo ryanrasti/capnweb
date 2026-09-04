@@ -16,8 +16,7 @@
 // JS: type CustomEncodingLevel = RpcTransportWithCustomEncoding["encodingLevel"];
 use crate::core::{
     CapnwebError, CapnwebValue, Error, PayloadStubHook, PromiseStubHook, PropertyKey, PropertyPath,
-    Result, RpcPayload, RpcStub, RpcTargetInner, StubHook, function_target,
-    unwrap_stub_and_path,
+    Result, RpcPayload, RpcStub, RpcTargetInner, StubHook, function_target, unwrap_stub_and_path,
 };
 use crate::rpc::{AnyRpcTransport, RpcSession, RpcSessionOptions, TransportMessage, TransportSend};
 use crate::serialize::{EncodingLevel, deserialize, serialize, swap_byte_order};
@@ -1512,6 +1511,17 @@ impl RpcTargetInner for LocalTestTarget {
                     };
                     CapnwebValue::Target(Arc::new(LocalCounter(std::sync::Mutex::new(value))))
                 }
+                [PropertyKey::String(method)] if method == "callSquare" => {
+                    let stub = RpcStub::from_value(arguments.remove(0));
+                    let value = arguments.remove(0);
+                    CapnwebValue::Object(BTreeMap::from([(
+                        "result".to_owned(),
+                        CapnwebValue::RpcPromise(stub.call(
+                            vec!["square".to_owned()],
+                            RpcPayload::from_app_params(CapnwebValue::Array(vec![value])),
+                        )),
+                    )]))
+                }
                 [PropertyKey::String(method)] if method == "incrementCounter" => {
                     let counter = RpcStub::from_value(arguments.remove(0));
                     let amount = arguments
@@ -2752,6 +2762,37 @@ impl RpcTargetInner for FixedResultTarget {
     }
 }
 
+struct ErrorProcessingTarget(&'static str);
+
+impl RpcTargetInner for ErrorProcessingTarget {
+    fn call(self: Arc<Self>, path: PropertyPath, args: RpcPayload) -> Result<StubHook> {
+        let message = self.0;
+        Ok(PromiseStubHook::from_future(async move {
+            let mut arguments = match args.deliver_resolve().await? {
+                CapnwebValue::Array(arguments) => arguments,
+                _ => return Err(Error::Type("arguments are not an array".to_owned())),
+            };
+            let value = match path.as_slice() {
+                [PropertyKey::String(method)] if method == "throwError" => {
+                    return Err(Error::Message(message.to_owned()));
+                }
+                [PropertyKey::String(method)] if method == "processValue" => {
+                    let CapnwebValue::Number(value) = arguments.remove(0) else {
+                        return Err(Error::Type("value is not a number".to_owned()));
+                    };
+                    CapnwebValue::Number(value * 2.0)
+                }
+                _ => return Err(Error::Type(format!("No such RPC method: {path:?}"))),
+            };
+            Ok(Arc::new(PayloadStubHook::new(RpcPayload::from_app_return(value))) as StubHook)
+        }))
+    }
+
+    fn get(self: Arc<Self>, path: PropertyPath) -> Result<StubHook> {
+        Err(Error::Type(format!("No such RPC property: {path:?}")))
+    }
+}
+
 struct ProxyTarget {
     alice: RpcStub,
 }
@@ -3745,96 +3786,212 @@ mod capability_passing {
 }
 // JS:
 // JS: describe("promise pipelining", () => {
-// JS:   it("supports passing a promise in arguments", async () => {
-// JS:     await using harness = new TestHarness(new TestTarget());
-// JS:     let stub = harness.stub;
-// JS:     using promise = stub.square(2);
-// JS:     expect(await stub.square(promise)).toBe(16);
-// JS:   });
-// JS:
-// JS:   it("supports calling a promise", async () => {
-// JS:     await using harness = new TestHarness(new TestTarget());
-// JS:     let stub = harness.stub;
-// JS:     using counter = stub.makeCounter(4);
-// JS:     let promise1 = counter.increment();
-// JS:     let promise2 = counter.increment(4);
-// JS:     expect(await promise1).toBe(5);
-// JS:     expect(await promise2).toBe(9);
-// JS:   });
-// JS:
-// JS:   it("supports returning a promise", async () => {
-// JS:     await using harness = new TestHarness(new TestTarget());
-// JS:     let stub = harness.stub;
-// JS:     expect(await stub.callSquare(stub, 3)).toStrictEqual({result: 9});
-// JS:   });
-// JS:
-// JS:   it("propagates errors to pipelined calls", async () => {
-// JS:     class ErrorTarget extends RpcTarget {
-// JS:       throwError(): TestTarget {
-// JS:         throw new Error("pipelined error");
-// JS:       }
-// JS:     }
-// JS:
-// JS:     await using harness = new TestHarness(new ErrorTarget());
-// JS:     let stub = harness.stub;
-// JS:
-// JS:     // Pipeline a call on a promise that will reject
-// JS:     using errorPromise = stub.throwError();
-// JS:     using pipelinedCall = errorPromise.square(5);
-// JS:
-// JS:     await expect(() => pipelinedCall).rejects.toThrow("pipelined error");
-// JS:   });
-// JS:
-// JS:   it("propagates errors to argument-pipelined calls", async () => {
-// JS:     class ErrorTarget extends RpcTarget {
-// JS:       throwError(): never {
-// JS:         throw new Error("pipelined error");
-// JS:       }
-// JS:
-// JS:       processValue(value: any) {
-// JS:         return value * 2;
-// JS:       }
-// JS:     }
-// JS:
-// JS:     await using harness = new TestHarness(new ErrorTarget());
-// JS:     let stub = harness.stub;
-// JS:
-// JS:     // Pipeline a call on a promise that will reject
-// JS:     using errorPromise = stub.throwError();
-// JS:     using pipelinedCall = stub.processValue(errorPromise);
-// JS:
-// JS:     await expect(() => pipelinedCall).rejects.toThrow("pipelined error");
-// JS:   });
-// JS:
-// JS:   it("doesn't create spurious unhandled rejections", async () => {
-// JS:     class ErrorTarget extends RpcTarget {
-// JS:       throwError(): never {
-// JS:         throw new Error("test error");
-// JS:       }
-// JS:
-// JS:       processValue(value: any) {
-// JS:         return value * 2;
-// JS:       }
-// JS:     }
-// JS:
-// JS:     await using harness = new TestHarness(new ErrorTarget());
-// JS:     let stub = harness.stub;
-// JS:
-// JS:     let promise = stub.throwError();
-// JS:     let promise2 = stub.processValue(promise);
-// JS:
-// JS:     // Intentionally don't await the promises until the next tick. This means we don't pull them,
-// JS:     // which means nothing awaits the final result on the server end, which means the errors
-// JS:     // could be considered "unhandled rejections". We do not want the server end to actually see
-// JS:     // them as such, though, since it's entirely the client's fault that it hasn't waited on them
-// JS:     // yet! This tests that the system silences such unhandled rejection notices. Note that
-// JS:     // vitest automatically treats unhandled rejections as failures.
-// JS:     await new Promise(resolve => setTimeout(resolve, 0));
-// JS:
-// JS:     await expect(() => promise).rejects.toThrow("test error");
-// JS:     await expect(() => promise2).rejects.toThrow("test error");
-// JS:   });
-// JS: });
+mod promise_pipelining {
+    use super::*;
+    // JS:   it("supports passing a promise in arguments", async () => {
+    #[tokio::test(flavor = "current_thread")]
+    async fn supports_passing_a_promise_in_arguments() {
+        // JS:     await using harness = new TestHarness(new TestTarget());
+        let harness = IndexRpcHarness::new(Arc::new(LocalTestTarget));
+        // JS:     let stub = harness.stub;
+        let stub = harness.stub.clone();
+        // JS:     using promise = stub.square(2);
+        let promise = stub.call(vec!["square".to_owned()], one_number_argument(2.0));
+        // JS:     expect(await stub.square(promise)).toBe(16);
+        assert!(matches!(
+            stub.call(
+                vec!["square".to_owned()],
+                RpcPayload::from_app_params(CapnwebValue::Array(vec![CapnwebValue::RpcPromise(
+                    promise
+                )]))
+            )
+            .pull()
+            .await
+            .unwrap(),
+            CapnwebValue::Number(16.0)
+        ));
+        // JS:   });
+    }
+    // JS:
+    // JS:   it("supports calling a promise", async () => {
+    #[tokio::test(flavor = "current_thread")]
+    async fn supports_calling_a_promise() {
+        // JS:     await using harness = new TestHarness(new TestTarget());
+        let harness = IndexRpcHarness::new(Arc::new(LocalTestTarget));
+        // JS:     let stub = harness.stub;
+        let stub = harness.stub.clone();
+        // JS:     using counter = stub.makeCounter(4);
+        let counter = stub.call(vec!["makeCounter".to_owned()], one_number_argument(4.0));
+        // JS:     let promise1 = counter.increment();
+        let promise1 = counter.call(
+            vec!["increment".to_owned()],
+            RpcPayload::from_app_params(CapnwebValue::Array(vec![])),
+        );
+        // JS:     let promise2 = counter.increment(4);
+        let promise2 = counter.call(vec!["increment".to_owned()], one_number_argument(4.0));
+        // JS:     expect(await promise1).toBe(5);
+        assert!(matches!(
+            promise1.pull().await.unwrap(),
+            CapnwebValue::Number(5.0)
+        ));
+        // JS:     expect(await promise2).toBe(9);
+        assert!(matches!(
+            promise2.pull().await.unwrap(),
+            CapnwebValue::Number(9.0)
+        ));
+        // JS:   });
+    }
+    // JS:
+    // JS:   it("supports returning a promise", async () => {
+    #[tokio::test(flavor = "current_thread")]
+    async fn supports_returning_a_promise() {
+        // JS:     await using harness = new TestHarness(new TestTarget());
+        let harness = IndexRpcHarness::new(Arc::new(LocalTestTarget));
+        // JS:     let stub = harness.stub;
+        let stub = harness.stub.clone();
+        // JS:     expect(await stub.callSquare(stub, 3)).toStrictEqual({result: 9});
+        let result = stub
+            .call(
+                vec!["callSquare".to_owned()],
+                RpcPayload::from_app_params(CapnwebValue::Array(vec![
+                    CapnwebValue::Stub(stub.clone()),
+                    CapnwebValue::Number(3.0),
+                ])),
+            )
+            .pull()
+            .await
+            .unwrap();
+        let CapnwebValue::Object(result) = result else {
+            panic!()
+        };
+        assert!(matches!(
+            result.get("result"),
+            Some(CapnwebValue::Number(9.0))
+        ));
+        // JS:   });
+    }
+    // JS:
+    // JS:   it("propagates errors to pipelined calls", async () => {
+    #[tokio::test(flavor = "current_thread")]
+    async fn propagates_errors_to_pipelined_calls() {
+        // JS:     class ErrorTarget extends RpcTarget {
+        // JS:       throwError(): TestTarget {
+        // JS:         throw new Error("pipelined error");
+        // JS:       }
+        // JS:     }
+        // `FixedResultTarget` is the generated dispatch equivalent.
+        // JS:
+        // JS:     await using harness = new TestHarness(new ErrorTarget());
+        let harness = IndexRpcHarness::new(Arc::new(FixedResultTarget(Err(Error::Message(
+            "pipelined error".to_owned(),
+        )))));
+        // JS:     let stub = harness.stub;
+        let stub = harness.stub.clone();
+        // JS:
+        // JS:     // Pipeline a call on a promise that will reject
+        // JS:     using errorPromise = stub.throwError();
+        let error_promise = stub.call(
+            vec!["throwError".to_owned()],
+            RpcPayload::from_app_params(CapnwebValue::Array(vec![])),
+        );
+        // JS:     using pipelinedCall = errorPromise.square(5);
+        let pipelined_call =
+            error_promise.call(vec!["square".to_owned()], one_number_argument(5.0));
+        // JS:
+        // JS:     await expect(() => pipelinedCall).rejects.toThrow("pipelined error");
+        let error = pipelined_call.pull().await.unwrap_err();
+        assert!(format!("{error}").contains("pipelined error"));
+        // JS:   });
+    }
+    // JS:
+    // JS:   it("propagates errors to argument-pipelined calls", async () => {
+    #[tokio::test(flavor = "current_thread")]
+    async fn propagates_errors_to_argument_pipelined_calls() {
+        // JS:     class ErrorTarget extends RpcTarget {
+        // JS:       throwError(): never {
+        // JS:         throw new Error("pipelined error");
+        // JS:       }
+        // JS:
+        // JS:       processValue(value: any) {
+        // JS:         return value * 2;
+        // JS:       }
+        // JS:     }
+        // `ErrorProcessingTarget` is the generated dispatch equivalent.
+        // JS:
+        // JS:     await using harness = new TestHarness(new ErrorTarget());
+        let harness = IndexRpcHarness::new(Arc::new(ErrorProcessingTarget("pipelined error")));
+        // JS:     let stub = harness.stub;
+        let stub = harness.stub.clone();
+        // JS:
+        // JS:     // Pipeline a call on a promise that will reject
+        // JS:     using errorPromise = stub.throwError();
+        let error_promise = stub.call(
+            vec!["throwError".to_owned()],
+            RpcPayload::from_app_params(CapnwebValue::Array(vec![])),
+        );
+        // JS:     using pipelinedCall = stub.processValue(errorPromise);
+        let pipelined_call = stub.call(
+            vec!["processValue".to_owned()],
+            RpcPayload::from_app_params(CapnwebValue::Array(vec![CapnwebValue::RpcPromise(
+                error_promise,
+            )])),
+        );
+        // JS:
+        // JS:     await expect(() => pipelinedCall).rejects.toThrow("pipelined error");
+        let error = pipelined_call.pull().await.unwrap_err();
+        assert!(format!("{error}").contains("pipelined error"));
+        // JS:   });
+    }
+    // JS:
+    // JS:   it("doesn't create spurious unhandled rejections", async () => {
+    #[tokio::test(flavor = "current_thread")]
+    async fn does_not_create_spurious_unhandled_rejections() {
+        // JS:     class ErrorTarget extends RpcTarget {
+        // JS:       throwError(): never {
+        // JS:         throw new Error("test error");
+        // JS:       }
+        // JS:
+        // JS:       processValue(value: any) {
+        // JS:         return value * 2;
+        // JS:       }
+        // JS:     }
+        // `ErrorProcessingTarget` is the generated dispatch equivalent.
+        // JS:
+        // JS:     await using harness = new TestHarness(new ErrorTarget());
+        let harness = IndexRpcHarness::new(Arc::new(ErrorProcessingTarget("test error")));
+        // JS:     let stub = harness.stub;
+        let stub = harness.stub.clone();
+        // JS:
+        // JS:     let promise = stub.throwError();
+        let promise = stub.call(
+            vec!["throwError".to_owned()],
+            RpcPayload::from_app_params(CapnwebValue::Array(vec![])),
+        );
+        // JS:     let promise2 = stub.processValue(promise);
+        let promise2 = stub.call(
+            vec!["processValue".to_owned()],
+            RpcPayload::from_app_params(CapnwebValue::Array(vec![CapnwebValue::RpcPromise(
+                promise.clone(),
+            )])),
+        );
+        // JS:
+        // JS:     // Intentionally don't await the promises until the next tick. This means we don't pull them,
+        // JS:     // which means nothing awaits the final result on the server end, which means the errors
+        // JS:     // could be considered "unhandled rejections". We do not want the server end to actually see
+        // JS:     // them as such, though, since it's entirely the client's fault that it hasn't waited on them
+        // JS:     // yet! This tests that the system silences such unhandled rejection notices. Note that
+        // JS:     // vitest automatically treats unhandled rejections as failures.
+        // JS:     await new Promise(resolve => setTimeout(resolve, 0));
+        tokio::task::yield_now().await;
+        // JS:
+        // JS:     await expect(() => promise).rejects.toThrow("test error");
+        assert!(format!("{}", promise.pull().await.unwrap_err()).contains("test error"));
+        // JS:     await expect(() => promise2).rejects.toThrow("test error");
+        assert!(format!("{}", promise2.pull().await.unwrap_err()).contains("test error"));
+        // JS:   });
+    }
+    // JS: });
+}
 // JS:
 // JS: describe("map() over RPC", () => {
 // JS:   it("supports map() on nulls", async () => {
