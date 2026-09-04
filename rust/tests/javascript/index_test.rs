@@ -14,10 +14,14 @@
 // JS: import { Counter, TestTarget } from "./test-util.js";
 // JS:
 // JS: type CustomEncodingLevel = RpcTransportWithCustomEncoding["encodingLevel"];
-use crate::core::{CapnwebError, CapnwebValue};
+use crate::core::{
+    CapnwebError, CapnwebValue, Error, PayloadStubHook, PromiseStubHook, PropertyKey, PropertyPath,
+    Result, RpcPayload, RpcStub, RpcTargetInner, StubHook, function_target,
+};
 use crate::serialize::{deserialize, serialize, swap_byte_order};
 use num_bigint::BigInt;
 use std::collections::BTreeMap;
+use std::sync::Arc;
 // JS:
 // JS: let SERIALIZE_TEST_CASES: Record<string, unknown> = {
 fn serialize_test_cases() -> Vec<(&'static str, CapnwebValue)> {
@@ -1381,230 +1385,1006 @@ mod error_serialization {
 // JS:   await expect(() => stub.square(1)).rejects.toThrow(sendError);
 // JS: });
 // JS:
+struct LocalTestTarget;
+
+impl RpcTargetInner for LocalTestTarget {
+    fn call(self: Arc<Self>, path: PropertyPath, args: RpcPayload) -> Result<StubHook> {
+        Ok(PromiseStubHook::from_future(async move {
+            let value = args.deliver_resolve().await?;
+            let CapnwebValue::Array(mut arguments) = value else {
+                return Err(Error::Type("arguments are not an array".to_owned()));
+            };
+            let result = match path.as_slice() {
+                [PropertyKey::String(method)] if method == "square" => {
+                    let CapnwebValue::Number(value) = arguments.remove(0) else {
+                        return Err(Error::Type("square argument is not a number".to_owned()));
+                    };
+                    CapnwebValue::Number(value * value)
+                }
+                [PropertyKey::String(method)] if method == "returnNull" => CapnwebValue::Null,
+                [PropertyKey::String(method)] if method == "returnUndefined" => {
+                    CapnwebValue::Undefined
+                }
+                [PropertyKey::String(method)] if method == "returnNumber" => arguments.remove(0),
+                [PropertyKey::String(method)] if method == "generateFibonacci" => {
+                    let CapnwebValue::Number(count) = arguments.remove(0) else {
+                        panic!()
+                    };
+                    let (mut a, mut b) = (0.0, 1.0);
+                    CapnwebValue::Array(
+                        (0..count as usize)
+                            .map(|_| {
+                                let value = a;
+                                (a, b) = (b, a + b);
+                                CapnwebValue::Number(value)
+                            })
+                            .collect(),
+                    )
+                }
+                [PropertyKey::String(method)] if method == "makeCounter" => {
+                    let CapnwebValue::Number(value) = arguments.remove(0) else {
+                        panic!()
+                    };
+                    CapnwebValue::Target(Arc::new(LocalCounter(std::sync::Mutex::new(value))))
+                }
+                _ => return Err(Error::Type(format!("No such RPC method: {path:?}"))),
+            };
+            Ok(Arc::new(PayloadStubHook::new(RpcPayload::from_app_return(result))) as StubHook)
+        }))
+    }
+
+    fn get(self: Arc<Self>, path: PropertyPath) -> Result<StubHook> {
+        if path.len() > 1 {
+            return Err(Error::Type(
+                "Cannot read a property of undefined".to_owned(),
+            ));
+        }
+        Ok(Arc::new(PayloadStubHook::new(RpcPayload::from_app_return(
+            CapnwebValue::Undefined,
+        ))))
+    }
+}
+
+fn local_test_stub() -> RpcStub {
+    RpcStub::from_value(CapnwebValue::Target(Arc::new(LocalTestTarget)))
+}
+
+fn number_arrays(values: &[f64]) -> CapnwebValue {
+    CapnwebValue::Array(values.iter().copied().map(CapnwebValue::Number).collect())
+}
+
+fn one_number_argument(value: f64) -> RpcPayload {
+    RpcPayload::from_app_params(CapnwebValue::Array(vec![CapnwebValue::Number(value)]))
+}
+
+struct LocalCounter(std::sync::Mutex<f64>);
+
+impl RpcTargetInner for LocalCounter {
+    fn call(self: Arc<Self>, path: PropertyPath, args: RpcPayload) -> Result<StubHook> {
+        Ok(PromiseStubHook::from_future(async move {
+            if path != vec![PropertyKey::String("increment".to_owned())] {
+                return Err(Error::Type(format!("No such counter method: {path:?}")));
+            }
+            let CapnwebValue::Array(arguments) = args.deliver_resolve().await? else {
+                panic!()
+            };
+            let by = match arguments.first() {
+                Some(CapnwebValue::Number(value)) => *value,
+                None => 1.0,
+                _ => panic!(),
+            };
+            let value = {
+                let mut value = self.0.lock().unwrap();
+                *value += by;
+                *value
+            };
+            Ok(Arc::new(PayloadStubHook::new(RpcPayload::from_app_return(
+                CapnwebValue::Number(value),
+            ))) as StubHook)
+        }))
+    }
+
+    fn get(self: Arc<Self>, path: PropertyPath) -> Result<StubHook> {
+        if path != vec![PropertyKey::String("value".to_owned())] {
+            return Err(Error::Type(format!("No such counter property: {path:?}")));
+        }
+        let value = *self.0.lock().unwrap();
+        Ok(Arc::new(PayloadStubHook::new(RpcPayload::from_app_return(
+            CapnwebValue::Number(value),
+        ))))
+    }
+}
+
+fn local_counter(value: f64) -> RpcStub {
+    RpcStub::from_value(CapnwebValue::Target(Arc::new(LocalCounter(
+        std::sync::Mutex::new(value),
+    ))))
+}
+
+struct ReflectionTarget;
+
+impl RpcTargetInner for ReflectionTarget {
+    fn call(self: Arc<Self>, path: PropertyPath, _args: RpcPayload) -> Result<StubHook> {
+        let value = match path.as_slice() {
+            [PropertyKey::String(method)] if method == "prototypeMethod" => "method",
+            [PropertyKey::String(method)] if method == "publicMethod" => "public",
+            _ => return Err(Error::Type(format!("No such RPC method: {path:?}"))),
+        };
+        Ok(Arc::new(PayloadStubHook::new(RpcPayload::from_app_return(
+            CapnwebValue::String(value.to_owned()),
+        ))))
+    }
+
+    fn get(self: Arc<Self>, path: PropertyPath) -> Result<StubHook> {
+        let value = match path.as_slice() {
+            [PropertyKey::String(property)] if property == "prototypeProp" => {
+                CapnwebValue::String("prototype".to_owned())
+            }
+            [PropertyKey::String(property)] if property == "#privateMethod" => {
+                CapnwebValue::Undefined
+            }
+            [PropertyKey::String(property)]
+                if property == "instanceProp" || property == "dynamicProp" =>
+            {
+                return Err(Error::Type(format!(
+                    "Attempted to access instance property '{property}'"
+                )));
+            }
+            _ => CapnwebValue::Undefined,
+        };
+        Ok(Arc::new(PayloadStubHook::new(RpcPayload::from_app_return(
+            value,
+        ))))
+    }
+}
+
+struct OuterNestedTarget {
+    property: &'static str,
+    inner: Arc<LocalTestTarget>,
+    as_stub: bool,
+}
+
+impl RpcTargetInner for OuterNestedTarget {
+    fn call(self: Arc<Self>, path: PropertyPath, args: RpcPayload) -> Result<StubHook> {
+        match path.as_slice() {
+            [PropertyKey::String(method)] if method == "getValue" => Ok(Arc::new(
+                PayloadStubHook::new(RpcPayload::from_app_return(CapnwebValue::Number(42.0))),
+            )),
+            [PropertyKey::String(property), rest @ ..] if property == self.property => {
+                self.inner.clone().call(rest.to_vec(), args)
+            }
+            _ => Err(Error::Type(format!("No such RPC method: {path:?}"))),
+        }
+    }
+
+    fn get(self: Arc<Self>, path: PropertyPath) -> Result<StubHook> {
+        if path == vec![PropertyKey::String(self.property.to_owned())] {
+            let value = if self.as_stub {
+                CapnwebValue::Stub(RpcStub::from_value(CapnwebValue::Target(
+                    self.inner.clone(),
+                )))
+            } else {
+                CapnwebValue::Target(self.inner.clone())
+            };
+            Ok(Arc::new(PayloadStubHook::new(RpcPayload::from_app_return(
+                value,
+            ))))
+        } else {
+            Err(Error::Type(format!("No such RPC property: {path:?}")))
+        }
+    }
+}
+
 // JS: describe("local stub", () => {
-// JS:   it("supports wrapping an RpcTarget", async () => {
-// JS:     let stub = new RpcStub(new TestTarget());
-// JS:     expect(await stub.square(3)).toBe(9);
-// JS:   });
-// JS:
-// JS:   it("supports wrapping a function", async () => {
-// JS:     // TODO: If we don't explicitly declare the type of `i` then the type system complains about
-// JS:     //   too-deep recursion here. Why?
-// JS:     let stub = new RpcStub((i :number) => i + 5);
-// JS:     expect(await stub(3)).toBe(8);
-// JS:   });
-// JS:
-// JS:   it("supports wrapping an async function", async () => {
-// JS:     let stub = new RpcStub(async (i :number) => { return i + 5; });
-// JS:     expect(await stub(3)).toBe(8);
-// JS:   });
-// JS:
-// JS:   it("supports wrapping an arbitrary object", async () => {
-// JS:     let stub = new RpcStub({abc: "hello"});
-// JS:     expect(await stub.abc).toBe("hello");
-// JS:   });
-// JS:
-// JS:   it("supports wrapping an object with nested stubs", async () => {
-// JS:     let innerTarget = new TestTarget();
-// JS:     let innerStub = new RpcStub(innerTarget);
-// JS:     let outerObject = { inner: innerStub, value: 42 };
-// JS:     let outerStub = new RpcStub(outerObject);
-// JS:
-// JS:     expect(await outerStub.value).toBe(42);
-// JS:     expect(await outerStub.inner.square(4)).toBe(16);
-// JS:   });
-// JS:
-// JS:   it("supports wrapping an object with nested RpcTargets", async () => {
-// JS:     let innerTarget = new TestTarget();
-// JS:     let outerObject = { inner: innerTarget, value: 42 };
-// JS:     let outerStub = new RpcStub(outerObject);
-// JS:
-// JS:     expect(await outerStub.value).toBe(42);
-// JS:     expect(await outerStub.inner.square(4)).toBe(16);
-// JS:   });
-// JS:
-// JS:   it("supports wrapping an object with nested functions", async () => {
-// JS:     let outerObject = { square: (x: number) => x * x, value: 42 };
-// JS:     let outerStub = new RpcStub(outerObject);
-// JS:
-// JS:     expect(await outerStub.value).toBe(42);
-// JS:     expect(await outerStub.square(4)).toBe(16);
-// JS:   });
-// JS:
-// JS:   it("supports wrapping an object with nested async functions", async () => {
-// JS:     async function asyncSqare(x: number) {
-// JS:       await Promise.resolve();
-// JS:       return x * x;
-// JS:     }
-// JS:
-// JS:     let outerObject = { square: asyncSqare, value: 42 };
-// JS:     let outerStub = new RpcStub(outerObject);
-// JS:
-// JS:     expect(await outerStub.value).toBe(42);
-// JS:     expect(await outerStub.square(4)).toBe(16);
-// JS:   });
-// JS:
-// JS:   it("supports wrapping an RpcTarget with nested stubs", async () => {
-// JS:     class TargetWithStubs extends RpcTarget {
-// JS:       getValue() { return 42; }
-// JS:
-// JS:       get innerStub() {
-// JS:         return new RpcStub(new TestTarget());
-// JS:       }
-// JS:     }
-// JS:
-// JS:     let outerStub = new RpcStub(new TargetWithStubs());
-// JS:     expect(await outerStub.getValue()).toBe(42);
-// JS:     expect(await outerStub.innerStub.square(3)).toBe(9);
-// JS:   });
-// JS:
-// JS:   it("supports wrapping an RpcTarget with nested RpcTargets", async () => {
-// JS:     class TargetWithTargets extends RpcTarget {
-// JS:       getValue() { return 42; }
-// JS:
-// JS:       get innerTarget() {
-// JS:         return new TestTarget();
-// JS:       }
-// JS:     }
-// JS:
-// JS:     let outerStub = new RpcStub(new TargetWithTargets());
-// JS:     expect(await outerStub.getValue()).toBe(42);
-// JS:     expect(await outerStub.innerTarget.square(3)).toBe(9);
-// JS:   });
-// JS:
-// JS:   it("returns undefined when accessing nonexistent properties", async () => {
-// JS:     let objectStub = new RpcStub({foo: "bar"});
-// JS:     let arrayStub = new RpcStub([1, 2, 3]);
-// JS:     let targetStub = new RpcStub(new TestTarget());
-// JS:
-// JS:     expect(await (objectStub as any).nonexistent).toBe(undefined);
-// JS:     expect(await (arrayStub as any).nonexistent).toBe(undefined);
-// JS:     expect(await (targetStub as any).nonexistent).toBe(undefined);
-// JS:
-// JS:     // Accessing a property of undefined should throw TypeError (but the error message differs
-// JS:     // across runtimes).
-// JS:     await expect(() => (objectStub as any).nonexistent.foo).rejects.toThrow(TypeError);
-// JS:     await expect(() => (arrayStub as any).nonexistent.foo).rejects.toThrow(TypeError);
-// JS:     await expect(() => (targetStub as any).nonexistent.foo).rejects.toThrow(TypeError);
-// JS:   });
-// JS:
-// JS:   it("exposes only prototype properties for RpcTarget, not instance properties", async () => {
-// JS:     class TargetWithProps extends RpcTarget {
-// JS:       instanceProp = "instance";
-// JS:       dynamicProp: string;
-// JS:
-// JS:       constructor() {
-// JS:         super();
-// JS:         this.dynamicProp = "dynamic";
-// JS:       }
-// JS:
-// JS:       get prototypeProp() { return "prototype"; }
-// JS:       prototypeMethod() { return "method"; }
-// JS:     }
-// JS:
-// JS:     let target = new TargetWithProps();
-// JS:     let stub = new RpcStub(target);
-// JS:
-// JS:     expect(await stub.prototypeProp).toBe("prototype");
-// JS:     expect(await stub.prototypeMethod()).toBe("method");
-// JS:     await expect(() => (stub as any).instanceProp).rejects.toThrow(new TypeError(
-// JS:         "Attempted to access property 'instanceProp', which is an instance property of the " +
-// JS:         "RpcTarget. To avoid leaking private internals, instance properties cannot be accessed " +
-// JS:         "over RPC. If you want to make this property available over RPC, define it as a method " +
-// JS:         "or getter on the class, instead of an instance property."));
-// JS:     await expect(() => (stub as any).dynamicProp).rejects.toThrow(new TypeError(
-// JS:         "Attempted to access property 'dynamicProp', which is an instance property of the " +
-// JS:         "RpcTarget. To avoid leaking private internals, instance properties cannot be accessed " +
-// JS:         "over RPC. If you want to make this property available over RPC, define it as a method " +
-// JS:         "or getter on the class, instead of an instance property."));
-// JS:   });
-// JS:
-// JS:   it("does not expose private methods starting with #", async () => {
-// JS:     class TargetWithPrivate extends RpcTarget {
-// JS:       #privateMethod() { return "private"; }
-// JS:       publicMethod() { return "public"; }
-// JS:     }
-// JS:
-// JS:     let stub = new RpcStub(new TargetWithPrivate());
-// JS:     expect(await stub.publicMethod()).toBe("public");
-// JS:     expect(await (stub as any)["#privateMethod"]).toBe(undefined);
-// JS:   });
-// JS:
-// JS:   it("supports map() on nulls", async () => {
-// JS:     let counter = new RpcStub(new Counter(0));
-// JS:
-// JS:     let stub = new RpcStub(new TestTarget());
-// JS:
-// JS:     {
-// JS:       using promise = stub.returnNull();
-// JS:       expect(await promise.map(_ => counter.increment(123))).toBe(null);
-// JS:     }
-// JS:
-// JS:     {
-// JS:       using promise = stub.returnUndefined();
-// JS:       expect(await promise.map(_ => counter.increment(456))).toBe(undefined);
-// JS:     }
-// JS:
-// JS:     {
-// JS:       using promise = stub.returnNumber(2);
-// JS:       expect(await promise.map(i => counter.increment(i))).toBe(2);
-// JS:     }
-// JS:
-// JS:     {
-// JS:       using promise = stub.returnNumber(4);
-// JS:       expect(await promise.map(i => counter.increment(i))).toBe(6);
-// JS:     }
-// JS:   });
-// JS:
-// JS:   it("supports map() on arrays", async () => {
-// JS:     let outerCounter = new RpcStub(new Counter(0));
-// JS:     let stub = new RpcStub(new TestTarget());
-// JS:
-// JS:     using fib = stub.generateFibonacci(6);
-// JS:     using counters = await fib.map(i => {
-// JS:       let counter = stub.makeCounter(i);
-// JS:       let val = counter.increment(3);
-// JS:       outerCounter.increment();
-// JS:       return {counter, val};
-// JS:     });
-// JS:
-// JS:     expect(counters.map(x => x.val)).toStrictEqual([3, 4, 4, 5, 6, 8]);
-// JS:
-// JS:     expect(await Promise.all(counters.map(x => x.counter.value)))
-// JS:         .toStrictEqual([3, 4, 4, 5, 6, 8]);
-// JS:
-// JS:     expect(await outerCounter.value).toBe(6);
-// JS:   });
-// JS:
-// JS:   it("supports nested map()", async () => {
-// JS:     let stub = new RpcStub(new TestTarget());
-// JS:
-// JS:     let fib = stub.generateFibonacci(7);
-// JS:     let result = await fib.map(i => {
-// JS:       return stub.generateFibonacci(i).map(j => {
-// JS:         return stub.generateFibonacci(j);
-// JS:       });
-// JS:     });
-// JS:
-// JS:     expect(result).toStrictEqual([
-// JS:       [],
-// JS:       [[]],
-// JS:       [[]],
-// JS:       [[], [0]],
-// JS:       [[], [0], [0]],
-// JS:       [[], [0], [0], [0, 1], [0, 1, 1]],
-// JS:       [[], [0], [0], [0, 1], [0, 1, 1], [0, 1, 1, 2, 3], [0, 1, 1, 2, 3, 5, 8, 13],
-// JS:           [0, 1, 1, 2, 3, 5, 8, 13, 21, 34, 55, 89, 144]],
-// JS:     ]);
-// JS:   });
-// JS:
-// JS:   it("overrides toString() to at least specify the type", async () => {
-// JS:     let stub = new RpcStub(new TestTarget());
-// JS:     expect(stub.toString()).toBe("[object RpcStub]");
-// JS:     let promise = stub.square(3);
-// JS:     expect(promise.toString()).toBe("[object RpcPromise]");
-// JS:   });
-// JS: });
+mod local_stub {
+    use super::*;
+    // JS:   it("supports wrapping an RpcTarget", async () => {
+    #[tokio::test(flavor = "current_thread")]
+    async fn supports_wrapping_an_rpc_target() {
+        // JS:     let stub = new RpcStub(new TestTarget());
+        let stub = local_test_stub();
+        // JS:     expect(await stub.square(3)).toBe(9);
+        let result = stub
+            .call(vec!["square".to_owned()], one_number_argument(3.0))
+            .pull()
+            .await
+            .unwrap();
+        assert!(matches!(result, CapnwebValue::Number(9.0)));
+        // JS:   });
+    }
+    // JS:
+    // JS:   it("supports wrapping a function", async () => {
+    #[tokio::test(flavor = "current_thread")]
+    async fn supports_wrapping_a_function() {
+        // JS:     // TODO: If we don't explicitly declare the type of `i` then the type system complains about
+        // JS:     //   too-deep recursion here. Why?
+        // JS:     let stub = new RpcStub((i :number) => i + 5);
+        let stub = RpcStub::from_value(function_target(|args| async move {
+            let CapnwebValue::Array(args) = args.deliver_resolve().await? else {
+                panic!()
+            };
+            let CapnwebValue::Number(value) = args[0] else {
+                panic!()
+            };
+            Ok(CapnwebValue::Number(value + 5.0))
+        }));
+        // JS:     expect(await stub(3)).toBe(8);
+        assert!(matches!(
+            stub.call(Vec::new(), one_number_argument(3.0))
+                .pull()
+                .await
+                .unwrap(),
+            CapnwebValue::Number(8.0)
+        ));
+        // JS:   });
+    }
+    // JS:
+    // JS:   it("supports wrapping an async function", async () => {
+    #[tokio::test(flavor = "current_thread")]
+    async fn supports_wrapping_an_async_function() {
+        // JS:     let stub = new RpcStub(async (i :number) => { return i + 5; });
+        let stub = RpcStub::from_value(function_target(|args| async move {
+            tokio::task::yield_now().await;
+            let CapnwebValue::Array(args) = args.deliver_resolve().await? else {
+                panic!()
+            };
+            let CapnwebValue::Number(value) = args[0] else {
+                panic!()
+            };
+            Ok(CapnwebValue::Number(value + 5.0))
+        }));
+        // JS:     expect(await stub(3)).toBe(8);
+        assert!(matches!(
+            stub.call(Vec::new(), one_number_argument(3.0))
+                .pull()
+                .await
+                .unwrap(),
+            CapnwebValue::Number(8.0)
+        ));
+        // JS:   });
+    }
+    // JS:
+    // JS:   it("supports wrapping an arbitrary object", async () => {
+    #[tokio::test(flavor = "current_thread")]
+    async fn supports_wrapping_an_arbitrary_object() {
+        // JS:     let stub = new RpcStub({abc: "hello"});
+        let stub = RpcStub::from_value(object_value([(
+            "abc",
+            CapnwebValue::String("hello".to_owned()),
+        )]));
+        // JS:     expect(await stub.abc).toBe("hello");
+        assert!(
+            matches!(stub.get(vec!["abc".to_owned()]).pull().await.unwrap(), CapnwebValue::String(value) if value == "hello")
+        );
+        // JS:   });
+    }
+    // JS:
+    // JS:   it("supports wrapping an object with nested stubs", async () => {
+    #[tokio::test(flavor = "current_thread")]
+    async fn supports_wrapping_an_object_with_nested_stubs() {
+        // JS:     let innerTarget = new TestTarget();
+        let inner_target = Arc::new(LocalTestTarget);
+        // JS:     let innerStub = new RpcStub(innerTarget);
+        let inner_stub = RpcStub::from_value(CapnwebValue::Target(inner_target));
+        // JS:     let outerObject = { inner: innerStub, value: 42 };
+        let outer_object = object_value([
+            ("inner", CapnwebValue::Stub(inner_stub)),
+            ("value", CapnwebValue::Number(42.0)),
+        ]);
+        // JS:     let outerStub = new RpcStub(outerObject);
+        let outer_stub = RpcStub::from_value(outer_object);
+        // JS:
+        // JS:     expect(await outerStub.value).toBe(42);
+        assert!(matches!(
+            outer_stub
+                .get(vec!["value".to_owned()])
+                .pull()
+                .await
+                .unwrap(),
+            CapnwebValue::Number(42.0)
+        ));
+        // JS:     expect(await outerStub.inner.square(4)).toBe(16);
+        assert!(matches!(
+            outer_stub
+                .call(
+                    vec!["inner".to_owned(), "square".to_owned()],
+                    one_number_argument(4.0)
+                )
+                .pull()
+                .await
+                .unwrap(),
+            CapnwebValue::Number(16.0)
+        ));
+        // JS:   });
+    }
+    // JS:
+    // JS:   it("supports wrapping an object with nested RpcTargets", async () => {
+    #[tokio::test(flavor = "current_thread")]
+    async fn supports_wrapping_an_object_with_nested_rpc_targets() {
+        // JS:     let innerTarget = new TestTarget();
+        let inner_target = Arc::new(LocalTestTarget);
+        // JS:     let outerObject = { inner: innerTarget, value: 42 };
+        let outer_object = object_value([
+            ("inner", CapnwebValue::Target(inner_target)),
+            ("value", CapnwebValue::Number(42.0)),
+        ]);
+        // JS:     let outerStub = new RpcStub(outerObject);
+        let outer_stub = RpcStub::from_value(outer_object);
+        // JS:
+        // JS:     expect(await outerStub.value).toBe(42);
+        assert!(matches!(
+            outer_stub
+                .get(vec!["value".to_owned()])
+                .pull()
+                .await
+                .unwrap(),
+            CapnwebValue::Number(42.0)
+        ));
+        // JS:     expect(await outerStub.inner.square(4)).toBe(16);
+        assert!(matches!(
+            outer_stub
+                .call(
+                    vec!["inner".to_owned(), "square".to_owned()],
+                    one_number_argument(4.0)
+                )
+                .pull()
+                .await
+                .unwrap(),
+            CapnwebValue::Number(16.0)
+        ));
+        // JS:   });
+    }
+    // JS:
+    // JS:   it("supports wrapping an object with nested functions", async () => {
+    #[tokio::test(flavor = "current_thread")]
+    async fn supports_wrapping_an_object_with_nested_functions() {
+        // JS:     let outerObject = { square: (x: number) => x * x, value: 42 };
+        let square = function_target(|args| async move {
+            let CapnwebValue::Array(args) = args.deliver_resolve().await? else {
+                panic!()
+            };
+            let CapnwebValue::Number(value) = args[0] else {
+                panic!()
+            };
+            Ok(CapnwebValue::Number(value * value))
+        });
+        let outer_object =
+            object_value([("square", square), ("value", CapnwebValue::Number(42.0))]);
+        // JS:     let outerStub = new RpcStub(outerObject);
+        let outer_stub = RpcStub::from_value(outer_object);
+        // JS:
+        // JS:     expect(await outerStub.value).toBe(42);
+        assert!(matches!(
+            outer_stub
+                .get(vec!["value".to_owned()])
+                .pull()
+                .await
+                .unwrap(),
+            CapnwebValue::Number(42.0)
+        ));
+        // JS:     expect(await outerStub.square(4)).toBe(16);
+        assert!(matches!(
+            outer_stub
+                .call(vec!["square".to_owned()], one_number_argument(4.0))
+                .pull()
+                .await
+                .unwrap(),
+            CapnwebValue::Number(16.0)
+        ));
+        // JS:   });
+    }
+    // JS:
+    // JS:   it("supports wrapping an object with nested async functions", async () => {
+    #[tokio::test(flavor = "current_thread")]
+    async fn supports_wrapping_an_object_with_nested_async_functions() {
+        // JS:     async function asyncSqare(x: number) {
+        let async_square = function_target(|args| async move {
+            // JS:       await Promise.resolve();
+            tokio::task::yield_now().await;
+            // JS:       return x * x;
+            let CapnwebValue::Array(args) = args.deliver_resolve().await? else {
+                panic!()
+            };
+            let CapnwebValue::Number(value) = args[0] else {
+                panic!()
+            };
+            Ok(CapnwebValue::Number(value * value))
+            // JS:     }
+        });
+        // JS:
+        // JS:     let outerObject = { square: asyncSqare, value: 42 };
+        let outer_object = object_value([
+            ("square", async_square),
+            ("value", CapnwebValue::Number(42.0)),
+        ]);
+        // JS:     let outerStub = new RpcStub(outerObject);
+        let outer_stub = RpcStub::from_value(outer_object);
+        // JS:
+        // JS:     expect(await outerStub.value).toBe(42);
+        assert!(matches!(
+            outer_stub
+                .get(vec!["value".to_owned()])
+                .pull()
+                .await
+                .unwrap(),
+            CapnwebValue::Number(42.0)
+        ));
+        // JS:     expect(await outerStub.square(4)).toBe(16);
+        assert!(matches!(
+            outer_stub
+                .call(vec!["square".to_owned()], one_number_argument(4.0))
+                .pull()
+                .await
+                .unwrap(),
+            CapnwebValue::Number(16.0)
+        ));
+        // JS:   });
+    }
+    // JS:
+    // JS:   it("supports wrapping an RpcTarget with nested stubs", async () => {
+    #[tokio::test(flavor = "current_thread")]
+    async fn supports_wrapping_an_rpc_target_with_nested_stubs() {
+        // JS:     class TargetWithStubs extends RpcTarget {
+        let target = OuterNestedTarget {
+            property: "innerStub",
+            inner: Arc::new(LocalTestTarget),
+            as_stub: true,
+        };
+        // JS:       getValue() { return 42; }
+        // Implemented by `OuterNestedTarget::call()`.
+        // JS:
+        // JS:       get innerStub() {
+        // Implemented by `OuterNestedTarget::get()`.
+        // JS:         return new RpcStub(new TestTarget());
+        // The getter returns `CapnwebValue::Stub` when `as_stub` is true.
+        // JS:       }
+        // JS:     }
+        // JS:
+        // JS:     let outerStub = new RpcStub(new TargetWithStubs());
+        let outer_stub = RpcStub::from_value(CapnwebValue::Target(Arc::new(target)));
+        // JS:     expect(await outerStub.getValue()).toBe(42);
+        assert!(matches!(
+            outer_stub
+                .call(
+                    vec!["getValue".to_owned()],
+                    RpcPayload::from_app_params(CapnwebValue::Array(vec![]))
+                )
+                .pull()
+                .await
+                .unwrap(),
+            CapnwebValue::Number(42.0)
+        ));
+        // JS:     expect(await outerStub.innerStub.square(3)).toBe(9);
+        assert!(matches!(
+            outer_stub
+                .call(
+                    vec!["innerStub".to_owned(), "square".to_owned()],
+                    one_number_argument(3.0)
+                )
+                .pull()
+                .await
+                .unwrap(),
+            CapnwebValue::Number(9.0)
+        ));
+        // JS:   });
+    }
+    // JS:
+    // JS:   it("supports wrapping an RpcTarget with nested RpcTargets", async () => {
+    #[tokio::test(flavor = "current_thread")]
+    async fn supports_wrapping_an_rpc_target_with_nested_rpc_targets() {
+        // JS:     class TargetWithTargets extends RpcTarget {
+        let target = OuterNestedTarget {
+            property: "innerTarget",
+            inner: Arc::new(LocalTestTarget),
+            as_stub: false,
+        };
+        // JS:       getValue() { return 42; }
+        // Implemented by `OuterNestedTarget::call()`.
+        // JS:
+        // JS:       get innerTarget() {
+        // Implemented by `OuterNestedTarget::get()`.
+        // JS:         return new TestTarget();
+        // The getter returns `CapnwebValue::Target` when `as_stub` is false.
+        // JS:       }
+        // JS:     }
+        // JS:
+        // JS:     let outerStub = new RpcStub(new TargetWithTargets());
+        let outer_stub = RpcStub::from_value(CapnwebValue::Target(Arc::new(target)));
+        // JS:     expect(await outerStub.getValue()).toBe(42);
+        assert!(matches!(
+            outer_stub
+                .call(
+                    vec!["getValue".to_owned()],
+                    RpcPayload::from_app_params(CapnwebValue::Array(vec![]))
+                )
+                .pull()
+                .await
+                .unwrap(),
+            CapnwebValue::Number(42.0)
+        ));
+        // JS:     expect(await outerStub.innerTarget.square(3)).toBe(9);
+        assert!(matches!(
+            outer_stub
+                .call(
+                    vec!["innerTarget".to_owned(), "square".to_owned()],
+                    one_number_argument(3.0)
+                )
+                .pull()
+                .await
+                .unwrap(),
+            CapnwebValue::Number(9.0)
+        ));
+        // JS:   });
+    }
+    // JS:
+    // JS:   it("returns undefined when accessing nonexistent properties", async () => {
+    #[tokio::test(flavor = "current_thread")]
+    async fn returns_undefined_when_accessing_nonexistent_properties() {
+        // JS:     let objectStub = new RpcStub({foo: "bar"});
+        let object_stub = RpcStub::from_value(object_value([(
+            "foo",
+            CapnwebValue::String("bar".to_owned()),
+        )]));
+        // JS:     let arrayStub = new RpcStub([1, 2, 3]);
+        let array_stub = RpcStub::from_value(CapnwebValue::Array(vec![
+            CapnwebValue::Number(1.0),
+            CapnwebValue::Number(2.0),
+            CapnwebValue::Number(3.0),
+        ]));
+        // JS:     let targetStub = new RpcStub(new TestTarget());
+        let target_stub = local_test_stub();
+        // JS:
+        // JS:     expect(await (objectStub as any).nonexistent).toBe(undefined);
+        assert!(matches!(
+            object_stub
+                .get(vec!["nonexistent".to_owned()])
+                .pull()
+                .await
+                .unwrap(),
+            CapnwebValue::Undefined
+        ));
+        // JS:     expect(await (arrayStub as any).nonexistent).toBe(undefined);
+        assert!(matches!(
+            array_stub
+                .get(vec!["nonexistent".to_owned()])
+                .pull()
+                .await
+                .unwrap(),
+            CapnwebValue::Undefined
+        ));
+        // JS:     expect(await (targetStub as any).nonexistent).toBe(undefined);
+        assert!(matches!(
+            target_stub
+                .get(vec!["nonexistent".to_owned()])
+                .pull()
+                .await
+                .unwrap(),
+            CapnwebValue::Undefined
+        ));
+        // JS:
+        // JS:     // Accessing a property of undefined should throw TypeError (but the error message differs
+        // JS:     // across runtimes).
+        // JS:     await expect(() => (objectStub as any).nonexistent.foo).rejects.toThrow(TypeError);
+        assert!(
+            object_stub
+                .get(vec!["nonexistent".to_owned(), "foo".to_owned()])
+                .pull()
+                .await
+                .is_err()
+        );
+        // JS:     await expect(() => (arrayStub as any).nonexistent.foo).rejects.toThrow(TypeError);
+        assert!(
+            array_stub
+                .get(vec!["nonexistent".to_owned(), "foo".to_owned()])
+                .pull()
+                .await
+                .is_err()
+        );
+        // JS:     await expect(() => (targetStub as any).nonexistent.foo).rejects.toThrow(TypeError);
+        assert!(
+            target_stub
+                .get(vec!["nonexistent".to_owned(), "foo".to_owned()])
+                .pull()
+                .await
+                .is_err()
+        );
+        // JS:   });
+    }
+    // JS:
+    // JS:   it("exposes only prototype properties for RpcTarget, not instance properties", async () => {
+    #[tokio::test(flavor = "current_thread")]
+    async fn exposes_only_declared_target_properties() {
+        // RUST-DIFF(JS Proxy/reflection): generated `RpcTargetInner::call/get` dispatch exposes only declared members.
+        // JS:     class TargetWithProps extends RpcTarget {
+        // JS:       instanceProp = "instance";
+        // JS:       dynamicProp: string;
+        // JS:
+        // JS:       constructor() {
+        // JS:         super();
+        // JS:         this.dynamicProp = "dynamic";
+        // JS:       }
+        // JS:
+        // JS:       get prototypeProp() { return "prototype"; }
+        // JS:       prototypeMethod() { return "method"; }
+        // JS:     }
+        // JS:
+        // JS:     let target = new TargetWithProps();
+        let target = Arc::new(ReflectionTarget);
+        // JS:     let stub = new RpcStub(target);
+        let stub = RpcStub::from_value(CapnwebValue::Target(target));
+        // JS:
+        // JS:     expect(await stub.prototypeProp).toBe("prototype");
+        assert!(
+            matches!(stub.get(vec!["prototypeProp".to_owned()]).pull().await.unwrap(), CapnwebValue::String(value) if value == "prototype")
+        );
+        // JS:     expect(await stub.prototypeMethod()).toBe("method");
+        assert!(
+            matches!(stub.call(vec!["prototypeMethod".to_owned()], RpcPayload::from_app_params(CapnwebValue::Array(vec![]))).pull().await.unwrap(), CapnwebValue::String(value) if value == "method")
+        );
+        // JS:     await expect(() => (stub as any).instanceProp).rejects.toThrow(new TypeError(
+        let instance_error = stub
+            .get(vec!["instanceProp".to_owned()])
+            .pull()
+            .await
+            .unwrap_err();
+        // JS:         "Attempted to access property 'instanceProp', which is an instance property of the " +
+        // JS:         "RpcTarget. To avoid leaking private internals, instance properties cannot be accessed " +
+        // JS:         "over RPC. If you want to make this property available over RPC, define it as a method " +
+        // JS:         "or getter on the class, instead of an instance property."));
+        assert!(instance_error.to_string().contains("instanceProp"));
+        // JS:     await expect(() => (stub as any).dynamicProp).rejects.toThrow(new TypeError(
+        let dynamic_error = stub
+            .get(vec!["dynamicProp".to_owned()])
+            .pull()
+            .await
+            .unwrap_err();
+        // JS:         "Attempted to access property 'dynamicProp', which is an instance property of the " +
+        // JS:         "RpcTarget. To avoid leaking private internals, instance properties cannot be accessed " +
+        // JS:         "over RPC. If you want to make this property available over RPC, define it as a method " +
+        // JS:         "or getter on the class, instead of an instance property."));
+        assert!(dynamic_error.to_string().contains("dynamicProp"));
+        // JS:   });
+    }
+    // JS:
+    // JS:   it("does not expose private methods starting with #", async () => {
+    #[tokio::test(flavor = "current_thread")]
+    async fn does_not_expose_private_methods_starting_with_hash() {
+        // RUST-DIFF(JS Proxy/reflection): generated dispatch cannot name Rust-private implementation methods.
+        // JS:     class TargetWithPrivate extends RpcTarget {
+        // JS:       #privateMethod() { return "private"; }
+        // JS:       publicMethod() { return "public"; }
+        // JS:     }
+        // JS:
+        // JS:     let stub = new RpcStub(new TargetWithPrivate());
+        let stub = RpcStub::from_value(CapnwebValue::Target(Arc::new(ReflectionTarget)));
+        // JS:     expect(await stub.publicMethod()).toBe("public");
+        assert!(
+            matches!(stub.call(vec!["publicMethod".to_owned()], RpcPayload::from_app_params(CapnwebValue::Array(vec![]))).pull().await.unwrap(), CapnwebValue::String(value) if value == "public")
+        );
+        // JS:     expect(await (stub as any)["#privateMethod"]).toBe(undefined);
+        assert!(matches!(
+            stub.get(vec!["#privateMethod".to_owned()])
+                .pull()
+                .await
+                .unwrap(),
+            CapnwebValue::Undefined
+        ));
+        // JS:   });
+    }
+    // JS:
+    // JS:   it("supports map() on nulls", async () => {
+    #[tokio::test(flavor = "current_thread")]
+    async fn supports_map_on_nulls() {
+        // JS:     let counter = new RpcStub(new Counter(0));
+        let counter = local_counter(0.0);
+        // JS:
+        // JS:     let stub = new RpcStub(new TestTarget());
+        let stub = local_test_stub();
+        // JS:
+        // JS:     {
+        {
+            // JS:       using promise = stub.returnNull();
+            let promise = stub.call(
+                vec!["returnNull".to_owned()],
+                RpcPayload::from_app_params(CapnwebValue::Array(vec![])),
+            );
+            // JS:       expect(await promise.map(_ => counter.increment(123))).toBe(null);
+            let mapped = promise
+                .as_stub()
+                .map({
+                    let counter = counter.clone();
+                    move |_| {
+                        Ok(CapnwebValue::RpcPromise(counter.call(
+                            vec!["increment".to_owned()],
+                            one_number_argument(123.0),
+                        )))
+                    }
+                })
+                .unwrap();
+            assert!(matches!(mapped.pull().await.unwrap(), CapnwebValue::Null));
+            // JS:     }
+        }
+        // JS:
+        // JS:     {
+        {
+            // JS:       using promise = stub.returnUndefined();
+            let promise = stub.call(
+                vec!["returnUndefined".to_owned()],
+                RpcPayload::from_app_params(CapnwebValue::Array(vec![])),
+            );
+            // JS:       expect(await promise.map(_ => counter.increment(456))).toBe(undefined);
+            let mapped = promise
+                .as_stub()
+                .map({
+                    let counter = counter.clone();
+                    move |_| {
+                        Ok(CapnwebValue::RpcPromise(counter.call(
+                            vec!["increment".to_owned()],
+                            one_number_argument(456.0),
+                        )))
+                    }
+                })
+                .unwrap();
+            assert!(matches!(
+                mapped.pull().await.unwrap(),
+                CapnwebValue::Undefined
+            ));
+            // JS:     }
+        }
+        // JS:
+        // JS:     {
+        {
+            // JS:       using promise = stub.returnNumber(2);
+            let promise = stub.call(vec!["returnNumber".to_owned()], one_number_argument(2.0));
+            // JS:       expect(await promise.map(i => counter.increment(i))).toBe(2);
+            let mapped = promise
+                .as_stub()
+                .map({
+                    let counter = counter.clone();
+                    move |i| {
+                        Ok(CapnwebValue::RpcPromise(counter.call(
+                            vec!["increment".to_owned()],
+                            RpcPayload::from_app_params(CapnwebValue::Array(vec![
+                                CapnwebValue::RpcPromise(i),
+                            ])),
+                        )))
+                    }
+                })
+                .unwrap();
+            assert!(matches!(
+                mapped.pull().await.unwrap(),
+                CapnwebValue::Number(2.0)
+            ));
+            // JS:     }
+        }
+        // JS:
+        // JS:     {
+        {
+            // JS:       using promise = stub.returnNumber(4);
+            let promise = stub.call(vec!["returnNumber".to_owned()], one_number_argument(4.0));
+            // JS:       expect(await promise.map(i => counter.increment(i))).toBe(6);
+            let mapped = promise
+                .as_stub()
+                .map({
+                    let counter = counter.clone();
+                    move |i| {
+                        Ok(CapnwebValue::RpcPromise(counter.call(
+                            vec!["increment".to_owned()],
+                            RpcPayload::from_app_params(CapnwebValue::Array(vec![
+                                CapnwebValue::RpcPromise(i),
+                            ])),
+                        )))
+                    }
+                })
+                .unwrap();
+            assert!(matches!(
+                mapped.pull().await.unwrap(),
+                CapnwebValue::Number(6.0)
+            ));
+            // JS:     }
+        }
+        // JS:   });
+    }
+    // JS:
+    // JS:   it("supports map() on arrays", async () => {
+    #[tokio::test(flavor = "current_thread")]
+    async fn supports_map_on_arrays() {
+        // JS:     let outerCounter = new RpcStub(new Counter(0));
+        let outer_counter = local_counter(0.0);
+        // JS:     let stub = new RpcStub(new TestTarget());
+        let stub = local_test_stub();
+        // JS:
+        // JS:     using fib = stub.generateFibonacci(6);
+        let fib = stub.call(
+            vec!["generateFibonacci".to_owned()],
+            one_number_argument(6.0),
+        );
+        // JS:     using counters = await fib.map(i => {
+        let counters = fib
+            .as_stub()
+            .map({
+                let stub = stub.clone();
+                let outer_counter = outer_counter.clone();
+                move |i| {
+                    // JS:       let counter = stub.makeCounter(i);
+                    let counter = stub.call(
+                        vec!["makeCounter".to_owned()],
+                        RpcPayload::from_app_params(CapnwebValue::Array(vec![
+                            CapnwebValue::RpcPromise(i),
+                        ])),
+                    );
+                    // JS:       let val = counter.increment(3);
+                    let val = counter.call(vec!["increment".to_owned()], one_number_argument(3.0));
+                    // JS:       outerCounter.increment();
+                    let _ = outer_counter.call(
+                        vec!["increment".to_owned()],
+                        RpcPayload::from_app_params(CapnwebValue::Array(vec![])),
+                    );
+                    // JS:       return {counter, val};
+                    Ok(object_value([
+                        ("counter", CapnwebValue::RpcPromise(counter)),
+                        ("val", CapnwebValue::RpcPromise(val)),
+                    ]))
+                    // JS:     });
+                }
+            })
+            .unwrap()
+            .pull()
+            .await
+            .unwrap();
+        // JS:
+        // JS:     expect(counters.map(x => x.val)).toStrictEqual([3, 4, 4, 5, 6, 8]);
+        let CapnwebValue::Array(counters) = counters else {
+            panic!()
+        };
+        let values = counters
+            .iter()
+            .map(|counter| {
+                let CapnwebValue::Object(counter) = counter else {
+                    panic!()
+                };
+                let CapnwebValue::Number(value) = counter["val"] else {
+                    panic!()
+                };
+                value
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(values, [3.0, 4.0, 4.0, 5.0, 6.0, 8.0]);
+        // JS:
+        // JS:     expect(await Promise.all(counters.map(x => x.counter.value)))
+        let mut counter_values = Vec::new();
+        for counter in &counters {
+            let CapnwebValue::Object(counter) = counter else {
+                panic!()
+            };
+            let stub = RpcStub::from_value(counter["counter"].clone());
+            let CapnwebValue::Number(value) =
+                stub.get(vec!["value".to_owned()]).pull().await.unwrap()
+            else {
+                panic!()
+            };
+            counter_values.push(value);
+        }
+        // JS:         .toStrictEqual([3, 4, 4, 5, 6, 8]);
+        assert_eq!(counter_values, [3.0, 4.0, 4.0, 5.0, 6.0, 8.0]);
+        // JS:
+        // JS:     expect(await outerCounter.value).toBe(6);
+        assert!(matches!(
+            outer_counter
+                .get(vec!["value".to_owned()])
+                .pull()
+                .await
+                .unwrap(),
+            CapnwebValue::Number(6.0)
+        ));
+        // JS:   });
+    }
+    // JS:
+    // JS:   it("supports nested map()", async () => {
+    #[tokio::test(flavor = "current_thread")]
+    async fn supports_nested_map() {
+        // JS:     let stub = new RpcStub(new TestTarget());
+        let stub = local_test_stub();
+        // JS:
+        // JS:     let fib = stub.generateFibonacci(7);
+        let fib = stub.call(
+            vec!["generateFibonacci".to_owned()],
+            one_number_argument(7.0),
+        );
+        // JS:     let result = await fib.map(i => {
+        let result = fib
+            .as_stub()
+            .map({
+                let stub = stub.clone();
+                move |i| {
+                    // JS:       return stub.generateFibonacci(i).map(j => {
+                    let inner = stub.call(
+                        vec!["generateFibonacci".to_owned()],
+                        RpcPayload::from_app_params(CapnwebValue::Array(vec![
+                            CapnwebValue::RpcPromise(i),
+                        ])),
+                    );
+                    let nested = inner.as_stub().map({
+                        let stub = stub.clone();
+                        move |j| {
+                            // JS:         return stub.generateFibonacci(j);
+                            Ok(CapnwebValue::RpcPromise(stub.call(
+                                vec!["generateFibonacci".to_owned()],
+                                RpcPayload::from_app_params(CapnwebValue::Array(vec![
+                                    CapnwebValue::RpcPromise(j),
+                                ])),
+                            )))
+                            // JS:       });
+                        }
+                    })?;
+                    Ok(CapnwebValue::RpcPromise(nested))
+                    // JS:     });
+                }
+            })
+            .unwrap()
+            .pull()
+            .await
+            .unwrap();
+        // JS:
+        // JS:     expect(result).toStrictEqual([
+        let expected = CapnwebValue::Array(vec![
+            // JS:       [],
+            number_arrays(&[]),
+            // JS:       [[]],
+            CapnwebValue::Array(vec![number_arrays(&[])]),
+            // JS:       [[]],
+            CapnwebValue::Array(vec![number_arrays(&[])]),
+            // JS:       [[], [0]],
+            CapnwebValue::Array(vec![number_arrays(&[]), number_arrays(&[0.0])]),
+            // JS:       [[], [0], [0]],
+            CapnwebValue::Array(vec![
+                number_arrays(&[]),
+                number_arrays(&[0.0]),
+                number_arrays(&[0.0]),
+            ]),
+            // JS:       [[], [0], [0], [0, 1], [0, 1, 1]],
+            CapnwebValue::Array(vec![
+                number_arrays(&[]),
+                number_arrays(&[0.0]),
+                number_arrays(&[0.0]),
+                number_arrays(&[0.0, 1.0]),
+                number_arrays(&[0.0, 1.0, 1.0]),
+            ]),
+            // JS:       [[], [0], [0], [0, 1], [0, 1, 1], [0, 1, 1, 2, 3], [0, 1, 1, 2, 3, 5, 8, 13],
+            CapnwebValue::Array(vec![
+                number_arrays(&[]),
+                number_arrays(&[0.0]),
+                number_arrays(&[0.0]),
+                number_arrays(&[0.0, 1.0]),
+                number_arrays(&[0.0, 1.0, 1.0]),
+                number_arrays(&[0.0, 1.0, 1.0, 2.0, 3.0]),
+                number_arrays(&[0.0, 1.0, 1.0, 2.0, 3.0, 5.0, 8.0, 13.0]),
+                // JS:           [0, 1, 1, 2, 3, 5, 8, 13, 21, 34, 55, 89, 144]],
+                number_arrays(&[
+                    0.0, 1.0, 1.0, 2.0, 3.0, 5.0, 8.0, 13.0, 21.0, 34.0, 55.0, 89.0, 144.0,
+                ]),
+            ]),
+            // JS:     ]);
+        ]);
+        assert!(values_equal(&result, &expected));
+        // JS:   });
+    }
+    // JS:
+    // JS:   it("overrides toString() to at least specify the type", async () => {
+    #[test]
+    fn overrides_to_string_to_at_least_specify_the_type() {
+        // JS:     let stub = new RpcStub(new TestTarget());
+        let stub = local_test_stub();
+        // JS:     expect(stub.toString()).toBe("[object RpcStub]");
+        assert_eq!(stub.to_string(), "[object RpcStub]");
+        // JS:     let promise = stub.square(3);
+        let promise = stub.call(vec!["square".to_owned()], one_number_argument(3.0));
+        // JS:     expect(promise.toString()).toBe("[object RpcPromise]");
+        assert_eq!(promise.to_string(), "[object RpcPromise]");
+        // JS:   });
+    }
+    // JS: });
+}
 // JS:
 // JS: describe("stub disposal", () => {
 // JS:   it("disposes nested stubs and RpcTargets when wrapping an object", () => {
