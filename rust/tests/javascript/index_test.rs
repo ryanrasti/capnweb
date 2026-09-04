@@ -21,7 +21,9 @@ use crate::core::{
 use crate::serialize::{deserialize, serialize, swap_byte_order};
 use num_bigint::BigInt;
 use std::collections::BTreeMap;
+use std::mem::ManuallyDrop;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 // JS:
 // JS: let SERIALIZE_TEST_CASES: Record<string, unknown> = {
 fn serialize_test_cases() -> Vec<(&'static str, CapnwebValue)> {
@@ -2386,96 +2388,216 @@ mod local_stub {
     // JS: });
 }
 // JS:
+struct DisposableLocalTarget(Arc<AtomicBool>);
+
+impl Drop for DisposableLocalTarget {
+    fn drop(&mut self) {
+        self.0.store(true, Ordering::SeqCst);
+    }
+}
+
+impl RpcTargetInner for DisposableLocalTarget {
+    fn call(self: Arc<Self>, path: PropertyPath, _args: RpcPayload) -> Result<StubHook> {
+        Err(Error::Type(format!("No such RPC method: {path:?}")))
+    }
+
+    fn get(self: Arc<Self>, path: PropertyPath) -> Result<StubHook> {
+        Err(Error::Type(format!("No such RPC property: {path:?}")))
+    }
+}
+
+struct TargetOwningStub {
+    disposed: Arc<AtomicBool>,
+    inner: ManuallyDrop<RpcStub>,
+}
+
+impl Drop for TargetOwningStub {
+    fn drop(&mut self) {
+        self.disposed.store(true, Ordering::SeqCst);
+        // JavaScript's explicit target disposer does not recursively dispose instance fields.
+    }
+}
+
+impl RpcTargetInner for TargetOwningStub {
+    fn call(self: Arc<Self>, path: PropertyPath, _args: RpcPayload) -> Result<StubHook> {
+        Err(Error::Type(format!("No such RPC method: {path:?}")))
+    }
+
+    fn get(self: Arc<Self>, path: PropertyPath) -> Result<StubHook> {
+        Err(Error::Type(format!("No such RPC property: {path:?}")))
+    }
+}
+
 // JS: describe("stub disposal", () => {
-// JS:   it("disposes nested stubs and RpcTargets when wrapping an object", () => {
-// JS:     class DisposableTarget extends RpcTarget {
-// JS:       constructor(private disposeFlag: { value: boolean }) {
-// JS:         super();
-// JS:       }
-// JS:       [Symbol.dispose]() { this.disposeFlag.value = true; }
-// JS:     }
-// JS:
-// JS:     let innerFlag = { value: false };
-// JS:     let anotherFlag = { value: false };
-// JS:     let innerStub = new RpcStub(new DisposableTarget(innerFlag));
-// JS:
-// JS:     let outerObject = {
-// JS:       stub: innerStub,
-// JS:       target: new DisposableTarget(anotherFlag),
-// JS:       value: 42
-// JS:     };
-// JS:     let outerStub = new RpcStub(outerObject);
-// JS:
-// JS:     outerStub[Symbol.dispose]();
-// JS:
-// JS:     expect(innerFlag.value).toBe(true);
-// JS:     expect(anotherFlag.value).toBe(true);
-// JS:   });
-// JS:
-// JS:   it("only calls RpcTarget disposer when wrapping an RpcTarget with nested stubs", () => {
-// JS:     let targetDisposed = false;
-// JS:     let innerTargetDisposed = false;
-// JS:
-// JS:     class InnerTarget extends RpcTarget {
-// JS:       [Symbol.dispose]() { innerTargetDisposed = true; }
-// JS:     }
-// JS:
-// JS:     class TargetWithStubs extends RpcTarget {
-// JS:       inner = new RpcStub(new InnerTarget());
-// JS:
-// JS:       get innerStub() {
-// JS:         return this.inner;
-// JS:       }
-// JS:
-// JS:       [Symbol.dispose]() { targetDisposed = true; }
-// JS:     }
-// JS:
-// JS:     let outerStub = new RpcStub(new TargetWithStubs());
-// JS:     outerStub[Symbol.dispose]();
-// JS:
-// JS:     expect(targetDisposed).toBe(true);
-// JS:     expect(innerTargetDisposed).toBe(false); // nested stubs in RpcTarget are not auto-disposed
-// JS:   });
-// JS:
-// JS:   it("only disposes RpcTarget when all dups are disposed", () => {
-// JS:     let disposed = false;
-// JS:     class DisposableTarget extends RpcTarget {
-// JS:       [Symbol.dispose]() { disposed = true; }
-// JS:     }
-// JS:
-// JS:     let original = new RpcStub(new DisposableTarget());
-// JS:     let dup1 = original.dup();
-// JS:     let dup2 = original.dup();
-// JS:
-// JS:     original[Symbol.dispose]();
-// JS:     expect(disposed).toBe(false);
-// JS:
-// JS:     dup1[Symbol.dispose]();
-// JS:     expect(disposed).toBe(false);
-// JS:
-// JS:     dup2[Symbol.dispose]();
-// JS:     expect(disposed).toBe(true);
-// JS:   });
-// JS:
-// JS:   it("makes disposal idempotent - duplicate dispose calls don't affect refcount", () => {
-// JS:     let disposed = false;
-// JS:     class DisposableTarget extends RpcTarget {
-// JS:       [Symbol.dispose]() { disposed = true; }
-// JS:     }
-// JS:
-// JS:     let original = new RpcStub(new DisposableTarget());
-// JS:     let dup1 = original.dup();
-// JS:
-// JS:     // Dispose the duplicate twice
-// JS:     dup1[Symbol.dispose]();
-// JS:     dup1[Symbol.dispose]();
-// JS:     expect(disposed).toBe(false);
-// JS:
-// JS:     // Only when original is also disposed should the target be disposed
-// JS:     original[Symbol.dispose]();
-// JS:     expect(disposed).toBe(true);
-// JS:   });
-// JS: });
+mod stub_disposal {
+    use super::*;
+    // JS:   it("disposes nested stubs and RpcTargets when wrapping an object", () => {
+    #[test]
+    fn disposes_nested_stubs_and_targets_when_wrapping_an_object() {
+        // JS:     class DisposableTarget extends RpcTarget {
+        // `DisposableLocalTarget` is the Rust target.
+        // JS:       constructor(private disposeFlag: { value: boolean }) {
+        // Its constructor stores an `Arc<AtomicBool>`.
+        // JS:         super();
+        // Rust has no target superclass.
+        // JS:       }
+        // JS:       [Symbol.dispose]() { this.disposeFlag.value = true; }
+        // Implemented by `DisposableLocalTarget::drop()`.
+        // JS:     }
+        // JS:
+        // JS:     let innerFlag = { value: false };
+        let inner_flag = Arc::new(AtomicBool::new(false));
+        // JS:     let anotherFlag = { value: false };
+        let another_flag = Arc::new(AtomicBool::new(false));
+        // JS:     let innerStub = new RpcStub(new DisposableTarget(innerFlag));
+        let inner_stub = RpcStub::from_value(CapnwebValue::Target(Arc::new(
+            DisposableLocalTarget(inner_flag.clone()),
+        )));
+        // JS:
+        // JS:     let outerObject = {
+        let outer_object = object_value([
+            // JS:       stub: innerStub,
+            ("stub", CapnwebValue::Stub(inner_stub)),
+            // JS:       target: new DisposableTarget(anotherFlag),
+            (
+                "target",
+                CapnwebValue::Target(Arc::new(DisposableLocalTarget(another_flag.clone()))),
+            ),
+            // JS:       value: 42
+            ("value", CapnwebValue::Number(42.0)),
+            // JS:     };
+        ]);
+        // JS:     let outerStub = new RpcStub(outerObject);
+        let outer_stub = RpcStub::from_value(outer_object);
+        // JS:
+        // JS:     outerStub[Symbol.dispose]();
+        drop(outer_stub);
+        // JS:
+        // JS:     expect(innerFlag.value).toBe(true);
+        assert!(inner_flag.load(Ordering::SeqCst));
+        // JS:     expect(anotherFlag.value).toBe(true);
+        assert!(another_flag.load(Ordering::SeqCst));
+        // JS:   });
+    }
+    // JS:
+    // JS:   it("only calls RpcTarget disposer when wrapping an RpcTarget with nested stubs", () => {
+    #[test]
+    fn only_calls_target_drop_when_target_owns_nested_stubs() {
+        // JS:     let targetDisposed = false;
+        let target_disposed = Arc::new(AtomicBool::new(false));
+        // JS:     let innerTargetDisposed = false;
+        let inner_target_disposed = Arc::new(AtomicBool::new(false));
+        // JS:
+        // JS:     class InnerTarget extends RpcTarget {
+        // `DisposableLocalTarget` is used below.
+        // JS:       [Symbol.dispose]() { innerTargetDisposed = true; }
+        // Implemented by `DisposableLocalTarget::drop()`.
+        // JS:     }
+        // JS:
+        // JS:     class TargetWithStubs extends RpcTarget {
+        // `TargetOwningStub` is the Rust target.
+        // JS:       inner = new RpcStub(new InnerTarget());
+        let inner = RpcStub::from_value(CapnwebValue::Target(Arc::new(DisposableLocalTarget(
+            inner_target_disposed.clone(),
+        ))));
+        // JS:
+        // JS:       get innerStub() {
+        // Implemented by `TargetOwningStub::get()`.
+        // JS:         return this.inner;
+        // The inner hook is borrowed without transferring ownership.
+        // JS:       }
+        // JS:
+        // JS:       [Symbol.dispose]() { targetDisposed = true; }
+        // Implemented by `TargetOwningStub::drop()`.
+        // JS:     }
+        // JS:
+        // JS:     let outerStub = new RpcStub(new TargetWithStubs());
+        let outer_stub = RpcStub::from_value(CapnwebValue::Target(Arc::new(TargetOwningStub {
+            disposed: target_disposed.clone(),
+            inner: ManuallyDrop::new(inner),
+        })));
+        // JS:     outerStub[Symbol.dispose]();
+        drop(outer_stub);
+        // JS:
+        // JS:     expect(targetDisposed).toBe(true);
+        assert!(target_disposed.load(Ordering::SeqCst));
+        // JS:     expect(innerTargetDisposed).toBe(false); // nested stubs in RpcTarget are not auto-disposed
+        assert!(!inner_target_disposed.load(Ordering::SeqCst));
+        // JS:   });
+    }
+    // JS:
+    // JS:   it("only disposes RpcTarget when all dups are disposed", () => {
+    #[test]
+    fn only_disposes_target_when_all_clones_are_dropped() {
+        // JS:     let disposed = false;
+        let disposed = Arc::new(AtomicBool::new(false));
+        // JS:     class DisposableTarget extends RpcTarget {
+        // `DisposableLocalTarget` is used below.
+        // JS:       [Symbol.dispose]() { disposed = true; }
+        // Implemented by `Drop`.
+        // JS:     }
+        // JS:
+        // JS:     let original = new RpcStub(new DisposableTarget());
+        let original = RpcStub::from_value(CapnwebValue::Target(Arc::new(DisposableLocalTarget(
+            disposed.clone(),
+        ))));
+        // JS:     let dup1 = original.dup();
+        let dup1 = original.clone();
+        // JS:     let dup2 = original.dup();
+        let dup2 = original.clone();
+        // JS:
+        // JS:     original[Symbol.dispose]();
+        drop(original);
+        // JS:     expect(disposed).toBe(false);
+        assert!(!disposed.load(Ordering::SeqCst));
+        // JS:
+        // JS:     dup1[Symbol.dispose]();
+        drop(dup1);
+        // JS:     expect(disposed).toBe(false);
+        assert!(!disposed.load(Ordering::SeqCst));
+        // JS:
+        // JS:     dup2[Symbol.dispose]();
+        drop(dup2);
+        // JS:     expect(disposed).toBe(true);
+        assert!(disposed.load(Ordering::SeqCst));
+        // JS:   });
+    }
+    // JS:
+    // JS:   it("makes disposal idempotent - duplicate dispose calls don't affect refcount", () => {
+    #[test]
+    fn ownership_makes_duplicate_drop_unrepresentable() {
+        // JS:     let disposed = false;
+        let disposed = Arc::new(AtomicBool::new(false));
+        // JS:     class DisposableTarget extends RpcTarget {
+        // `DisposableLocalTarget` is used below.
+        // JS:       [Symbol.dispose]() { disposed = true; }
+        // Implemented by `Drop`.
+        // JS:     }
+        // JS:
+        // JS:     let original = new RpcStub(new DisposableTarget());
+        let original = RpcStub::from_value(CapnwebValue::Target(Arc::new(DisposableLocalTarget(
+            disposed.clone(),
+        ))));
+        // JS:     let dup1 = original.dup();
+        let dup1 = original.clone();
+        // JS:
+        // JS:     // Dispose the duplicate twice
+        // JS:     dup1[Symbol.dispose]();
+        drop(dup1);
+        // JS:     dup1[Symbol.dispose]();
+        // Rust move semantics make a second `drop(dup1)` a compile-time error.
+        // JS:     expect(disposed).toBe(false);
+        assert!(!disposed.load(Ordering::SeqCst));
+        // JS:
+        // JS:     // Only when original is also disposed should the target be disposed
+        // JS:     original[Symbol.dispose]();
+        drop(original);
+        // JS:     expect(disposed).toBe(true);
+        assert!(disposed.load(Ordering::SeqCst));
+        // JS:   });
+    }
+    // JS: });
+}
 // JS:
 // JS: describe("basic rpc", () => {
 // JS:   it("supports calls", async () => {
