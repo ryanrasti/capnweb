@@ -26,6 +26,9 @@ pub enum Error {
     /// A value did not have the required type.
     #[error("{0}")]
     Type(String),
+    /// A rich application error received from or prepared for the wire.
+    #[error("{name}: {message}", name = .0.name, message = .0.message)]
+    Serialized(CapnwebError),
     /// A deliberately deferred JavaScript built-in was requested.
     #[error("JavaScript built-in `{0}` is not supported by the Rust runtime")]
     UnsupportedBuiltin(&'static str),
@@ -49,6 +52,9 @@ pub struct CapnwebError {
 
 impl From<Error> for CapnwebError {
     fn from(error: Error) -> Self {
+        if let Error::Serialized(error) = error {
+            return error;
+        }
         let name = if matches!(error, Error::Type(_)) {
             "TypeError"
         } else {
@@ -94,6 +100,8 @@ pub enum CapnwebValue {
     Target(Arc<dyn RpcTargetInner>),
     /// A serialized application error.
     Error(CapnwebError),
+    /// A hydrated host value which cannot be represented on the wire.
+    Unsupported(String),
 }
 
 impl std::fmt::Debug for CapnwebValue {
@@ -113,6 +121,7 @@ impl std::fmt::Debug for CapnwebValue {
             Self::RpcPromise(_) => formatter.write_str("RpcPromise(..)"),
             Self::Target(_) => formatter.write_str("Target(..)"),
             Self::Error(value) => formatter.debug_tuple("Error").field(value).finish(),
+            Self::Unsupported(value) => formatter.debug_tuple("Unsupported").field(value).finish(),
         }
     }
 }
@@ -530,6 +539,7 @@ pub(crate) fn type_for_rpc(value: &CapnwebValue) -> TypeForRpc {
         // JS:       if (value instanceof Error) {
         // JS:         return "error";
         CapnwebValue::Error(_) => TypeForRpc::Error,
+        CapnwebValue::Unsupported(_) => TypeForRpc::Unsupported,
         // JS:       }
         // JS:
 
@@ -1134,6 +1144,8 @@ impl RpcStub {
     /// Constructs a stub which adopts an application value.
     pub fn from_value(value: CapnwebValue) -> Self {
         let hook = match value {
+            CapnwebValue::Stub(stub) => return stub,
+            CapnwebValue::RpcPromise(promise) => return promise.stub,
             CapnwebValue::Target(target) => TargetStubHook::create(target, false),
             CapnwebValue::Function(target) => TargetStubHook::create(target, true),
             value => Arc::new(PayloadStubHook::new(RpcPayload::from_app_return(value))),
@@ -1956,7 +1968,8 @@ impl RpcPayload {
             | CapnwebValue::String(_)
             | CapnwebValue::BigInt(_)
             | CapnwebValue::Bytes(_)
-            | CapnwebValue::Error(_) => value.clone(),
+            | CapnwebValue::Error(_)
+            | CapnwebValue::Unsupported(_) => value.clone(),
             // JS:
             // JS:       case "array": {
             // JS:         // We have to construct the new array first, then fill it in, so we can pass it as the
@@ -2619,15 +2632,18 @@ impl RpcPayload {
             CapnwebValue::Stub(stub) => stub.hook.ignore_unhandled_rejections(),
             CapnwebValue::RpcPromise(promise) => promise.stub.hook.ignore_unhandled_rejections(),
             // JS:         return;
-            // JS:
-            // JS:       case "rpc-thenable":
-            // JS:         (<any>value).then((_: any) => {}, (_: any) => {});
-            // JS:         return;
-            // JS:
-            // JS:       default:
-            // JS:         kind satisfies never;
-            // JS:         return;
-            // JS:     }
+            CapnwebValue::Unsupported(_) => {
+                let _unsupported_value_has_no_rejection = ();
+            } // Unsupported values contain no promises.
+              // JS:
+              // JS:       case "rpc-thenable":
+              // JS:         (<any>value).then((_: any) => {}, (_: any) => {});
+              // JS:         return;
+              // JS:
+              // JS:       default:
+              // JS:         kind satisfies never;
+              // JS:         return;
+              // JS:     }
         }
         // JS:   }
     }

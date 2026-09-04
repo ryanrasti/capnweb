@@ -174,7 +174,7 @@ fn wire_integer(value: &CapnwebValue) -> Option<i64> {
 
 fn value_to_error(value: CapnwebValue) -> Error {
     match value {
-        CapnwebValue::Error(error) => Error::Message(format!("{}: {}", error.name, error.message)),
+        CapnwebValue::Error(error) => Error::Serialized(error),
         CapnwebValue::String(message) => Error::Message(message),
         value => Error::Message(format!("RPC rejection: {value:?}")),
     }
@@ -299,7 +299,8 @@ fn estimate_encoded_size(value: &CapnwebValue, depth: usize) -> usize {
         CapnwebValue::Stub(_)
         | CapnwebValue::RpcPromise(_)
         | CapnwebValue::Target(_)
-        | CapnwebValue::Function(_) => 16,
+        | CapnwebValue::Function(_)
+        | CapnwebValue::Unsupported(_) => 16,
         // JS:   }
     }
     // JS: }

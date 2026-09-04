@@ -467,6 +467,9 @@ impl<'a> Devaluator<'a> {
                 Ok(wire_tag("inf", Vec::new()))
             }
             CapnwebValue::Number(_) => Ok(wire_tag("-inf", Vec::new())),
+            CapnwebValue::Unsupported(description) => Err(Error::Type(format!(
+                "Cannot serialize value: {description}"
+            ))),
             // JS:
             // JS:       case "object": {
             // JS:         let object = <Record<string, unknown>>value;
@@ -1088,7 +1091,8 @@ pub(crate) fn capnweb_to_json(value: &CapnwebValue) -> Result<serde_json::Value>
         | CapnwebValue::Stub(_)
         | CapnwebValue::RpcPromise(_)
         | CapnwebValue::Target(_)
-        | CapnwebValue::Error(_) => Err(Error::Type(
+        | CapnwebValue::Error(_)
+        | CapnwebValue::Unsupported(_) => Err(Error::Type(
             "devalued string-level tree contains a non-JSON value".to_owned(),
         )),
     }
@@ -1994,7 +1998,8 @@ impl<'a> Evaluator<'a> {
             | CapnwebValue::Stub(_)
             | CapnwebValue::RpcPromise(_)
             | CapnwebValue::Target(_)
-            | CapnwebValue::Error(_) => Err(Error::Type(
+            | CapnwebValue::Error(_)
+            | CapnwebValue::Unsupported(_) => Err(Error::Type(
                 "encoded input contains an unsupported native value".to_owned(),
             )),
             // JS:     }
