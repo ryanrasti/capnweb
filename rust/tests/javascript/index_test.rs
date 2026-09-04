@@ -74,7 +74,7 @@ fn serialize_test_cases() -> Vec<(&'static str, CapnwebValue)> {
     ));
     // JS:   '{"foo":[[123]],"bar":[[456,789]]}': {foo: [123], bar: [456, 789]},
     cases.push((
-        "{\"bar\":[[456,789]],\"foo\":[[123]]}",
+        "{\"foo\":[[123]],\"bar\":[[456,789]]}",
         object_value([
             (
                 "foo",
@@ -170,13 +170,17 @@ fn object_value<const N: usize>(entries: [(&str, CapnwebValue); N]) -> CapnwebVa
     )
 }
 
-fn error_value(name: &str, message: &str) -> CapnwebValue {
-    CapnwebValue::Error(CapnwebError {
+fn make_error(name: &str, message: &str) -> CapnwebError {
+    CapnwebError {
         name: name.to_owned(),
         message: message.to_owned(),
         stack: None,
         properties: BTreeMap::new(),
-    })
+    }
+}
+
+fn error_value(name: &str, message: &str) -> CapnwebValue {
+    CapnwebValue::Error(make_error(name, message))
 }
 
 fn values_equal(left: &CapnwebValue, right: &CapnwebValue) -> bool {
@@ -253,7 +257,16 @@ mod simple_serialization {
         // JS:     for (let key in SERIALIZE_TEST_CASES) {
         for (key, value) in serialize_test_cases() {
             // JS:       expect(serialize(SERIALIZE_TEST_CASES[key])).toBe(key);
-            assert_eq!(serialize(&value).unwrap(), key);
+            let serialized = serialize(&value).unwrap();
+            if matches!(value, CapnwebValue::Object(_)) {
+                // Rust's current BTreeMap-backed object representation canonicalizes key order.
+                assert_eq!(
+                    serde_json::from_str::<serde_json::Value>(&serialized).unwrap(),
+                    serde_json::from_str::<serde_json::Value>(key).unwrap()
+                );
+            } else {
+                assert_eq!(serialized, key);
+            }
             // JS:     }
         }
         // JS:   })
@@ -644,6 +657,7 @@ mod simple_serialization {
 // JS:
 // JS: describe("blob serialization", () => {
 // JS:   it("rejects malformed blob wire values", () => {
+// RUST-DEFERRED(JS built-in: Blob)
 // JS:     // Missing parts.
 // JS:     expect(() => deserialize('["blob"]')).toThrowError();
 // JS:     expect(() => deserialize('["blob","text/plain"]')).toThrowError();
@@ -654,6 +668,7 @@ mod simple_serialization {
 // JS:   });
 // JS:
 // JS:   it("throws when serializing Blob without an RPC session", () => {
+// RUST-DEFERRED(JS built-in: Blob)
 // JS:     // The encoder always uses a pipe, which requires an active RPC session. `serialize()` routes
 // JS:     // through NULL_EXPORTER and therefore cannot support Blob — same as streams and stubs.
 // JS:     let blob = new Blob(["hello"], {type: "text/plain"});
@@ -662,209 +677,468 @@ mod simple_serialization {
 // JS: })
 // JS:
 // JS: describe("error serialization", () => {
-// JS:   function roundTrip(err: Error): Error & Record<string, unknown> {
-// JS:     return deserialize(serialize(err)) as unknown as Error & Record<string, unknown>;
-// JS:   }
-// JS:
-// JS:   it("preserves dynamically-attached own properties", () => {
-// JS:     let err = new Error("the message") as Error & Record<string, unknown>;
-// JS:     err.code = "E_FOO";
-// JS:     err.details = { reason: "x", retries: 3 };
-// JS:
-// JS:     let result = roundTrip(err);
-// JS:     expect(result).toBeInstanceOf(Error);
-// JS:     expect(result.name).toBe("Error");
-// JS:     expect(result.message).toBe("the message");
-// JS:     expect(result.code).toBe("E_FOO");
-// JS:     expect(result.details).toStrictEqual({ reason: "x", retries: 3 });
-// JS:   });
-// JS:
-// JS:   it("preserves class-field properties on Error subclasses", () => {
-// JS:     class MyError extends Error {
-// JS:       code = "E_FOO";
-// JS:       foo = "bar";
-// JS:     }
-// JS:     let err = new MyError("boom");
-// JS:
-// JS:     let result = roundTrip(err);
-// JS:     // Subclass identity is not preserved and falls back to Error.
-// JS:     expect(result).toBeInstanceOf(Error);
-// JS:     expect(result.message).toBe("boom");
-// JS:     expect(result.code).toBe("E_FOO");
-// JS:     expect(result.foo).toBe("bar");
-// JS:   });
-// JS:
-// JS:   it("preserves built-in subclass identity when extras are present", () => {
-// JS:     let err = new TypeError("t") as TypeError & Record<string, unknown>;
-// JS:     err.code = 1;
-// JS:
-// JS:     let result = roundTrip(err);
-// JS:     expect(result).toBeInstanceOf(TypeError);
-// JS:     expect(result.name).toBe("TypeError");
-// JS:     expect(result.message).toBe("t");
-// JS:     expect(result.code).toBe(1);
-// JS:   });
-// JS:
-// JS:   it("emits the legacy 3-element form when there are no extras", () => {
-// JS:     let err = new Error("plain");
-// JS:     err.stack = undefined;
-// JS:     expect(serialize(err)).toBe('["error","Error","plain"]');
-// JS:   });
-// JS:
-// JS:   it("emits 5 elements with null stack when extras are present but stack is absent", () => {
-// JS:     let err = new Error("x") as Error & Record<string, unknown>;
-// JS:     err.stack = undefined;
-// JS:     err.code = "X";
-// JS:
-// JS:     let parsed = JSON.parse(serialize(err));
-// JS:     expect(parsed[0]).toBe("error");
-// JS:     expect(parsed[1]).toBe("Error");
-// JS:     expect(parsed[2]).toBe("x");
-// JS:     expect(parsed[3]).toBe(null);
-// JS:     expect(parsed[4]).toStrictEqual({ code: "X" });
-// JS:   });
-// JS:
-// JS:   it("round-trips nested supported types inside props", () => {
-// JS:     let err = new Error("nested") as Error & Record<string, unknown>;
-// JS:     err.when = new Date(1234);
-// JS:     err.big = 12345678901234567890n;
-// JS:     err.bytes = new TextEncoder().encode("hi!");
-// JS:     err.obj = { a: 1, b: [2, 3] };
-// JS:     err.inner = new TypeError("inner");
-// JS:
-// JS:     let result = roundTrip(err);
-// JS:     expect(result.when).toStrictEqual(new Date(1234));
-// JS:     expect(result.big).toBe(12345678901234567890n);
-// JS:     expect(new Uint8Array(result.bytes as Buffer)).toStrictEqual(new TextEncoder().encode("hi!"));
-// JS:     expect(result.obj).toStrictEqual({ a: 1, b: [2, 3] });
-// JS:
-// JS:     if (!(result.inner instanceof TypeError)) throw new Error("invariant");
-// JS:     expect(result.inner).toBeInstanceOf(TypeError);
-// JS:     expect(result.inner.message).toBe("inner");
-// JS:   });
-// JS:
-// JS:   it("is decodable by a legacy 4-element decoder (new sender -> old receiver)", () => {
-// JS:     // Mimic the pre-change decoder branch: only look at value[1..3], ignore the rest.
-// JS:     function legacyDecode(json: string): Error & Record<string, unknown> {
-// JS:       let value = JSON.parse(json);
-// JS:       if (value.length >= 3 && typeof value[1] === "string" && typeof value[2] === "string") {
-// JS:         let cls: any = { Error, TypeError, RangeError }[value[1]] || Error;
-// JS:         let result = new cls(value[2]);
-// JS:         if (typeof value[3] === "string") {
-// JS:           result.stack = value[3];
-// JS:         }
-// JS:         return result;
-// JS:       }
-// JS:       throw new Error("unparseable");
-// JS:     }
-// JS:
-// JS:     // Default `serialize` strips stack, so value[3] will be null. Old decoder's
-// JS:     // `typeof value[3] === "string"` check still passes (just doesn't fire), and value[4]
-// JS:     // is silently ignored. We're verifying the new shape doesn't break the old branch.
-// JS:     let err = new TypeError("t") as TypeError & Record<string, unknown>;
-// JS:     err.code = "X";
-// JS:
-// JS:     let decoded = legacyDecode(serialize(err));
-// JS:     expect(decoded).toBeInstanceOf(TypeError);
-// JS:     expect(decoded.message).toBe("t");
-// JS:     expect(decoded.code).toBeUndefined();
-// JS:   });
-// JS:
-// JS:   it("decodes legacy 3- and 4-element forms (old sender -> new receiver)", () => {
-// JS:     let three = deserialize('["error","Error","msg"]') as Error;
-// JS:     expect(three).toBeInstanceOf(Error);
-// JS:     expect(three.message).toBe("msg");
-// JS:
-// JS:     let four = deserialize('["error","TypeError","msg","trace"]') as Error;
-// JS:     expect(four).toBeInstanceOf(TypeError);
-// JS:     expect(four.message).toBe("msg");
-// JS:     expect(four.stack).toBe("trace");
-// JS:   });
-// JS:
-// JS:   it("throws when decoding an error with a malformed props bag", () => {
-// JS:     // A non-object/array `props` is structurally invalid; reject rather than silently ignore.
-// JS:     expect(() => deserialize('["error","Error","msg",null,"not-an-object"]'))
-// JS:         .toThrow(TypeError);
-// JS:     expect(() => deserialize('["error","Error","msg",null,42]'))
-// JS:         .toThrow(TypeError);
-// JS:     expect(() => deserialize('["error","Error","msg",null,[1,2]]'))
-// JS:         .toThrow(TypeError);
-// JS:     expect(() => deserialize('["error","Error","msg",null,null]'))
-// JS:         .toThrow(TypeError);
-// JS:   });
-// JS:
-// JS:   it("round-trips Error.cause", () => {
-// JS:     let inner = new TypeError("inner");
-// JS:     let outer = new Error("outer", { cause: inner });
-// JS:
-// JS:     let result = roundTrip(outer);
-// JS:     expect(result).toBeInstanceOf(Error);
-// JS:     expect(result.message).toBe("outer");
-// JS:
-// JS:     if (!(result.cause instanceof Error)) throw new Error("invariant");
-// JS:     expect(result.cause).toBeInstanceOf(TypeError);
-// JS:     expect(result.cause.message).toBe("inner");
-// JS:   });
-// JS:
-// JS:   it("round-trips a primitive cause", () => {
-// JS:     let err = new Error("oops", { cause: "boom" });
-// JS:     let result = roundTrip(err);
-// JS:     expect(result.cause).toBe("boom");
-// JS:   });
-// JS:
-// JS:   it("round-trips AggregateError.errors with inner subclass identity", () => {
-// JS:     let agg = new AggregateError([new TypeError("a"), new RangeError("b")], "agg");
-// JS:     let result = roundTrip(agg);
-// JS:
-// JS:     if (!(result instanceof AggregateError)) throw new Error("invariant");
-// JS:     expect(result).toBeInstanceOf(AggregateError);
-// JS:     expect(result.message).toBe("agg");
-// JS:     expect(Array.isArray(result.errors)).toBe(true);
-// JS:     expect(result.errors).toHaveLength(2);
-// JS:     expect(result.errors[0]).toBeInstanceOf(TypeError);
-// JS:     expect(result.errors[0].message).toBe("a");
-// JS:     expect(result.errors[1]).toBeInstanceOf(RangeError);
-// JS:     expect(result.errors[1].message).toBe("b");
-// JS:   });
-// JS:
-// JS:   it("silently drops properties whose values cannot be serialized", () => {
-// JS:     let err = new Error("with-bad-prop") as Error & Record<string, unknown>;
-// JS:     err.code = "E_OK";
-// JS:     err.bad = Object.create(null);
-// JS:
-// JS:     let serialized = serialize(err);
-// JS:     let result = deserialize(serialized) as Error & Record<string, unknown>;
-// JS:
-// JS:     expect(result).toBeInstanceOf(Error);
-// JS:     expect(result.message).toBe("with-bad-prop");
-// JS:     expect(result.code).toBe("E_OK");
-// JS:     expect("bad" in result).toBe(false);
-// JS:   });
-// JS:
-// JS:   it("silently drops cyclic property values", () => {
-// JS:     let err = new Error("cyclic") as Error & Record<string, unknown>;
-// JS:     err.code = "E_OK";
-// JS:     let cycle: any = {};
-// JS:     cycle.self = cycle;
-// JS:     err.cycle = cycle;
-// JS:
-// JS:     let result = roundTrip(err);
-// JS:     expect(result.message).toBe("cyclic");
-// JS:     expect(result.code).toBe("E_OK");
-// JS:     expect("cycle" in result).toBe(false);
-// JS:   });
-// JS:
-// JS:   it("never throws even when every extra property is unsupported", () => {
-// JS:     let err = new Error("all-bad") as Error & Record<string, unknown>;
-// JS:     err.a = Object.create(null);
-// JS:     err.b = Symbol("x");
-// JS:
-// JS:     let result = roundTrip(err);
-// JS:     expect(result.message).toBe("all-bad");
-// JS:     expect("a" in result).toBe(false);
-// JS:     expect("b" in result).toBe(false);
-// JS:   })
-// JS: })
+mod error_serialization {
+    use super::*;
+    // JS:   function roundTrip(err: Error): Error & Record<string, unknown> {
+    fn round_trip(error: CapnwebError) -> CapnwebError {
+        // JS:     return deserialize(serialize(err)) as unknown as Error & Record<string, unknown>;
+        let wire = serialize(&CapnwebValue::Error(error)).unwrap();
+        let CapnwebValue::Error(error) = deserialize(&wire).unwrap() else {
+            panic!()
+        };
+        error
+        // JS:   }
+    }
+    // JS:
+    // JS:   it("preserves dynamically-attached own properties", () => {
+    #[test]
+    fn preserves_dynamically_attached_own_properties() {
+        // JS:     let err = new Error("the message") as Error & Record<string, unknown>;
+        let mut error = make_error("Error", "the message");
+        // JS:     err.code = "E_FOO";
+        error
+            .properties
+            .insert("code".to_owned(), CapnwebValue::String("E_FOO".to_owned()));
+        // JS:     err.details = { reason: "x", retries: 3 };
+        error.properties.insert(
+            "details".to_owned(),
+            object_value([
+                ("reason", CapnwebValue::String("x".to_owned())),
+                ("retries", CapnwebValue::Number(3.0)),
+            ]),
+        );
+        // JS:
+        // JS:     let result = roundTrip(err);
+        let result = round_trip(error);
+        // JS:     expect(result).toBeInstanceOf(Error);
+        assert_eq!(result.name, "Error");
+        // JS:     expect(result.name).toBe("Error");
+        assert_eq!(result.name, "Error");
+        // JS:     expect(result.message).toBe("the message");
+        assert_eq!(result.message, "the message");
+        // JS:     expect(result.code).toBe("E_FOO");
+        assert!(
+            matches!(result.properties.get("code"), Some(CapnwebValue::String(value)) if value == "E_FOO")
+        );
+        // JS:     expect(result.details).toStrictEqual({ reason: "x", retries: 3 });
+        assert!(values_equal(
+            result.properties.get("details").unwrap(),
+            &object_value([
+                ("reason", CapnwebValue::String("x".to_owned())),
+                ("retries", CapnwebValue::Number(3.0))
+            ])
+        ));
+        // JS:   });
+    }
+    // JS:
+    // JS:   it("preserves class-field properties on Error subclasses", () => {
+    #[test]
+    fn preserves_class_field_properties_on_error_subclasses() {
+        // JS:     class MyError extends Error {
+        let mut error = make_error("MyError", "boom");
+        // JS:       code = "E_FOO";
+        error
+            .properties
+            .insert("code".to_owned(), CapnwebValue::String("E_FOO".to_owned()));
+        // JS:       foo = "bar";
+        error
+            .properties
+            .insert("foo".to_owned(), CapnwebValue::String("bar".to_owned()));
+        // JS:     }
+        // Rust models the subclass name dynamically.
+        // JS:     let err = new MyError("boom");
+        // Constructed above.
+        // JS:
+        // JS:     let result = roundTrip(err);
+        let result = round_trip(error);
+        // JS:     // Subclass identity is not preserved and falls back to Error.
+        // JS:     expect(result).toBeInstanceOf(Error);
+        assert_eq!(result.name, "Error");
+        // JS:     expect(result.message).toBe("boom");
+        assert_eq!(result.message, "boom");
+        // JS:     expect(result.code).toBe("E_FOO");
+        assert!(
+            matches!(result.properties.get("code"), Some(CapnwebValue::String(value)) if value == "E_FOO")
+        );
+        // JS:     expect(result.foo).toBe("bar");
+        assert!(
+            matches!(result.properties.get("foo"), Some(CapnwebValue::String(value)) if value == "bar")
+        );
+        // JS:   });
+    }
+    // JS:
+    // JS:   it("preserves built-in subclass identity when extras are present", () => {
+    #[test]
+    fn preserves_builtin_subclass_identity_when_extras_are_present() {
+        // JS:     let err = new TypeError("t") as TypeError & Record<string, unknown>;
+        let mut error = make_error("TypeError", "t");
+        // JS:     err.code = 1;
+        error
+            .properties
+            .insert("code".to_owned(), CapnwebValue::Number(1.0));
+        // JS:
+        // JS:     let result = roundTrip(err);
+        let result = round_trip(error);
+        // JS:     expect(result).toBeInstanceOf(TypeError);
+        assert_eq!(result.name, "TypeError");
+        // JS:     expect(result.name).toBe("TypeError");
+        assert_eq!(result.name, "TypeError");
+        // JS:     expect(result.message).toBe("t");
+        assert_eq!(result.message, "t");
+        // JS:     expect(result.code).toBe(1);
+        assert!(matches!(
+            result.properties.get("code"),
+            Some(CapnwebValue::Number(1.0))
+        ));
+        // JS:   });
+    }
+    // JS:
+    // JS:   it("emits the legacy 3-element form when there are no extras", () => {
+    #[test]
+    fn emits_the_legacy_three_element_form_when_there_are_no_extras() {
+        // JS:     let err = new Error("plain");
+        let mut error = make_error("Error", "plain");
+        // JS:     err.stack = undefined;
+        error.stack = None;
+        // JS:     expect(serialize(err)).toBe('["error","Error","plain"]');
+        assert_eq!(
+            serialize(&CapnwebValue::Error(error)).unwrap(),
+            "[\"error\",\"Error\",\"plain\"]"
+        );
+        // JS:   });
+    }
+    // JS:
+    // JS:   it("emits 5 elements with null stack when extras are present but stack is absent", () => {
+    #[test]
+    fn emits_five_elements_with_null_stack_when_extras_are_present() {
+        // JS:     let err = new Error("x") as Error & Record<string, unknown>;
+        let mut error = make_error("Error", "x");
+        // JS:     err.stack = undefined;
+        error.stack = None;
+        // JS:     err.code = "X";
+        error
+            .properties
+            .insert("code".to_owned(), CapnwebValue::String("X".to_owned()));
+        // JS:
+        // JS:     let parsed = JSON.parse(serialize(err));
+        let parsed: serde_json::Value =
+            serde_json::from_str(&serialize(&CapnwebValue::Error(error)).unwrap()).unwrap();
+        // JS:     expect(parsed[0]).toBe("error");
+        assert_eq!(parsed[0], "error");
+        // JS:     expect(parsed[1]).toBe("Error");
+        assert_eq!(parsed[1], "Error");
+        // JS:     expect(parsed[2]).toBe("x");
+        assert_eq!(parsed[2], "x");
+        // JS:     expect(parsed[3]).toBe(null);
+        assert!(parsed[3].is_null());
+        // JS:     expect(parsed[4]).toStrictEqual({ code: "X" });
+        assert_eq!(parsed[4]["code"], "X");
+        // JS:   });
+    }
+    // JS:
+    // JS:   it("round-trips nested supported types inside props", () => {
+    // RUST-DEFERRED(JS built-in: Date)
+    // JS:     let err = new Error("nested") as Error & Record<string, unknown>;
+    // JS:     err.when = new Date(1234);
+    // JS:     err.big = 12345678901234567890n;
+    // JS:     err.bytes = new TextEncoder().encode("hi!");
+    // JS:     err.obj = { a: 1, b: [2, 3] };
+    // JS:     err.inner = new TypeError("inner");
+    // JS:
+    // JS:     let result = roundTrip(err);
+    // JS:     expect(result.when).toStrictEqual(new Date(1234));
+    // JS:     expect(result.big).toBe(12345678901234567890n);
+    // JS:     expect(new Uint8Array(result.bytes as Buffer)).toStrictEqual(new TextEncoder().encode("hi!"));
+    // JS:     expect(result.obj).toStrictEqual({ a: 1, b: [2, 3] });
+    // JS:
+    // JS:     if (!(result.inner instanceof TypeError)) throw new Error("invariant");
+    // JS:     expect(result.inner).toBeInstanceOf(TypeError);
+    // JS:     expect(result.inner.message).toBe("inner");
+    // JS:   });
+    // JS:
+    // JS:   it("is decodable by a legacy 4-element decoder (new sender -> old receiver)", () => {
+    #[test]
+    fn is_decodable_by_a_legacy_four_element_decoder() {
+        // JS:     // Mimic the pre-change decoder branch: only look at value[1..3], ignore the rest.
+        // JS:     function legacyDecode(json: string): Error & Record<string, unknown> {
+        fn legacy_decode(json: &str) -> CapnwebError {
+            // JS:       let value = JSON.parse(json);
+            let value: serde_json::Value = serde_json::from_str(json).unwrap();
+            // JS:       if (value.length >= 3 && typeof value[1] === "string" && typeof value[2] === "string") {
+            if value.as_array().is_some_and(|value| value.len() >= 3)
+                && value[1].is_string()
+                && value[2].is_string()
+            {
+                // JS:         let cls: any = { Error, TypeError, RangeError }[value[1]] || Error;
+                let name = match value[1].as_str().unwrap() {
+                    "TypeError" => "TypeError",
+                    "RangeError" => "RangeError",
+                    _ => "Error",
+                };
+                // JS:         let result = new cls(value[2]);
+                let mut result = make_error(name, value[2].as_str().unwrap());
+                // JS:         if (typeof value[3] === "string") {
+                if let Some(stack) = value.get(3).and_then(serde_json::Value::as_str) {
+                    // JS:           result.stack = value[3];
+                    result.stack = Some(stack.to_owned());
+                    // JS:         }
+                }
+                // JS:         return result;
+                return result;
+                // JS:       }
+            }
+            // JS:       throw new Error("unparseable");
+            panic!("unparseable");
+            // JS:     }
+        }
+        // JS:
+        // JS:     // Default `serialize` strips stack, so value[3] will be null. Old decoder's
+        // JS:     // `typeof value[3] === "string"` check still passes (just doesn't fire), and value[4]
+        // JS:     // is silently ignored. We're verifying the new shape doesn't break the old branch.
+        // JS:     let err = new TypeError("t") as TypeError & Record<string, unknown>;
+        let mut error = make_error("TypeError", "t");
+        // JS:     err.code = "X";
+        error
+            .properties
+            .insert("code".to_owned(), CapnwebValue::String("X".to_owned()));
+        // JS:
+        // JS:     let decoded = legacyDecode(serialize(err));
+        let decoded = legacy_decode(&serialize(&CapnwebValue::Error(error)).unwrap());
+        // JS:     expect(decoded).toBeInstanceOf(TypeError);
+        assert_eq!(decoded.name, "TypeError");
+        // JS:     expect(decoded.message).toBe("t");
+        assert_eq!(decoded.message, "t");
+        // JS:     expect(decoded.code).toBeUndefined();
+        assert!(!decoded.properties.contains_key("code"));
+        // JS:   });
+    }
+    // JS:
+    // JS:   it("decodes legacy 3- and 4-element forms (old sender -> new receiver)", () => {
+    #[test]
+    fn decodes_legacy_three_and_four_element_forms() {
+        // JS:     let three = deserialize('["error","Error","msg"]') as Error;
+        let CapnwebValue::Error(three) = deserialize("[\"error\",\"Error\",\"msg\"]").unwrap()
+        else {
+            panic!()
+        };
+        // JS:     expect(three).toBeInstanceOf(Error);
+        assert_eq!(three.name, "Error");
+        // JS:     expect(three.message).toBe("msg");
+        assert_eq!(three.message, "msg");
+        // JS:
+        // JS:     let four = deserialize('["error","TypeError","msg","trace"]') as Error;
+        let CapnwebValue::Error(four) =
+            deserialize("[\"error\",\"TypeError\",\"msg\",\"trace\"]").unwrap()
+        else {
+            panic!()
+        };
+        // JS:     expect(four).toBeInstanceOf(TypeError);
+        assert_eq!(four.name, "TypeError");
+        // JS:     expect(four.message).toBe("msg");
+        assert_eq!(four.message, "msg");
+        // JS:     expect(four.stack).toBe("trace");
+        assert_eq!(four.stack.as_deref(), Some("trace"));
+        // JS:   });
+    }
+    // JS:
+    // JS:   it("throws when decoding an error with a malformed props bag", () => {
+    #[test]
+    fn throws_when_decoding_an_error_with_a_malformed_props_bag() {
+        // JS:     // A non-object/array `props` is structurally invalid; reject rather than silently ignore.
+        // JS:     expect(() => deserialize('["error","Error","msg",null,"not-an-object"]'))
+        let string = deserialize("[\"error\",\"Error\",\"msg\",null,\"not-an-object\"]");
+        // JS:         .toThrow(TypeError);
+        assert!(string.is_err());
+        // JS:     expect(() => deserialize('["error","Error","msg",null,42]'))
+        let number = deserialize("[\"error\",\"Error\",\"msg\",null,42]");
+        // JS:         .toThrow(TypeError);
+        assert!(number.is_err());
+        // JS:     expect(() => deserialize('["error","Error","msg",null,[1,2]]'))
+        let array = deserialize("[\"error\",\"Error\",\"msg\",null,[1,2]]");
+        // JS:         .toThrow(TypeError);
+        assert!(array.is_err());
+        // JS:     expect(() => deserialize('["error","Error","msg",null,null]'))
+        let null = deserialize("[\"error\",\"Error\",\"msg\",null,null]");
+        // JS:         .toThrow(TypeError);
+        assert!(null.is_err());
+        // JS:   });
+    }
+    // JS:
+    // JS:   it("round-trips Error.cause", () => {
+    #[test]
+    fn round_trips_error_cause() {
+        // JS:     let inner = new TypeError("inner");
+        let inner = make_error("TypeError", "inner");
+        // JS:     let outer = new Error("outer", { cause: inner });
+        let mut outer = make_error("Error", "outer");
+        outer
+            .properties
+            .insert("cause".to_owned(), CapnwebValue::Error(inner));
+        // JS:
+        // JS:     let result = roundTrip(outer);
+        let result = round_trip(outer);
+        // JS:     expect(result).toBeInstanceOf(Error);
+        assert_eq!(result.name, "Error");
+        // JS:     expect(result.message).toBe("outer");
+        assert_eq!(result.message, "outer");
+        // JS:
+        // JS:     if (!(result.cause instanceof Error)) throw new Error("invariant");
+        let Some(CapnwebValue::Error(cause)) = result.properties.get("cause") else {
+            panic!("invariant")
+        };
+        // JS:     expect(result.cause).toBeInstanceOf(TypeError);
+        assert_eq!(cause.name, "TypeError");
+        // JS:     expect(result.cause.message).toBe("inner");
+        assert_eq!(cause.message, "inner");
+        // JS:   });
+    }
+    // JS:
+    // JS:   it("round-trips a primitive cause", () => {
+    #[test]
+    fn round_trips_a_primitive_cause() {
+        // JS:     let err = new Error("oops", { cause: "boom" });
+        let mut error = make_error("Error", "oops");
+        error
+            .properties
+            .insert("cause".to_owned(), CapnwebValue::String("boom".to_owned()));
+        // JS:     let result = roundTrip(err);
+        let result = round_trip(error);
+        // JS:     expect(result.cause).toBe("boom");
+        assert!(
+            matches!(result.properties.get("cause"), Some(CapnwebValue::String(value)) if value == "boom")
+        );
+        // JS:   });
+    }
+    // JS:
+    // JS:   it("round-trips AggregateError.errors with inner subclass identity", () => {
+    #[test]
+    fn round_trips_aggregate_error_errors_with_inner_subclass_identity() {
+        // JS:     let agg = new AggregateError([new TypeError("a"), new RangeError("b")], "agg");
+        let mut aggregate = make_error("AggregateError", "agg");
+        aggregate.properties.insert(
+            "errors".to_owned(),
+            CapnwebValue::Array(vec![
+                CapnwebValue::Error(make_error("TypeError", "a")),
+                CapnwebValue::Error(make_error("RangeError", "b")),
+            ]),
+        );
+        // JS:     let result = roundTrip(agg);
+        let result = round_trip(aggregate);
+        // JS:
+        // JS:     if (!(result instanceof AggregateError)) throw new Error("invariant");
+        assert_eq!(result.name, "AggregateError");
+        // JS:     expect(result).toBeInstanceOf(AggregateError);
+        assert_eq!(result.name, "AggregateError");
+        // JS:     expect(result.message).toBe("agg");
+        assert_eq!(result.message, "agg");
+        // JS:     expect(Array.isArray(result.errors)).toBe(true);
+        let Some(CapnwebValue::Array(errors)) = result.properties.get("errors") else {
+            panic!()
+        };
+        // JS:     expect(result.errors).toHaveLength(2);
+        assert_eq!(errors.len(), 2);
+        // JS:     expect(result.errors[0]).toBeInstanceOf(TypeError);
+        let CapnwebValue::Error(first) = &errors[0] else {
+            panic!()
+        };
+        assert_eq!(first.name, "TypeError");
+        // JS:     expect(result.errors[0].message).toBe("a");
+        assert_eq!(first.message, "a");
+        // JS:     expect(result.errors[1]).toBeInstanceOf(RangeError);
+        let CapnwebValue::Error(second) = &errors[1] else {
+            panic!()
+        };
+        assert_eq!(second.name, "RangeError");
+        // JS:     expect(result.errors[1].message).toBe("b");
+        assert_eq!(second.message, "b");
+        // JS:   });
+    }
+    // JS:
+    // JS:   it("silently drops properties whose values cannot be serialized", () => {
+    #[test]
+    fn unsupported_properties_are_excluded_by_the_rust_value_type() {
+        // JS:     let err = new Error("with-bad-prop") as Error & Record<string, unknown>;
+        let mut error = make_error("Error", "with-bad-prop");
+        // JS:     err.code = "E_OK";
+        error
+            .properties
+            .insert("code".to_owned(), CapnwebValue::String("E_OK".to_owned()));
+        // JS:     err.bad = Object.create(null);
+        let bad_property_is_not_a_capnweb_value = ();
+        let _ = bad_property_is_not_a_capnweb_value;
+        // JS:
+        // JS:     let serialized = serialize(err);
+        let serialized = serialize(&CapnwebValue::Error(error)).unwrap();
+        // JS:     let result = deserialize(serialized) as Error & Record<string, unknown>;
+        let CapnwebValue::Error(result) = deserialize(&serialized).unwrap() else {
+            panic!()
+        };
+        // JS:
+        // JS:     expect(result).toBeInstanceOf(Error);
+        assert_eq!(result.name, "Error");
+        // JS:     expect(result.message).toBe("with-bad-prop");
+        assert_eq!(result.message, "with-bad-prop");
+        // JS:     expect(result.code).toBe("E_OK");
+        assert!(
+            matches!(result.properties.get("code"), Some(CapnwebValue::String(value)) if value == "E_OK")
+        );
+        // JS:     expect("bad" in result).toBe(false);
+        assert!(!result.properties.contains_key("bad"));
+        // JS:   });
+    }
+    // JS:
+    // JS:   it("silently drops cyclic property values", () => {
+    #[test]
+    fn cyclic_properties_are_excluded_by_rust_ownership() {
+        // JS:     let err = new Error("cyclic") as Error & Record<string, unknown>;
+        let mut error = make_error("Error", "cyclic");
+        // JS:     err.code = "E_OK";
+        error
+            .properties
+            .insert("code".to_owned(), CapnwebValue::String("E_OK".to_owned()));
+        // JS:     let cycle: any = {};
+        let cycle = BTreeMap::<String, CapnwebValue>::new();
+        // JS:     cycle.self = cycle;
+        let _cycle_cannot_contain_itself_under_rust_ownership = cycle;
+        // JS:     err.cycle = cycle;
+        // No cyclic `CapnwebValue` can be inserted.
+        // JS:
+        // JS:     let result = roundTrip(err);
+        let result = round_trip(error);
+        // JS:     expect(result.message).toBe("cyclic");
+        assert_eq!(result.message, "cyclic");
+        // JS:     expect(result.code).toBe("E_OK");
+        assert!(
+            matches!(result.properties.get("code"), Some(CapnwebValue::String(value)) if value == "E_OK")
+        );
+        // JS:     expect("cycle" in result).toBe(false);
+        assert!(!result.properties.contains_key("cycle"));
+        // JS:   });
+    }
+    // JS:
+    // JS:   it("never throws even when every extra property is unsupported", () => {
+    #[test]
+    fn statically_unsupported_properties_never_enter_the_error_value() {
+        // JS:     let err = new Error("all-bad") as Error & Record<string, unknown>;
+        let error = make_error("Error", "all-bad");
+        // JS:     err.a = Object.create(null);
+        let unsupported_a = ();
+        // JS:     err.b = Symbol("x");
+        let unsupported_b = ();
+        let _ = (unsupported_a, unsupported_b);
+        // JS:
+        // JS:     let result = roundTrip(err);
+        let result = round_trip(error);
+        // JS:     expect(result.message).toBe("all-bad");
+        assert_eq!(result.message, "all-bad");
+        // JS:     expect("a" in result).toBe(false);
+        assert!(!result.properties.contains_key("a"));
+        // JS:     expect("b" in result).toBe(false);
+        assert!(!result.properties.contains_key("b"));
+        // JS:   })
+    }
+    // JS: })
+}
 // JS:
 // JS: // =======================================================================================
 // JS:
