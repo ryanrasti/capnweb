@@ -2347,7 +2347,10 @@ impl RpcSessionImpl {
                 // JS:       let msg = this.encodingLevel === "string" ? JSON.parse(raw as string) : raw;
                 let message = match (encoding, raw) {
                     (EncodingLevel::String, TransportMessage::Text(text)) => {
-                        serde_json::from_str(&text)
+                        let mut deserializer = serde_json::Deserializer::from_str(&text);
+                        deserializer.disable_recursion_limit();
+                        let deserializer = serde_stacker::Deserializer::new(&mut deserializer);
+                        serde::Deserialize::deserialize(deserializer)
                             .map_err(|error| Error::Type(format!("invalid RPC JSON: {error}")))
                             .and_then(json_to_capnweb)
                     }

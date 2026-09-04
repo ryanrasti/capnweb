@@ -9,10 +9,21 @@
 // JS: import { expect, it, describe } from "vitest"
 // JS: import { deserialize, serialize, RpcSession, RpcTransport, RpcTarget, DEFAULT_LIMITS,
 use num_bigint::BigInt;
+use std::collections::VecDeque;
+use std::future::{Future, pending};
+use std::pin::Pin;
 use std::str::FromStr;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 
-use crate::core::CapnwebValue;
-use crate::serialize::{DEFAULT_LIMITS, DEFAULT_MAX_DEPTH, deserialize, serialize};
+use crate::core::{
+    CapnwebValue, Error, PayloadStubHook, PromiseStubHook, PropertyKey, PropertyPath, Result,
+    RpcPayload, RpcTargetInner, StubHook,
+};
+use crate::rpc::{AnyRpcTransport, RpcSession, RpcSessionOptions, TransportMessage, TransportSend};
+use crate::serialize::{
+    DEFAULT_LIMITS, DEFAULT_MAX_DEPTH, EncodingLevel, RpcLimits, deserialize, serialize,
+};
 // JS:          DEFAULT_MAX_DEPTH, type RpcLimits } from "../src/index.js"
 // JS:
 // JS: // Builds the wire string for a value nested inside `depth` escaped-array layers. Each escaped
@@ -42,56 +53,178 @@ fn nested_call_args(depth: usize) -> String {
 // JS: // capturing everything the session sends back. Lets us assert exactly how the session reacts to a
 // JS: // hostile incoming message.
 // JS: class ScriptedTransport implements RpcTransport {
-// JS:   sent: string[] = [];
-// JS:   aborted = false;
-// JS:   private toReceive: string[];
-// JS:   private blockForever = new Promise<string>(() => {});
-// JS:
-// JS:   constructor(frames: string[]) {
-// JS:     this.toReceive = [...frames];
-// JS:   }
+struct ScriptedTransport {
+    // JS:   sent: string[] = [];
+    sent: Mutex<Vec<String>>,
+    // JS:   aborted = false;
+    aborted: AtomicBool,
+    // JS:   private toReceive: string[];
+    to_receive: Mutex<VecDeque<String>>,
+    // JS:   private blockForever = new Promise<string>(() => {});
+    block_forever: (),
+    session: Mutex<Option<RpcSession>>,
+    // JS:
+    // JS:   constructor(frames: string[]) {
+}
+impl ScriptedTransport {
+    fn new(frames: Vec<String>) -> Self {
+        // JS:     this.toReceive = [...frames];
+        Self {
+            sent: Mutex::new(Vec::new()),
+            aborted: AtomicBool::new(false),
+            to_receive: Mutex::new(frames.into()),
+            block_forever: (),
+            session: Mutex::new(None),
+        }
+        // JS:   }
+    }
+}
 // JS:
 // JS:   async send(message: string): Promise<void> {
-// JS:     this.sent.push(message);
-// JS:   }
-// JS:
-// JS:   async receive(): Promise<string> {
-// JS:     let next = this.toReceive.shift();
-// JS:     return next === undefined ? this.blockForever : next;
-// JS:   }
-// JS:
-// JS:   abort(reason: any): void {
-// JS:     this.aborted = true;
-// JS:   }
+impl AnyRpcTransport for ScriptedTransport {
+    fn encoding_level(&self) -> EncodingLevel {
+        EncodingLevel::String
+    }
+
+    fn send(&self, message: TransportMessage) -> Result<TransportSend> {
+        let TransportMessage::Text(message) = message else {
+            return Err(Error::Type("expected string transport message".to_owned()));
+        };
+        // JS:     this.sent.push(message);
+        self.sent.lock().unwrap().push(message);
+        Ok(TransportSend::Done(None))
+        // JS:   }
+    }
+    // JS:
+    // JS:   async receive(): Promise<string> {
+    fn receive(self: Arc<Self>) -> Pin<Box<dyn Future<Output = Result<TransportMessage>> + Send>> {
+        Box::pin(async move {
+            // JS:     let next = this.toReceive.shift();
+            let next = self.to_receive.lock().unwrap().pop_front();
+            // JS:     return next === undefined ? this.blockForever : next;
+            match next {
+                Some(next) => Ok(TransportMessage::Text(next)),
+                None => pending().await,
+            }
+            // JS:   }
+        })
+    }
+    // JS:
+    // JS:   abort(reason: any): void {
+    fn abort(&self, _reason: Error) {
+        // JS:     this.aborted = true;
+        self.aborted.store(true, Ordering::SeqCst);
+        // JS:   }
+    }
+}
 // JS:
 // JS:   // Resolves once the session has sent an ["abort", ...] frame, or rejects after a spin budget.
 // JS:   async waitForAbort(): Promise<string> {
-// JS:     for (let i = 0; i < 200; i++) {
-// JS:       let abortFrame = this.sent.find(m => m.startsWith('["abort"'));
-// JS:       if (abortFrame !== undefined) return abortFrame;
-// JS:       await Promise.resolve();
-// JS:     }
-// JS:     throw new Error(`session did not abort; sent: ${JSON.stringify(this.sent)}`);
-// JS:   }
-// JS:
-// JS:   async expectNoAbort(): Promise<void> {
-// JS:     for (let i = 0; i < 50; i++) await Promise.resolve();
-// JS:     let abortFrame = this.sent.find(m => m.startsWith('["abort"'));
-// JS:     expect(abortFrame, "session unexpectedly aborted").toBeUndefined();
-// JS:     expect(this.aborted, "transport unexpectedly aborted").toBe(false);
-// JS:   }
-// JS: }
+impl ScriptedTransport {
+    async fn wait_for_abort(&self) -> String {
+        // JS:     for (let i = 0; i < 200; i++) {
+        for _ in 0..200 {
+            // JS:       let abortFrame = this.sent.find(m => m.startsWith('["abort"'));
+            let abort_frame = self
+                .sent
+                .lock()
+                .unwrap()
+                .iter()
+                .find(|message| message.starts_with("[\"abort\""))
+                .cloned();
+            // JS:       if (abortFrame !== undefined) return abortFrame;
+            if let Some(abort_frame) = abort_frame {
+                return abort_frame;
+            }
+            // JS:       await Promise.resolve();
+            tokio::task::yield_now().await;
+            // JS:     }
+        }
+        // JS:     throw new Error(`session did not abort; sent: ${JSON.stringify(this.sent)}`);
+        panic!(
+            "session did not abort; sent: {:?}",
+            self.sent.lock().unwrap()
+        );
+        // JS:   }
+    }
+    // JS:
+    // JS:   async expectNoAbort(): Promise<void> {
+    async fn expect_no_abort(&self) {
+        // JS:     for (let i = 0; i < 50; i++) await Promise.resolve();
+        for _ in 0..50 {
+            tokio::task::yield_now().await;
+        }
+        // JS:     let abortFrame = this.sent.find(m => m.startsWith('["abort"'));
+        let abort_frame = self
+            .sent
+            .lock()
+            .unwrap()
+            .iter()
+            .find(|message| message.starts_with("[\"abort\""))
+            .cloned();
+        // JS:     expect(abortFrame, "session unexpectedly aborted").toBeUndefined();
+        assert!(
+            abort_frame.is_none(),
+            "session unexpectedly aborted: {abort_frame:?}"
+        );
+        // JS:     expect(this.aborted, "transport unexpectedly aborted").toBe(false);
+        assert!(
+            !self.aborted.load(Ordering::SeqCst),
+            "transport unexpectedly aborted"
+        );
+        // JS:   }
+    }
+    // JS: }
+}
 // JS:
 // JS: // Drives a server session that processes a single ["push", expr] frame, returning the transport so
 // JS: // the caller can inspect the reaction.
 // JS: function pushFrame(expr: string, limits?: Partial<RpcLimits>): ScriptedTransport {
-// JS:   let transport = new ScriptedTransport([`["push",${expr}]`]);
-// JS:   new RpcSession(transport, new EchoTarget(), limits ? { limits } : undefined);
-// JS:   return transport;
-// JS: }
+fn push_frame(expr: String, limits: Option<RpcLimits>) -> Arc<ScriptedTransport> {
+    // JS:   let transport = new ScriptedTransport([`["push",${expr}]`]);
+    let transport = Arc::new(ScriptedTransport::new(vec![format!("[\"push\",{expr}]")]));
+    // JS:   new RpcSession(transport, new EchoTarget(), limits ? { limits } : undefined);
+    let session = RpcSession::new(
+        transport.clone(),
+        Some(CapnwebValue::Target(Arc::new(EchoTarget))),
+        RpcSessionOptions {
+            limits: limits.unwrap_or(DEFAULT_LIMITS),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    *transport.session.lock().unwrap() = Some(session);
+    // JS:   return transport;
+    transport
+    // JS: }
+}
 // JS:
 // JS: class EchoTarget extends RpcTarget {
+struct EchoTarget;
 // JS:   echo(value: unknown) { return value; }
+impl RpcTargetInner for EchoTarget {
+    fn call(self: Arc<Self>, path: PropertyPath, args: RpcPayload) -> Result<StubHook> {
+        if path != vec![PropertyKey::String("echo".to_owned())] {
+            return Err(Error::Type(format!("No such RPC method: {path:?}")));
+        }
+        Ok(PromiseStubHook::from_future(async move {
+            let delivered = args.deliver_resolve().await?;
+            let CapnwebValue::Array(mut values) = delivered else {
+                return Err(Error::Type("arguments are not an array".to_owned()));
+            };
+            if values.len() != 1 {
+                return Err(Error::Type("echo expects one argument".to_owned()));
+            }
+            Ok(Arc::new(PayloadStubHook::new(RpcPayload::from_app_return(
+                values.remove(0),
+            ))) as StubHook)
+        }))
+    }
+
+    fn get(self: Arc<Self>, path: PropertyPath) -> Result<StubHook> {
+        Err(Error::Type(format!("No such RPC property: {path:?}")))
+    }
+}
 // JS: }
 // JS:
 // JS: describe("bigint deserialization limits", () => {
@@ -170,22 +303,46 @@ mod bigint_deserialization_limits {
     }
     // JS:
     // JS:   it("honors a per-session override of maxBigIntDigits", async () => {
-    // JS:     // The cap counts the full wire string length. "1234" is 4 characters.
-    // JS:     await pushFrame('["bigint","1234"]', { maxBigIntDigits: 4 }).expectNoAbort();
-    // JS:
-    // JS:     let aborted = await pushFrame('["bigint","12345"]', { maxBigIntDigits: 4 }).waitForAbort();
-    // JS:     expect(aborted).toMatch(/bigint exceeds maximum length/);
-    // JS:
-    // JS:     // The leading "-" counts toward the length, so "-123" is 4 characters (within a limit of 4)
-    // JS:     // while "-1234" is 5 and aborts.
-    // JS:     await pushFrame('["bigint","-123"]', { maxBigIntDigits: 4 }).expectNoAbort();
-    // JS:
-    // JS:     let abortedNeg = await pushFrame('["bigint","-1234"]', { maxBigIntDigits: 4 }).waitForAbort();
-    // JS:     expect(abortedNeg).toMatch(/bigint exceeds maximum length/);
-    // JS:
-    // JS:     // The 5-digit value is well under the default limit, so it does NOT abort by default.
-    // JS:     await pushFrame('["bigint","12345"]').expectNoAbort();
-    // JS:   });
+    #[tokio::test(flavor = "current_thread")]
+    async fn honors_a_per_session_override_of_max_big_int_digits() {
+        let limits = RpcLimits {
+            max_big_int_digits: 4,
+            ..DEFAULT_LIMITS
+        };
+        // JS:     // The cap counts the full wire string length. "1234" is 4 characters.
+        // JS:     await pushFrame('["bigint","1234"]', { maxBigIntDigits: 4 }).expectNoAbort();
+        push_frame("[\"bigint\",\"1234\"]".to_owned(), Some(limits))
+            .expect_no_abort()
+            .await;
+        // JS:
+        // JS:     let aborted = await pushFrame('["bigint","12345"]', { maxBigIntDigits: 4 }).waitForAbort();
+        let aborted = push_frame("[\"bigint\",\"12345\"]".to_owned(), Some(limits))
+            .wait_for_abort()
+            .await;
+        // JS:     expect(aborted).toMatch(/bigint exceeds maximum length/);
+        assert!(aborted.contains("bigint exceeds maximum length"));
+        // JS:
+        // JS:     // The leading "-" counts toward the length, so "-123" is 4 characters (within a limit of 4)
+        // JS:     // while "-1234" is 5 and aborts.
+        // JS:     await pushFrame('["bigint","-123"]', { maxBigIntDigits: 4 }).expectNoAbort();
+        push_frame("[\"bigint\",\"-123\"]".to_owned(), Some(limits))
+            .expect_no_abort()
+            .await;
+        // JS:
+        // JS:     let abortedNeg = await pushFrame('["bigint","-1234"]', { maxBigIntDigits: 4 }).waitForAbort();
+        let aborted_neg = push_frame("[\"bigint\",\"-1234\"]".to_owned(), Some(limits))
+            .wait_for_abort()
+            .await;
+        // JS:     expect(abortedNeg).toMatch(/bigint exceeds maximum length/);
+        assert!(aborted_neg.contains("bigint exceeds maximum length"));
+        // JS:
+        // JS:     // The 5-digit value is well under the default limit, so it does NOT abort by default.
+        // JS:     await pushFrame('["bigint","12345"]').expectNoAbort();
+        push_frame("[\"bigint\",\"12345\"]".to_owned(), None)
+            .expect_no_abort()
+            .await;
+        // JS:   });
+    }
     // JS: });
 }
 // JS:
@@ -214,45 +371,122 @@ mod message_depth_limits {
     }
     // JS:
     // JS:   it("honors a per-session override of maxDepth", async () => {
-    // JS:     // Override depth to a small value; nesting beyond it aborts the session.
-    // JS:     let deep = nestedEscapedArrays(10);
-    // JS:     let aborted = await pushFrame(deep, { maxDepth: 4 }).waitForAbort();
-    // JS:     expect(aborted).toMatch(/maximum allowed message depth/);
-    // JS:
-    // JS:     // The same depth is well within the default, so by default it does not abort.
-    // JS:     await pushFrame(deep).expectNoAbort();
-    // JS:   });
+    #[tokio::test(flavor = "current_thread")]
+    async fn honors_a_per_session_override_of_max_depth() {
+        // JS:     // Override depth to a small value; nesting beyond it aborts the session.
+        // JS:     let deep = nestedEscapedArrays(10);
+        let deep = nested_escaped_arrays(10);
+        // JS:     let aborted = await pushFrame(deep, { maxDepth: 4 }).waitForAbort();
+        let aborted = push_frame(
+            deep.clone(),
+            Some(RpcLimits {
+                max_depth: 4,
+                ..DEFAULT_LIMITS
+            }),
+        )
+        .wait_for_abort()
+        .await;
+        // JS:     expect(aborted).toMatch(/maximum allowed message depth/);
+        assert!(aborted.contains("maximum allowed message depth"));
+        // JS:
+        // JS:     // The same depth is well within the default, so by default it does not abort.
+        // JS:     await pushFrame(deep).expectNoAbort();
+        push_frame(deep, None).expect_no_abort().await;
+        // JS:   });
+    }
     // JS:
     // JS:   it("does not reset depth across nested call arguments", async () => {
-    // JS:     let aborted = await pushFrame(nestedCallArgs(8), { maxDepth: 8 }).waitForAbort();
-    // JS:     expect(aborted).toMatch(/maximum allowed message depth/);
-    // JS:   });
+    #[tokio::test(flavor = "current_thread")]
+    async fn does_not_reset_depth_across_nested_call_arguments() {
+        // JS:     let aborted = await pushFrame(nestedCallArgs(8), { maxDepth: 8 }).waitForAbort();
+        let aborted = push_frame(
+            nested_call_args(8),
+            Some(RpcLimits {
+                max_depth: 8,
+                ..DEFAULT_LIMITS
+            }),
+        )
+        .wait_for_abort()
+        .await;
+        // JS:     expect(aborted).toMatch(/maximum allowed message depth/);
+        assert!(aborted.contains("maximum allowed message depth"));
+        // JS:   });
+    }
     // JS:
     // JS:   it("accepts nested call arguments within the default depth limit", async () => {
-    // JS:     await pushFrame(nestedCallArgs(64)).expectNoAbort();
-    // JS:   });
+    #[tokio::test(flavor = "current_thread")]
+    async fn accepts_nested_call_arguments_within_the_default_depth_limit() {
+        // JS:     await pushFrame(nestedCallArgs(64)).expectNoAbort();
+        push_frame(nested_call_args(64), None)
+            .expect_no_abort()
+            .await;
+        // JS:   });
+    }
     // JS:
     // JS:   it("accepts near-limit call arguments that the default sender can serialize", async () => {
-    // JS:     let appArg = deserialize(nestedEscapedArrays(DEFAULT_MAX_DEPTH - 2));
-    // JS:     let wireArgs = JSON.parse(serialize([appArg]))[0];
-    // JS:     await pushFrame(`["pipeline",0,["echo"],${JSON.stringify(wireArgs)}]`).expectNoAbort();
-    // JS:   });
+    #[tokio::test(flavor = "current_thread")]
+    async fn accepts_near_limit_call_arguments_that_the_default_sender_can_serialize() {
+        // JS:     let appArg = deserialize(nestedEscapedArrays(DEFAULT_MAX_DEPTH - 2));
+        let app_arg = stacker::grow(8 * 1024 * 1024, || {
+            deserialize(&nested_escaped_arrays(DEFAULT_MAX_DEPTH - 2))
+        })
+        .unwrap();
+        // JS:     let wireArgs = JSON.parse(serialize([appArg]))[0];
+        let wire_args = stacker::grow(8 * 1024 * 1024, || {
+            serialize(&CapnwebValue::Array(vec![app_arg]))
+        })
+        .unwrap();
+        let wire_args = &wire_args[1..wire_args.len() - 1];
+        // JS:     await pushFrame(`["pipeline",0,["echo"],${JSON.stringify(wireArgs)}]`).expectNoAbort();
+        push_frame(format!("[\"pipeline\",0,[\"echo\"],{wire_args}]"), None)
+            .expect_no_abort()
+            .await;
+        // JS:   });
+    }
     // JS: });
 }
 // JS:
 // JS: describe("message size limits", () => {
-// JS:   it("aborts the session on a message over the size limit", async () => {
-// JS:     // The pushed expression is a long-but-valid JSON string literal, so the resulting frame is
-// JS:     // valid JSON and well over the 64-char override. The size check runs (and aborts) before
-// JS:     // JSON.parse, so this exercises the size guard specifically, not a parse error.
-// JS:     let aborted = await pushFrame(`"${"a".repeat(200)}"`, { maxMessageSize: 64 }).waitForAbort();
-// JS:     expect(aborted).toMatch(/exceeds maximum size/);
-// JS:   });
-// JS:
-// JS:   it("does not abort on a message under the size limit", async () => {
-// JS:     await pushFrame('"small"', { maxMessageSize: 1024 }).expectNoAbort();
-// JS:   });
-// JS: });
+mod message_size_limits {
+    use super::*;
+    // JS:   it("aborts the session on a message over the size limit", async () => {
+    #[tokio::test(flavor = "current_thread")]
+    async fn aborts_the_session_on_a_message_over_the_size_limit() {
+        // JS:     // The pushed expression is a long-but-valid JSON string literal, so the resulting frame is
+        // JS:     // valid JSON and well over the 64-char override. The size check runs (and aborts) before
+        // JS:     // JSON.parse, so this exercises the size guard specifically, not a parse error.
+        // JS:     let aborted = await pushFrame(`"${"a".repeat(200)}"`, { maxMessageSize: 64 }).waitForAbort();
+        let aborted = push_frame(
+            format!("\"{}\"", "a".repeat(200)),
+            Some(RpcLimits {
+                max_message_size: 64,
+                ..DEFAULT_LIMITS
+            }),
+        )
+        .wait_for_abort()
+        .await;
+        // JS:     expect(aborted).toMatch(/exceeds maximum size/);
+        assert!(aborted.contains("exceeds maximum size"));
+        // JS:   });
+    }
+    // JS:
+    // JS:   it("does not abort on a message under the size limit", async () => {
+    #[tokio::test(flavor = "current_thread")]
+    async fn does_not_abort_on_a_message_under_the_size_limit() {
+        // JS:     await pushFrame('"small"', { maxMessageSize: 1024 }).expectNoAbort();
+        push_frame(
+            "\"small\"".to_owned(),
+            Some(RpcLimits {
+                max_message_size: 1024,
+                ..DEFAULT_LIMITS
+            }),
+        )
+        .expect_no_abort()
+        .await;
+        // JS:   });
+    }
+    // JS: });
+}
 // JS:
 // JS: describe("limits backwards compatibility", () => {
 mod limits_backwards_compatibility {
@@ -301,65 +535,215 @@ mod limits_backwards_compatibility {
     }
     // JS:
     // JS:   it("a session constructed with no options behaves exactly as before", async () => {
-    // JS:     // A legitimate bigint, normal nesting, and a normal call all flow through a default session
-    // JS:     // without aborting.
-    // JS:     using harness = new SessionPair(new EchoTarget());
-    // JS:
-    // JS:     let stub = harness.stub as any;
-    // JS:     expect(await stub.echo(123n)).toBe(123n);
-    // JS:     expect(await stub.echo([[1, 2, 3]])).toStrictEqual([[1, 2, 3]]);
-    // JS:     expect(await stub.echo({a: {b: {c: 1}}})).toStrictEqual({a: {b: {c: 1}}});
-    // JS:
-    // JS:     await harness.dispose();
-    // JS:   });
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_session_constructed_with_no_options_behaves_exactly_as_before() {
+        // JS:     // A legitimate bigint, normal nesting, and a normal call all flow through a default session
+        // JS:     // without aborting.
+        // JS:     using harness = new SessionPair(new EchoTarget());
+        let harness = SessionPair::new(None);
+        // JS:
+        // JS:     let stub = harness.stub as any;
+        let stub = harness.stub.clone();
+        // JS:     expect(await stub.echo(123n)).toBe(123n);
+        let bigint = rpc_echo(&stub, CapnwebValue::BigInt(BigInt::from(123))).await;
+        assert!(matches!(bigint, CapnwebValue::BigInt(value) if value == BigInt::from(123)));
+        // JS:     expect(await stub.echo([[1, 2, 3]])).toStrictEqual([[1, 2, 3]]);
+        let array = CapnwebValue::Array(vec![CapnwebValue::Array(vec![
+            CapnwebValue::Number(1.0),
+            CapnwebValue::Number(2.0),
+            CapnwebValue::Number(3.0),
+        ])]);
+        assert!(capnweb_values_equal(
+            &rpc_echo(&stub, array.clone()).await,
+            &array
+        ));
+        // JS:     expect(await stub.echo({a: {b: {c: 1}}})).toStrictEqual({a: {b: {c: 1}}});
+        let object = CapnwebValue::Object(std::collections::BTreeMap::from([(
+            "a".to_owned(),
+            CapnwebValue::Object(std::collections::BTreeMap::from([(
+                "b".to_owned(),
+                CapnwebValue::Object(std::collections::BTreeMap::from([(
+                    "c".to_owned(),
+                    CapnwebValue::Number(1.0),
+                )])),
+            )])),
+        )]));
+        assert!(capnweb_values_equal(
+            &rpc_echo(&stub, object.clone()).await,
+            &object
+        ));
+        // JS:
+        // JS:     await harness.dispose();
+        harness.dispose().await;
+        // JS:   });
+    }
     // JS:
     // JS:   it("a session constructed with an empty options object behaves identically", async () => {
-    // JS:     using harness = new SessionPair(new EchoTarget(), {});
-    // JS:     let stub = harness.stub as any;
-    // JS:     expect(await stub.echo(999n)).toBe(999n);
-    // JS:     await harness.dispose();
-    // JS:   });
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_session_constructed_with_an_empty_options_object_behaves_identically() {
+        // JS:     using harness = new SessionPair(new EchoTarget(), {});
+        let harness = SessionPair::new(Some(RpcSessionOptions::default()));
+        // JS:     let stub = harness.stub as any;
+        let stub = harness.stub.clone();
+        // JS:     expect(await stub.echo(999n)).toBe(999n);
+        let value = rpc_echo(&stub, CapnwebValue::BigInt(BigInt::from(999))).await;
+        assert!(matches!(value, CapnwebValue::BigInt(value) if value == BigInt::from(999)));
+        // JS:     await harness.dispose();
+        harness.dispose().await;
+        // JS:   });
+    }
     // JS: });
 }
 // JS:
 // JS: // A minimal in-memory bidirectional session pair, sufficient for the round-trip checks above.
 // JS: class PairTransport implements RpcTransport {
-// JS:   partner!: PairTransport;
-// JS:   private queue: string[] = [];
-// JS:   private waiter?: () => void;
-// JS:
-// JS:   async send(message: string): Promise<void> {
-// JS:     this.partner.queue.push(message);
-// JS:     this.partner.waiter?.();
-// JS:     this.partner.waiter = undefined;
-// JS:   }
-// JS:
-// JS:   async receive(): Promise<string> {
-// JS:     while (this.queue.length === 0) {
-// JS:       await new Promise<void>(resolve => { this.waiter = resolve; });
-// JS:     }
-// JS:     return this.queue.shift()!;
-// JS:   }
-// JS: }
+struct PairTransport {
+    // JS:   partner!: PairTransport;
+    partner: tokio::sync::mpsc::UnboundedSender<String>,
+    // JS:   private queue: string[] = [];
+    queue: tokio::sync::Mutex<tokio::sync::mpsc::UnboundedReceiver<String>>,
+    // JS:   private waiter?: () => void;
+    waiter: (),
+    // JS:
+    // JS:   async send(message: string): Promise<void> {
+}
+impl AnyRpcTransport for PairTransport {
+    fn send(&self, message: TransportMessage) -> Result<TransportSend> {
+        let TransportMessage::Text(message) = message else {
+            return Err(Error::Type("expected string transport message".to_owned()));
+        };
+        // JS:     this.partner.queue.push(message);
+        self.partner
+            .send(message)
+            .map_err(|_| Error::Message("pair transport closed".to_owned()))?;
+        // JS:     this.partner.waiter?.();
+        let _ = self.waiter;
+        // JS:     this.partner.waiter = undefined;
+        let _ = self.waiter;
+        Ok(TransportSend::Done(None))
+        // JS:   }
+    }
+    // JS:
+    // JS:   async receive(): Promise<string> {
+    fn receive(self: Arc<Self>) -> Pin<Box<dyn Future<Output = Result<TransportMessage>> + Send>> {
+        Box::pin(async move {
+            // JS:     while (this.queue.length === 0) {
+            loop {
+                // JS:       await new Promise<void>(resolve => { this.waiter = resolve; });
+                if let Some(message) = self.queue.lock().await.recv().await {
+                    // JS:     }
+                    // JS:     return this.queue.shift()!;
+                    return Ok(TransportMessage::Text(message));
+                }
+                return Err(Error::Message("pair transport closed".to_owned()));
+            }
+            // JS:   }
+        })
+    }
+    // JS: }
+}
 // JS:
 // JS: class SessionPair {
-// JS:   private clientTransport = new PairTransport();
-// JS:   private serverTransport = new PairTransport();
-// JS:   private client: RpcSession;
-// JS:   private server: RpcSession;
-// JS:   stub: ReturnType<RpcSession["getRemoteMain"]>;
-// JS:
-// JS:   constructor(target: RpcTarget, options?: { limits?: Partial<RpcLimits> }) {
-// JS:     this.clientTransport.partner = this.serverTransport;
-// JS:     this.serverTransport.partner = this.clientTransport;
-// JS:     this.client = new RpcSession(this.clientTransport);
-// JS:     this.server = new RpcSession(this.serverTransport, target, options);
-// JS:     this.stub = this.client.getRemoteMain();
-// JS:   }
-// JS:
-// JS:   async dispose() {
-// JS:     for (let i = 0; i < 16; i++) await Promise.resolve();
-// JS:   }
-// JS:
-// JS:   [Symbol.dispose]() {}
-// JS: }
+struct SessionPair {
+    // JS:   private clientTransport = new PairTransport();
+    client_transport: Arc<PairTransport>,
+    // JS:   private serverTransport = new PairTransport();
+    server_transport: Arc<PairTransport>,
+    // JS:   private client: RpcSession;
+    client: RpcSession,
+    // JS:   private server: RpcSession;
+    server: RpcSession,
+    // JS:   stub: ReturnType<RpcSession["getRemoteMain"]>;
+    stub: crate::core::RpcStub,
+    // JS:
+    // JS:   constructor(target: RpcTarget, options?: { limits?: Partial<RpcLimits> }) {
+}
+impl SessionPair {
+    fn new(options: Option<RpcSessionOptions>) -> Self {
+        let (to_client, client_queue) = tokio::sync::mpsc::unbounded_channel();
+        let (to_server, server_queue) = tokio::sync::mpsc::unbounded_channel();
+        // JS:     this.clientTransport.partner = this.serverTransport;
+        let client_transport = Arc::new(PairTransport {
+            partner: to_server,
+            queue: tokio::sync::Mutex::new(client_queue),
+            waiter: (),
+        });
+        // JS:     this.serverTransport.partner = this.clientTransport;
+        let server_transport = Arc::new(PairTransport {
+            partner: to_client,
+            queue: tokio::sync::Mutex::new(server_queue),
+            waiter: (),
+        });
+        // JS:     this.client = new RpcSession(this.clientTransport);
+        let client =
+            RpcSession::new(client_transport.clone(), None, RpcSessionOptions::default()).unwrap();
+        // JS:     this.server = new RpcSession(this.serverTransport, target, options);
+        let server = RpcSession::new(
+            server_transport.clone(),
+            Some(CapnwebValue::Target(Arc::new(EchoTarget))),
+            options.unwrap_or_default(),
+        )
+        .unwrap();
+        // JS:     this.stub = this.client.getRemoteMain();
+        let stub = client.get_remote_main();
+        Self {
+            client_transport,
+            server_transport,
+            client,
+            server,
+            stub,
+        }
+        // JS:   }
+    }
+    // JS:
+    // JS:   async dispose() {
+    async fn dispose(self) {
+        // JS:     for (let i = 0; i < 16; i++) await Promise.resolve();
+        for _ in 0..16 {
+            tokio::task::yield_now().await;
+        }
+        // JS:   }
+    }
+    // JS:
+    // JS:   [Symbol.dispose]() {}
+    // Rust ownership disposes both sessions with the harness.
+    // JS: }
+}
+
+async fn rpc_echo(stub: &crate::core::RpcStub, value: CapnwebValue) -> CapnwebValue {
+    stub.call(
+        vec!["echo".to_owned()],
+        RpcPayload::from_app_params(CapnwebValue::Array(vec![value])),
+    )
+    .pull()
+    .await
+    .unwrap()
+}
+
+fn capnweb_values_equal(left: &CapnwebValue, right: &CapnwebValue) -> bool {
+    match (left, right) {
+        (CapnwebValue::Null, CapnwebValue::Null)
+        | (CapnwebValue::Undefined, CapnwebValue::Undefined) => true,
+        (CapnwebValue::Bool(left), CapnwebValue::Bool(right)) => left == right,
+        (CapnwebValue::Number(left), CapnwebValue::Number(right)) => left == right,
+        (CapnwebValue::String(left), CapnwebValue::String(right)) => left == right,
+        (CapnwebValue::BigInt(left), CapnwebValue::BigInt(right)) => left == right,
+        (CapnwebValue::Bytes(left), CapnwebValue::Bytes(right)) => left == right,
+        (CapnwebValue::Array(left), CapnwebValue::Array(right)) => {
+            left.len() == right.len()
+                && left
+                    .iter()
+                    .zip(right)
+                    .all(|(left, right)| capnweb_values_equal(left, right))
+        }
+        (CapnwebValue::Object(left), CapnwebValue::Object(right)) => {
+            left.len() == right.len()
+                && left.iter().all(|(key, left)| {
+                    right
+                        .get(key)
+                        .is_some_and(|right| capnweb_values_equal(left, right))
+                })
+        }
+        _ => false,
+    }
+}
