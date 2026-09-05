@@ -1,41 +1,47 @@
 {
   "name": "capnweb-rust-codegen",
-  "version": "0.0.0",
-  "description": "Generate Rust bindings from TypeScript Cap'n Web contracts.",
+  "version": "0.1.0",
+  "description": "Generate ordinary Rust Cap'n Web bindings from TypeScript declarations.",
   "license": "MIT",
   "type": "module",
-  "main": "dist/index.mjs",
-  "types": "dist/index.d.mts",
   "files": [
-    "dist"
+    "dist",
+    "README.md",
+    "LICENSE.txt"
   ],
-  "exports": {
-    ".": {
-      "types": "./dist/index.d.mts",
-      "import": "./dist/index.mjs"
-    }
-  },
   "bin": {
     "capnweb-rust-codegen": "./dist/cli.mjs"
   },
   "scripts": {
     "build": "tsdown",
-    "test": "vitest run --root ../.. --project node packages/capnweb-rust-codegen/__tests__",
-    "typecheck": "tsc -p tsconfig.json"
+    "build:watch": "tsdown --watch",
+    "test": "vitest run",
+    "typecheck": "tsc -p tsconfig.json",
+    "check:generated": "node dist/cli.mjs --project __tests__/fixtures/simple/tsconfig.json --input __tests__/fixtures/simple/api.ts --root Api --out ../../rust/tests/generated/simple.rs --check && node dist/cli.mjs --project ../../rust/examples/kitchen-sink/tsconfig.json --input ../../rust/examples/kitchen-sink/api.d.ts --root KitchenSinkApi --out ../../rust/examples/kitchen-sink/generated.rs --check",
+    "prepack": "npm run typecheck && npm run test && npm run build"
   },
   "dependencies": {
     "typescript": ">=5.7.0 <7"
   },
   "devDependencies": {
+    "@types/node": "^24.0.0",
     "@typescript/vfs": "^1.6.4",
-    "tsdown": "^0.22.0"
+    "tsdown": "^0.22.0",
+    "vitest": "^3.2.7"
+  },
+  "engines": {
+    "node": ">=20"
   },
   "publishConfig": {
     "access": "public"
   },
   "repository": {
     "type": "git",
-    "url": "https://github.com/cloudflare/capnweb"
+    "url": "https://github.com/cloudflare/capnweb.git",
+    "directory": "packages/capnweb-rust-codegen"
   },
-  "private": true
+  "bugs": {
+    "url": "https://github.com/cloudflare/capnweb/issues"
+  },
+  "homepage": "https://github.com/cloudflare/capnweb/tree/main/packages/capnweb-rust-codegen"
 }

@@ -36,7 +36,7 @@
     "!packages/docs"
   ],
   "scripts": {
-    "build": "tsdown --config-loader native && node scripts/check-dist-ascii.mjs && npm run -w capnweb-validate build",
+    "build": "tsdown --config-loader native && node scripts/check-dist-ascii.mjs && npm run -w capnweb-validate build && npm run -w capnweb-rust-codegen build",
     "build:watch": "tsdown --config-loader native --watch",
     "dev": "npm run build:watch",
     "dev:docs": "npm run build && npm --prefix packages/docs run dev -- --port 4321",
