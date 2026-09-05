@@ -51,6 +51,9 @@ jobs:
       - name: Build project
         run: npm run build
 
+      - name: Check generated Rust bindings
+        run: npm run -w capnweb-rust-codegen check:generated
+
       - name: Run tests
         run: npm run test:ci
 

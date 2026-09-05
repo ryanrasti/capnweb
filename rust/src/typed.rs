@@ -10,10 +10,36 @@ use num_bigint::BigInt;
 
 use crate::core::{CapnwebValue, Error, Result, RpcPromise, RpcStub};
 
+/// An opaque byte string, distinct from a Cap'n Web array of numeric values.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct Bytes(pub Vec<u8>);
+
+impl From<Vec<u8>> for Bytes {
+    fn from(value: Vec<u8>) -> Self {
+        Self(value)
+    }
+}
+
+impl From<Bytes> for Vec<u8> {
+    fn from(value: Bytes) -> Self {
+        value.0
+    }
+}
+
 /// Describes the wire-visible members of a generated RPC interface.
 pub trait RpcInterfaceDescriptor {
     /// Returns whether `wire_name` is declared by the interface.
     fn has_member(wire_name: &str) -> bool;
+
+    /// Returns whether `wire_name` is declared as a callable method.
+    fn has_method(wire_name: &str) -> bool {
+        Self::has_member(wire_name)
+    }
+
+    /// Returns whether `wire_name` is declared as a property getter.
+    fn has_getter(wire_name: &str) -> bool {
+        Self::has_member(wire_name)
+    }
 }
 
 /// Converts a typed application value into Cap'n Web's dynamic value representation.
@@ -121,6 +147,21 @@ impl FromCapnwebValue for BigInt {
     }
 }
 
+impl IntoCapnwebValue for Bytes {
+    fn into_capnweb_value(self) -> Result<CapnwebValue> {
+        Ok(CapnwebValue::Bytes(self.0))
+    }
+}
+
+impl FromCapnwebValue for Bytes {
+    fn from_capnweb_value(value: CapnwebValue) -> Result<Self> {
+        match value {
+            CapnwebValue::Bytes(value) => Ok(Self(value)),
+            other => Err(type_mismatch("bytes", &other)),
+        }
+    }
+}
+
 impl<T: IntoCapnwebValue> IntoCapnwebValue for Vec<T> {
     fn into_capnweb_value(self) -> Result<CapnwebValue> {
         self.into_iter()
@@ -141,6 +182,50 @@ impl<T: FromCapnwebValue> FromCapnwebValue for Vec<T> {
             .collect()
     }
 }
+
+macro_rules! tuple_conversions {
+    ($(($($type:ident $value:ident),+)),+ $(,)?) => {
+        $(
+            impl<$($type: IntoCapnwebValue),+> IntoCapnwebValue for ($($type,)+) {
+                fn into_capnweb_value(self) -> Result<CapnwebValue> {
+                    let ($($value,)+) = self;
+                    Ok(CapnwebValue::Array(vec![
+                        $($value.into_capnweb_value()?,)+
+                    ]))
+                }
+            }
+
+            impl<$($type: FromCapnwebValue),+> FromCapnwebValue for ($($type,)+) {
+                fn from_capnweb_value(value: CapnwebValue) -> Result<Self> {
+                    let CapnwebValue::Array(values) = value else {
+                        return Err(type_mismatch("tuple", &value));
+                    };
+                    let mut values = values.into_iter();
+                    let result = (
+                        $($type::from_capnweb_value(
+                            values.next().unwrap_or(CapnwebValue::Undefined),
+                        )?,)+
+                    );
+                    if values.next().is_some() {
+                        return Err(Error::Type("tuple has too many elements".to_owned()));
+                    }
+                    Ok(result)
+                }
+            }
+        )+
+    };
+}
+
+tuple_conversions!(
+    (A a),
+    (A a, B b),
+    (A a, B b, C c),
+    (A a, B b, C c, D d),
+    (A a, B b, C c, D d, E e),
+    (A a, B b, C c, D d, E e, F f),
+    (A a, B b, C c, D d, E e, F f, G g),
+    (A a, B b, C c, D d, E e, F f, G g, H h),
+);
 
 impl<T: IntoCapnwebValue> IntoCapnwebValue for BTreeMap<String, T> {
     fn into_capnweb_value(self) -> Result<CapnwebValue> {
@@ -207,6 +292,15 @@ impl FromCapnwebValue for RpcStub {
 impl IntoCapnwebValue for RpcPromise {
     fn into_capnweb_value(self) -> Result<CapnwebValue> {
         Ok(CapnwebValue::RpcPromise(self))
+    }
+}
+
+impl FromCapnwebValue for RpcPromise {
+    fn from_capnweb_value(value: CapnwebValue) -> Result<Self> {
+        match value {
+            CapnwebValue::RpcPromise(promise) => Ok(promise),
+            other => Err(type_mismatch("RPC promise", &other)),
+        }
     }
 }
 

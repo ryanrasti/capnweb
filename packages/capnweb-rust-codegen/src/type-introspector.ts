@@ -26,6 +26,7 @@ export function introspectRustSchema(
 ): RustSchema {
   let resolver = new SchemaResolver(checker);
   let rootIds = roots.map((type) => resolver.resolveTarget(type));
+  resolver.validateObjectLayouts();
   return {
     version: 1,
     roots: rootIds,
@@ -39,10 +40,51 @@ class SchemaResolver {
   readonly #checker: ts.TypeChecker;
   readonly #ids = new Map<ts.Type, TypeId>();
   readonly #declarations = new Map<TypeId, RustDeclaration>();
+  readonly #fieldDeclarations = new Map<TypeId, Map<string, ts.Declaration>>();
   #nextAnonymousId = 1;
 
   constructor(checker: ts.TypeChecker) {
     this.#checker = checker;
+  }
+
+  validateObjectLayouts(): void {
+    let visiting = new Set<TypeId>();
+    let visited = new Set<TypeId>();
+    let path: { object: TypeId; field: string }[] = [];
+
+    let visit = (id: TypeId): void => {
+      if (visited.has(id)) return;
+      visiting.add(id);
+      let declaration = this.#declarations.get(id);
+      if (declaration?.kind === "object") {
+        for (let field of declaration.fields) {
+          for (let target of this.#directObjectReferences(field.type)) {
+            path.push({ object: id, field: field.wireName });
+            if (visiting.has(target)) {
+              let cycleStart = path.findIndex((part) => part.object === target);
+              let cycle = path
+                .slice(cycleStart < 0 ? 0 : cycleStart)
+                .map((part) => `${part.object}.${part.field}`)
+                .concat(target)
+                .join(" -> ");
+              let source = this.#fieldDeclarations.get(id)?.get(field.wireName);
+              let message =
+                `Recursive by-value object layout: ${cycle}. ` +
+                "Use an array, record, or RpcTarget capability to introduce indirection.";
+              throw source ? schemaError(source, message) : new Error(message);
+            }
+            visit(target);
+            path.pop();
+          }
+        }
+      }
+      visiting.delete(id);
+      visited.add(id);
+    };
+
+    for (let declaration of this.declarations) {
+      if (declaration.kind === "object") visit(declaration.id);
+    }
   }
 
   resolveTarget(type: ts.Type): TypeId {
@@ -86,6 +128,10 @@ class SchemaResolver {
         stubBrandDeclaration
       );
       if (service !== type) return this.#resolveType(service);
+    }
+
+    if (type.isIntersection()) {
+      return { kind: "dynamic", reason: this.#checker.typeToString(type) };
     }
 
     if (type.isUnion()) {
@@ -169,6 +215,12 @@ class SchemaResolver {
     if (this.#isTarget(type)) {
       return { kind: "named", id: this.#declare(type, "target") };
     }
+    if (
+      object.objectFlags & ts.ObjectFlags.Mapped ||
+      hasSymbolKeyedProperty(type, this.#checker)
+    ) {
+      return { kind: "dynamic", reason: this.#checker.typeToString(type) };
+    }
     return { kind: "named", id: this.#declare(type, "object") };
   }
 
@@ -179,6 +231,18 @@ class SchemaResolver {
     let branches = types
       .filter((type) => !(type.flags & (ts.TypeFlags.Null | ts.TypeFlags.Undefined)))
       .map((type) => this.#resolveType(type));
+    let booleanLiterals = branches.filter(
+      (branch): branch is Extract<TypeRef, { kind: "literal" }> =>
+        branch.kind === "literal" && typeof branch.value === "boolean"
+    );
+    if (
+      booleanLiterals.length === branches.length &&
+      booleanLiterals.some((branch) => branch.value === true) &&
+      booleanLiterals.some((branch) => branch.value === false)
+    ) {
+      let boolean: TypeRef = { kind: "boolean" };
+      return hasNull ? { kind: "nullable", inner: boolean } : boolean;
+    }
     if (hasNull && branches.length === 1) {
       return { kind: "nullable", inner: branches[0]! };
     }
@@ -254,9 +318,11 @@ class SchemaResolver {
     id: TypeId,
     sourceName: string
   ): ObjectDeclaration {
+    let declarations = new Map<string, ts.Declaration>();
     let fields: Field[] = this.#checker.getPropertiesOfType(type).map((property) => {
       let declaration = property.valueDeclaration ?? property.declarations?.[0];
       if (!declaration) throw new Error(`Property ${property.getName()} has no declaration`);
+      declarations.set(property.getName(), declaration);
       let propertyType = this.#checker.getTypeOfSymbolAtLocation(property, declaration);
       return {
         wireName: property.getName(),
@@ -265,6 +331,7 @@ class SchemaResolver {
         type: this.#resolveType(propertyType),
       };
     });
+    this.#fieldDeclarations.set(id, declarations);
     return { kind: "object", id, sourceName, fields };
   }
 
@@ -357,11 +424,14 @@ class SchemaResolver {
         let resolved = this.#resolveType(type);
         rest = resolved.kind === "array" ? resolved.element : resolved;
       } else {
+        let resolved = this.#resolveType(type);
         parameters.push({
           sourceName: parameter.getName(),
           optional: Boolean(parameter.flags & ts.SymbolFlags.Optional) ||
             (ts.isParameter(declaration) && Boolean(declaration.questionToken)),
-          type: this.#resolveType(type),
+          type: resolved.kind === "promise"
+            ? { kind: "dynamic", reason: "promise-valued parameter" }
+            : resolved,
         });
       }
     }
@@ -370,6 +440,23 @@ class SchemaResolver {
 
   #resolveReturnType(type: ts.Type): TypeRef {
     return this.#resolveType(this.#checker.getAwaitedType(type) ?? type);
+  }
+
+  #directObjectReferences(type: TypeRef): TypeId[] {
+    switch (type.kind) {
+      case "named":
+        return this.#declarations.get(type.id)?.kind === "object" ? [type.id] : [];
+      case "nullable":
+        return this.#directObjectReferences(type.inner);
+      case "tuple":
+        return type.elements.flatMap((element) =>
+          this.#directObjectReferences(element.type)
+        );
+      default:
+        // Vec, BTreeMap, providers, capabilities, and streams all provide
+        // indirection. Dynamic unions are represented by CapnwebValue.
+        return [];
+    }
   }
 
   #isTarget(type: ts.Type): boolean {
@@ -412,6 +499,15 @@ function schemaError(declaration: ts.Declaration, message: string): Error {
   return new Error(
     `${source.fileName}:${position.line + 1}:${position.character + 1}: ${message}`
   );
+}
+
+function hasSymbolKeyedProperty(type: ts.Type, checker: ts.TypeChecker): boolean {
+  return checker.getPropertiesOfType(type).some((property) => {
+    let declaration = property.valueDeclaration ?? property.declarations?.[0];
+    if (!declaration) return false;
+    let name = ts.getNameOfDeclaration(declaration);
+    return Boolean(name && ts.isComputedPropertyName(name));
+  });
 }
 
 function hasReadonlyModifier(declaration: ts.Declaration): boolean {

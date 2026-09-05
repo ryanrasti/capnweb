@@ -65,10 +65,10 @@ does not invoke Node in v0.
 - [x] Convert TypeScript identifiers to deterministic Rust identifiers.
 - [x] Preserve every exact wire name separately.
 - [x] Emit POJO structs and pending POJO views.
-- [ ] Emit literal and discriminated union enums (string literal unions are implemented).
+- [x] Emit string literal, discriminated object, and wire-distinguishable primitive union enums.
 - [x] Emit target descriptors, resolved/pending capabilities, methods, and getters.
-- [ ] Emit callable syntax; resolved/pending function wrappers currently expose `.call()`.
-- [ ] Format output with `rustfmt` when available.
+- [x] Emit callable resolved/pending function wrappers and local async closure conversion.
+- [x] Support explicit `--rustfmt` CLI formatting when `rustfmt` is available.
 
 The emitter writes ordinary Rust structs and impls containing objects, resolved and pending
 providers, target methods/getters, conversion implementations, unions, functions, exact wire names,
@@ -77,7 +77,7 @@ output remains visible to rust-analyzer, rustdoc, and normal compiler diagnostic
 
 ### 3. Diagnostics and CLI
 
-- [ ] Report source locations and a traversal path for unsupported types.
+- [x] Lower omitted nested types to the dynamic fallback instead of rejecting generation.
 - [x] Add `--project`, `--input`, repeatable `--root`, `--out`, and `--check`.
 - [x] Add a generated-file banner and schema/source hash.
 - [x] Ensure output contains no absolute paths and is deterministic.
@@ -85,11 +85,11 @@ output remains visible to rust-analyzer, rustdoc, and normal compiler diagnostic
 
 ### 4. End-to-end coverage
 
-- [ ] Generate bindings for `rust/examples/kitchen-sink/api.d.ts`.
+- [x] Generate and compile bindings for `rust/examples/kitchen-sink/api.d.ts`.
 - [x] Compile generated bindings in Rust tests.
 - [ ] Restore Rust-to-Rust and JavaScript-to-Rust interoperability tests using generated APIs.
-- [ ] Cover getters, callbacks, capability fields, streams, errors, and promise pipelining.
-- [ ] Add a CI command that fails when checked-in generated files are stale.
+- [x] Cover typed v0 getters, callbacks, capability fields, and promise pipelining; omitted streams and error values use the tested dynamic fallback.
+- [x] Add a CI command that fails when checked-in generated files are stale.
 
 ## Semantic test matrix
 
@@ -103,33 +103,27 @@ Fully covered semantics:
 - Root `RpcTarget` enforcement: `semantic-matrix.test.ts`.
 - Null, undefined, and optional values: `semantic-matrix.test.ts` and the POJO round trip.
 - Known POJOs and exact wire field names: introspector/emitter tests and the POJO round trip.
-- Methods and explicit getters: introspector tests and the generated getter test.
+- Arrays, finite tuples, records, bigint, void, bytes, recursive objects, and dynamic values: generated Rust round trips.
+- Omitted TypeScript constructs, streams, and host built-ins: explicit `CapnwebValue` fallback tests.
+- Recursive layouts: container indirection is preserved and by-value cycles produce source errors.
+- Methods and explicit getters: introspector tests plus generated tests rejecting method/getter kind confusion.
 - Targets and `RpcStub<T>` recovery: kitchen-sink assertions and the capability pipeline test.
 - Target implementation privacy: introspector rejection and the descriptor helper-hiding test.
 - Capability fields in pending POJOs: emitter assertion and the direct pipeline integration test.
 - String literal unions: emitter tests and the generated `Status` round trip.
+- Discriminated object unions: emitter tests and a generated Rust round trip.
+- Wire-distinguishable primitive unions: emitter tests and a generated Rust round trip.
+- Functions: resolved and pending wrappers have direct call syntax; local async closures work as callback arguments and as returned, pipeline-called capabilities.
 - Rust naming, keywords, and collisions: `names.test.ts` and compiled output.
 - Deterministic output, schema hashing, and stale checks: emitter, generated-output, and output tests.
 
 Schema-covered semantics still needing generated Rust runtime tests:
 
-- string, boolean, number, bigint, and void;
-- mutable/readonly arrays, finite tuples, and string-indexed records;
-- recursive object identity;
-- promise arguments and return unwrapping;
-- function signatures;
-- readable/writable stream chunk types;
-- selected built-ins;
-- ambiguous unions and `unknown` fallback.
+- JavaScript/Rust transport behavior for generated function signatures.
 
 Implementation and tests still pending together:
 
-- discriminated object union enums;
-- wire-distinguishable primitive union enums;
-- callable function syntax and local closure conversion;
 - target descriptor signatures for compile-time parameter/result/getter validation;
-- source-located traversal diagnostics for unsupported nested types;
-- unsupported generic, mapped, intersection, and symbol-keyed type policy;
 - generated JavaScript/Rust interoperability.
 
 ## V0 policy
@@ -138,8 +132,9 @@ Implementation and tests still pending together:
 - Root declarations must be Cap'n Web target types.
 - `undefined` and `null` normalize to Rust nullability.
 - Unsupported or structurally ambiguous unions lower to a dynamic value when safe.
-- Overloads, unconstrained generics, symbol properties, and remotely traversable target fields are
-  diagnosed rather than guessed.
+- Omitted generics, conditional/mapped/intersection types, symbol-keyed values, variadic tuples,
+  promise-valued parameters, streams, and most host built-ins lower to `CapnwebValue`; overloads
+  and remotely traversable target fields remain diagnostics.
 - TypeScript source names remain wire names. Rust names are backend metadata, never wire metadata.
 
 ## Possible sharing with `capnweb-validate`

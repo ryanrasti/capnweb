@@ -85,8 +85,8 @@ describe("emitRustSchema", () => {
     expect(output).toContain('"currentUser",');
     expect(output).toContain("].contains(&wire_name)");
     expect(output).toContain("pub fn current_user(&self) -> PendingUser {");
-    expect(output).toContain(
-      "pub fn format_value(&self, r#type: String, formatter: Option<Formatter>)"
+    expect(output).toMatch(
+      /pub fn format_value\(\s*&self,\s*r#type: String,\s*formatter: Option<Formatter>,/
     );
     expect(output).toContain('vec!["formatValue".to_owned()]');
     expect(output).toContain("pub struct User {");

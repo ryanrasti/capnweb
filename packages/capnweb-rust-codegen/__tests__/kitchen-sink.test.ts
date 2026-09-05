@@ -57,7 +57,7 @@ describe("kitchen-sink schema", () => {
     expect(member("acceptDeferred")).toMatchObject({
       parameters: [
         {
-          type: { kind: "promise", value: { kind: "string" } },
+          type: { kind: "dynamic", reason: "promise-valued parameter" },
         },
       ],
       returns: { kind: "string" },
@@ -151,6 +151,8 @@ describe("kitchen-sink schema", () => {
     );
     expect(rust).toContain('vec!["echoUser".to_owned()]');
     expect(rust).toContain("pub struct Formatter {");
-    expect(rust).toContain("pub type UserEvent = ::capnweb::CapnwebValue;");
+    expect(rust).toContain("pub enum UserEvent {");
+    expect(rust).toContain("Created {");
+    expect(rust).toContain("Deleted {");
   });
 });

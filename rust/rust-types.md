@@ -549,32 +549,25 @@ All other unions map to `CapnwebValue`.
 
 ## Special values
 
-Initial or planned mappings are:
+The deliberately small v0 mapping is:
 
-| TypeScript          | Rust                                      |
-| ------------------- | ----------------------------------------- |
-| `Uint8Array`        | `Bytes` or `Vec<u8>`                      |
-| `Int8Array`         | `Vec<i8>`                                 |
-| `Uint16Array`       | `Vec<u16>`                                |
-| `Int16Array`        | `Vec<i16>`                                |
-| `Uint32Array`       | `Vec<u32>`                                |
-| `Int32Array`        | `Vec<i32>`                                |
-| `BigUint64Array`    | `Vec<u64>`                                |
-| `BigInt64Array`     | `Vec<i64>`                                |
-| `Float32Array`      | `Vec<f32>`                                |
-| `Float64Array`      | `Vec<f64>`                                |
-| `ArrayBuffer`       | `ArrayBuffer` or `Bytes` wrapper          |
-| `DataView`          | `DataView` wrapper                        |
-| `Date`              | Cap'n Web `Date` wrapper initially        |
-| `URL`               | `url::Url`                                |
-| `Headers`           | Cap'n Web `Headers` wrapper               |
-| `Error`             | `RemoteError`                             |
-| `ReadableStream<T>` | `RpcReadStream<T>`                        |
-| `WritableStream<T>` | `RpcWriteSink<T>`                         |
+| TypeScript          | Rust                    |
+| ------------------- | ----------------------- |
+| `Uint8Array`        | `capnweb::Bytes`        |
+| `Uint8ClampedArray` | `capnweb::Bytes`        |
+| other typed arrays  | `capnweb::CapnwebValue` |
+| `ArrayBuffer`       | `capnweb::CapnwebValue` |
+| `DataView`          | `capnweb::CapnwebValue` |
+| `Date`              | `capnweb::CapnwebValue` |
+| `URL`               | `capnweb::CapnwebValue` |
+| `Headers`           | `capnweb::CapnwebValue` |
+| `Error`             | `capnweb::CapnwebValue` |
+| `ReadableStream<T>` | `capnweb::CapnwebValue` |
+| `WritableStream<T>` | `capnweb::CapnwebValue` |
 
-`Blob`, `Request`, and `Response` are deferred from v0. JavaScript `Map`, `Set`, `RegExp`, arbitrary
-application-defined by-value classes, and cyclic value graphs remain unsupported while the wire
-runtime does not support them.
+`Bytes` is distinct from `Vec<u8>` so it always uses the wire byte-string representation rather
+than an RPC array of numbers. More specialized host and stream wrappers can be added later without
+blocking generation today. Omitted TypeScript constructs similarly lower to `CapnwebValue`.
 
 ## Dynamic fallback
 

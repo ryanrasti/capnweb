@@ -1,12 +1,23 @@
-# Kitchen-sink binding sketch
+# Kitchen-sink generated bindings
 
-[`api.d.ts`](api.d.ts) is a hand-written TypeScript contract covering the initial Rust port's
-intended value, capability, callback, promise, and stream surface.
+[`api.d.ts`](api.d.ts) is a broad TypeScript contract covering values, capabilities, callbacks,
+promises, streams, and browser host types.
 
-[`equivalent.rs`](equivalent.rs) is a hand-written sketch of what generated Rust bindings should
-look like. It intentionally does not compile yet: the runtime types and procedural macros it names
-have not been implemented. Keeping it below `examples/kitchen-sink/` prevents Cargo from treating it
-as a runnable top-level example.
+[`generated.rs`](generated.rs) is ordinary Rust emitted by `capnweb-rust-codegen` and compiled by
+`rust/tests/generated_kitchen_sink.rs`. [`equivalent.rs`](equivalent.rs) remains the earlier
+hand-written design sketch.
 
-The pair is a design fixture. Once code generation exists, `equivalent.rs` can become a golden-file
-test and a separate runnable client/server example can implement the generated traits.
+The v0 generator uses typed Rust representations for its supported structural surface, including
+POJOs, arrays, finite tuples, records, capabilities, functions, and `Uint8Array` bytes. Omitted host
+and stream wrappers remain usable as `capnweb::CapnwebValue` rather than preventing the complete API
+from being generated.
+
+Regenerate with:
+
+```sh
+node packages/capnweb-rust-codegen/dist/cli.mjs \
+  --project rust/examples/kitchen-sink/tsconfig.json \
+  --input rust/examples/kitchen-sink/api.d.ts \
+  --root KitchenSinkApi \
+  --out rust/examples/kitchen-sink/generated.rs
+```

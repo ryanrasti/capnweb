@@ -77,6 +77,14 @@ pub fn rpc_interface(_attribute: TokenStream, item: TokenStream) -> TokenStream 
             fn has_member(wire_name: &str) -> bool {
                 false #( || wire_name == #wire_names)*
             }
+
+            fn has_method(wire_name: &str) -> bool {
+                Self::has_member(wire_name)
+            }
+
+            fn has_getter(_wire_name: &str) -> bool {
+                false
+            }
         }
 
         #[derive(Clone)]
@@ -194,7 +202,7 @@ pub fn rpc_target(attribute: TokenStream, item: TokenStream) -> TokenStream {
 
     let interface_guard = interface.as_ref().map(|interface| {
         quote! {
-            if !<#interface as ::capnweb::RpcInterfaceDescriptor>::has_member(&method) {
+            if !<#interface as ::capnweb::RpcInterfaceDescriptor>::has_method(&method) {
                 return Err(::capnweb::Error::Type(format!(
                     "No such RPC method: {}", method
                 )));
@@ -204,7 +212,7 @@ pub fn rpc_target(attribute: TokenStream, item: TokenStream) -> TokenStream {
 
     let getter_interface_guard = interface.as_ref().map(|interface| {
         quote! {
-            if !<#interface as ::capnweb::RpcInterfaceDescriptor>::has_member(&property) {
+            if !<#interface as ::capnweb::RpcInterfaceDescriptor>::has_getter(&property) {
                 return Err(::capnweb::Error::Type(format!(
                     "No such RPC property: {}", property
                 )));

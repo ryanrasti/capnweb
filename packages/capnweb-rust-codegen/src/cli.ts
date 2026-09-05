@@ -8,7 +8,7 @@ import { writeFile } from "node:fs/promises";
 import { loadProject } from "./context.js";
 import { resolveExportedTypes } from "./discover.js";
 import { emitRustSchema } from "./emit-rust.js";
-import { writeGeneratedOutput } from "./output.js";
+import { formatGeneratedRust, writeGeneratedOutput } from "./output.js";
 import { introspectRustSchema } from "./type-introspector.js";
 
 interface Options {
@@ -18,6 +18,7 @@ interface Options {
   out?: string;
   schemaOut?: string;
   check: boolean;
+  rustfmt: boolean;
 }
 
 async function main(argv: readonly string[]): Promise<void> {
@@ -31,6 +32,7 @@ async function main(argv: readonly string[]): Promise<void> {
   }
 
   let rust = emitRustSchema(schema);
+  if (options.rustfmt) rust = await formatGeneratedRust(rust);
   if (options.out) {
     await writeGeneratedOutput(options.out, rust, options.check);
   } else {
@@ -45,6 +47,7 @@ function parseOptions(argv: readonly string[]): Options {
   let out: string | undefined;
   let schemaOut: string | undefined;
   let check = false;
+  let rustfmt = false;
 
   for (let index = 0; index < argv.length; index++) {
     let argument = argv[index]!;
@@ -73,6 +76,9 @@ function parseOptions(argv: readonly string[]): Options {
       case "--check":
         check = true;
         break;
+      case "--rustfmt":
+        rustfmt = true;
+        break;
       case "--help":
         process.stdout.write(USAGE);
         process.exit(0);
@@ -88,6 +94,7 @@ function parseOptions(argv: readonly string[]): Options {
     input,
     roots,
     check,
+    rustfmt,
     ...(out ? { out } : {}),
     ...(schemaOut ? { schemaOut } : {}),
   };
@@ -109,6 +116,7 @@ Options:
   --out <file>          Write generated Rust instead of stdout
   --schema-out <file>   Also write the intermediate schema as JSON
   --check               Fail if --out is absent or stale; do not write it
+  --rustfmt             Format Rust output when rustfmt is installed
   --help                Show this help
 `;
 

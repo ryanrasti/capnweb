@@ -123,7 +123,7 @@ describe("semantic type matrix", () => {
         {
           sourceName: "promised",
           optional: false,
-          type: { kind: "promise", value: { kind: "string" } },
+          type: { kind: "dynamic", reason: "promise-valued parameter" },
         },
       ],
       rest: { kind: "bigint" },
@@ -131,12 +131,12 @@ describe("semantic type matrix", () => {
     });
   });
 
-  test("normalizes optional/null/undefined and preserves recursive object identity", () => {
+  test("allows recursive objects when a container provides indirection", () => {
     let schema = schemaFor(`
       ${RPC_TARGET}
       interface Node {
         name: string;
-        parent?: Node | null;
+        children: Node[];
       }
       export declare class Api extends RpcTarget {
         node(): Node;
@@ -149,13 +149,39 @@ describe("semantic type matrix", () => {
       kind: "object",
       fields: expect.arrayContaining([
         {
-          wireName: "parent",
-          optional: true,
+          wireName: "children",
+          optional: false,
           readonly: false,
-          type: { kind: "nullable", inner: { kind: "named", id: "Node" } },
+          type: {
+            kind: "array",
+            element: { kind: "named", id: "Node" },
+          },
         },
       ]),
     });
+  });
+
+  test("rejects direct and indirect infinitely-sized object layouts", () => {
+    expect(() =>
+      schemaFor(`
+        ${RPC_TARGET}
+        interface Node { parent?: Node | null; }
+        export declare class Api extends RpcTarget { node(): Node; }
+      `)
+    ).toThrow(
+      /api\.ts:\d+:\d+: Recursive by-value object layout: Node\.parent -> Node/
+    );
+
+    expect(() =>
+      schemaFor(`
+        ${RPC_TARGET}
+        interface A { b: B; }
+        interface B { a: A; }
+        export declare class Api extends RpcTarget { value(): A; }
+      `)
+    ).toThrow(
+      "Recursive by-value object layout: A.b -> B.a -> A"
+    );
   });
 
   test("classifies literal, primitive, discriminated, and ambiguous unions", () => {
@@ -177,6 +203,37 @@ describe("semantic type matrix", () => {
         kind: "union",
         sourceName: name,
       });
+    }
+  });
+
+  test("falls back dynamically for omitted TypeScript constructs", () => {
+    let schema = schemaFor(`
+      ${RPC_TARGET}
+      declare const key: unique symbol;
+      type Conditional<T> = T extends string ? string : number;
+      type Mapped = { [K in "left" | "right"]: number };
+      type Intersected = { left: string } & { right: number };
+      type SymbolKeyed = { [key]: string };
+      export declare class Api extends RpcTarget {
+        generic<T>(value: T): T;
+        conditional<T>(value: Conditional<T>): Conditional<T>;
+        mapped(value: Mapped): Mapped;
+        intersected(value: Intersected): Intersected;
+        symbolKeyed(value: SymbolKeyed): SymbolKeyed;
+      }
+    `);
+    for (let wireName of [
+      "generic",
+      "conditional",
+      "mapped",
+      "intersected",
+      "symbolKeyed",
+    ]) {
+      let member = method(schema, wireName);
+      expect(member.kind).toBe("method");
+      if (member.kind !== "method") throw new Error(`${wireName} is not a method`);
+      expect(member.parameters[0]?.type.kind).toBe("dynamic");
+      expect(member.returns.kind).toBe("dynamic");
     }
   });
 

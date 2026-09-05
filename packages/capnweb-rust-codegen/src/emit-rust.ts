@@ -20,6 +20,7 @@ import type {
 interface EmitContext {
   names: ReadonlyMap<TypeId, string>;
   kinds: ReadonlyMap<TypeId, RustDeclaration["kind"]>;
+  declarations: ReadonlyMap<TypeId, RustDeclaration>;
 }
 
 /** Emit ordinary Rust declarations from the semantic schema. */
@@ -28,6 +29,9 @@ export function emitRustSchema(schema: RustSchema): string {
     names: allocateTypeNames(schema.declarations),
     kinds: new Map(
       schema.declarations.map((declaration) => [declaration.id, declaration.kind])
+    ),
+    declarations: new Map(
+      schema.declarations.map((declaration) => [declaration.id, declaration])
     ),
   };
   let schemaHash = createHash("sha256")
@@ -91,14 +95,18 @@ function emitObject(
     )
     .join("\n");
   let decodeFields = fields
-    .map(
-      (field) =>
-        `            ${field.rustName}: <${renderOptionalType(field.type, field.optional, context)} as ::capnweb::FromCapnwebValue>::from_capnweb_value(\n` +
+    .map((field) => {
+      let prefix = `            ${field.rustName}: <${renderOptionalType(field.type, field.optional, context)} as ::capnweb::FromCapnwebValue>::from_capnweb_value(`;
+      let expression = `fields.remove(${rustString(field.wireName)}).unwrap_or(::capnweb::CapnwebValue::Null),`;
+      if (`                ${expression}`.length <= 77) {
+        return `${prefix}\n                ${expression}\n            )?,`;
+      }
+      return `${prefix}\n` +
         "                fields\n" +
         `                    .remove(${rustString(field.wireName)})\n` +
         "                    .unwrap_or(::capnweb::CapnwebValue::Null),\n" +
-        "            )?,"
-    )
+        "            )?,";
+    })
     .join("\n");
   let encodeFields = fields
     .map(
@@ -215,31 +223,45 @@ function emitCapability(
       )
     )
     .join("\n\n");
-  let descriptorMembers = members
-    .map(({ member }) => rustString(member.wireName))
-    .join(", ");
+  let descriptorBody = emitDescriptorBody(members.map(({ member }) => member));
+  let methodDescriptorBody = emitDescriptorBody(
+    members.flatMap(({ member }) => member.kind === "method" ? [member] : [])
+  );
+  let getterDescriptorBody = emitDescriptorBody(
+    members.flatMap(({ member }) => member.kind === "getter" ? [member] : [])
+  );
+  let signatures = functionLike
+    ? ""
+    : emitTargetSignatures(name, members, context);
   let descriptor = functionLike
     ? ""
     : `\n\nimpl ::capnweb::RpcInterfaceDescriptor for ${name} {\n` +
       "    fn has_member(wire_name: &str) -> bool {\n" +
-      (members.length === 0
-        ? "        false\n"
-        : `        [${descriptorMembers}].contains(&wire_name)\n`) +
+      descriptorBody +
+      "    }\n\n" +
+      "    fn has_method(wire_name: &str) -> bool {\n" +
+      methodDescriptorBody +
+      "    }\n\n" +
+      "    fn has_getter(wire_name: &str) -> bool {\n" +
+      getterDescriptorBody +
       "    }\n" +
       "}";
+  let callable = functionLike
+    ? emitCallableSupport(name, members[0]!.member, context)
+    : undefined;
 
-  return `#[derive(Clone, Debug)]
+  return `${signatures}${callable?.typeAlias ?? ""}#[derive(Clone${callable ? "" : ", Debug"})]
 pub struct ${name} {
     inner: ::capnweb::RpcStub,
-}${descriptor}
+${callable ? `    callable: ::std::sync::Arc<${callable.typeName}>,\n` : ""}}${descriptor}${callable?.debugImpl ?? ""}
 
 impl ${name} {
-    pub fn new(inner: ::capnweb::RpcStub) -> Self {
-        Self { inner }
+${callable ? "    #[rustfmt::skip]\n" : ""}    pub fn new(inner: ::capnweb::RpcStub) -> Self {
+${callable?.resolvedConstructor ?? "        Self { inner }"}
     }
 
 ${indent(resolvedMethods, 4)}
-}
+}${callable?.resolvedDeref ?? ""}${callable?.closureImpl ?? ""}
 
 impl ::capnweb::FromCapnwebValue for ${name} {
     fn from_capnweb_value(value: ::capnweb::CapnwebValue) -> ::capnweb::Result<Self> {
@@ -248,7 +270,7 @@ impl ::capnweb::FromCapnwebValue for ${name} {
             ::capnweb::CapnwebValue::Target(target) => Ok(Self::new(
                 ::capnweb::RpcStub::from_value(::capnweb::CapnwebValue::Target(target)),
             )),
-            other => Err(::capnweb::Error::Type(format!(
+${functionLike ? `            ::capnweb::CapnwebValue::Function(target) => Ok(Self::new(\n                ::capnweb::RpcStub::from_value(::capnweb::CapnwebValue::Function(target)),\n            )),\n` : ""}            other => Err(::capnweb::Error::Type(format!(
                 "expected capability for ${name}, got {other:?}",
             ))),
         }
@@ -264,18 +286,18 @@ impl ::capnweb::IntoCapnwebValue for ${name} {
 pub struct ${pendingName} {
     inner: ::capnweb::TypedRpcPromise<${name}>,
     pipeline: ::capnweb::RpcPromise,
-}
+${callable ? `    callable: ::std::sync::Arc<${callable.typeName}>,\n` : ""}}
 
 impl ${pendingName} {
-    fn new(promise: ::capnweb::RpcPromise) -> Self {
-        Self {
+${callable ? "    #[rustfmt::skip]\n" : ""}    fn new(promise: ::capnweb::RpcPromise) -> Self {
+${callable?.pendingConstructor ?? `        Self {
             inner: ::capnweb::TypedRpcPromise::new(promise.clone()),
             pipeline: promise,
-        }
+        }`}
     }
 
 ${indent(pendingMethods, 4)}
-}
+}${callable?.pendingDeref ?? ""}
 
 impl ::std::future::Future for ${pendingName} {
     type Output = ::capnweb::Result<${name}>;
@@ -287,6 +309,186 @@ impl ::std::future::Future for ${pendingName} {
         ::std::pin::Pin::new(&mut self.inner).poll(context)
     }
 }`;
+}
+
+function emitDescriptorBody(members: readonly TargetMember[]): string {
+  if (members.length === 0) return "        let _ = wire_name;\n        false\n";
+  let names = members.map((member) => rustString(member.wireName));
+  let expression = `        [${names.join(", ")}].contains(&wire_name)`;
+  if (expression.length <= 90) return `${expression}\n`;
+  return "        [\n" +
+    names.map((name) => `            ${name},`).join("\n") +
+    "\n        ]\n        .contains(&wire_name)\n";
+}
+
+function emitTargetSignatures(
+  targetName: string,
+  members: readonly { member: TargetMember; rustName: string }[],
+  context: EmitContext
+): string {
+  let aliases = members
+    .map(({ member, rustName }) => {
+      let memberName = toRustTypeName(rustName);
+      let result = `    pub type ${memberName}Result = ${renderType(member.returns, context)};`;
+      if (member.kind === "getter") return result;
+      let argumentTypes = member.parameters.map((parameter) =>
+        renderOptionalType(parameter.type, parameter.optional, context)
+      );
+      if (member.rest) argumentTypes.push(`Vec<${renderType(member.rest, context)}>`);
+      let tuple = `(${argumentTypes.join(", ")}${argumentTypes.length === 1 ? "," : ""})`;
+      return `    pub type ${memberName}Arguments = ${tuple};\n${result}`;
+    })
+    .join("\n");
+  let moduleName = `__capnweb_${toRustFieldName(targetName)}_signatures`;
+  return `#[doc(hidden)]
+pub mod ${moduleName} {
+    #[allow(unused_imports)]
+    use super::*;
+${aliases}
+}
+
+`;
+}
+
+interface CallableSupport {
+  typeName: string;
+  typeAlias: string;
+  debugImpl: string;
+  resolvedConstructor: string;
+  resolvedDeref: string;
+  closureImpl: string;
+  pendingConstructor: string;
+  pendingDeref: string;
+}
+
+function emitCallableSupport(
+  name: string,
+  member: TargetMember,
+  context: EmitContext
+): CallableSupport {
+  if (member.kind !== "method") throw new Error("a function must have a call signature");
+  let allocator = new NameAllocator();
+  let parameters = member.parameters.map((parameter) => ({
+    rustName: allocator.allocate(toRustFieldName(parameter.sourceName)),
+    type: renderOptionalType(parameter.type, parameter.optional, context),
+  }));
+  let restName = member.rest ? allocator.allocate("rest") : undefined;
+  if (member.rest && restName) {
+    parameters.push({ rustName: restName, type: `Vec<${renderType(member.rest, context)}>` });
+  }
+  let declarations = parameters
+    .map((parameter) => `${parameter.rustName}: ${parameter.type}`)
+    .join(", ");
+  let argumentTypes = parameters.map((parameter) => parameter.type).join(", ");
+  let argumentNames = parameters.map((parameter) => parameter.rustName);
+  let returnValueType = renderType(member.returns, context);
+  let returnType = renderPendingType(member.returns, context);
+  let typeName = `${name}Callable`;
+  let resolvedCall = emitCallExpression(
+    member,
+    "callable_inner",
+    argumentNames.slice(0, member.parameters.length),
+    restName,
+    true
+  );
+  let pendingCall = emitCallExpression(
+    member,
+    "callable_pipeline",
+    argumentNames.slice(0, member.parameters.length),
+    restName,
+    true
+  );
+  let wrap = (call: string) =>
+    `            let promise = ${call};\n` +
+    `            ${wrapPending(member.returns, "promise", context)}`;
+  let debugImpl = `\n\nimpl ::std::fmt::Debug for ${name} {
+    fn fmt(&self, formatter: &mut ::std::fmt::Formatter<'_>) -> ::std::fmt::Result {
+        formatter.write_str("${name}(..)")
+    }
+}`;
+  let resolvedDeref = `\n\nimpl ::std::ops::Deref for ${name} {
+    type Target = ${typeName};
+
+    fn deref(&self) -> &Self::Target {
+        self.callable.as_ref()
+    }
+}`;
+  let pendingName = `Pending${name}`;
+  let pendingDeref = `\n\nimpl ::std::ops::Deref for ${pendingName} {
+    type Target = ${typeName};
+
+    fn deref(&self) -> &Self::Target {
+        self.callable.as_ref()
+    }
+}`;
+  let decodedParameters = member.parameters
+    .map((parameter, index) => {
+      let decoded = parameters[index]!;
+      return `                let ${decoded.rustName}: ${decoded.type} =
+                    ::capnweb::FromCapnwebValue::from_capnweb_value(arguments.next().ok_or_else(
+                        || ::capnweb::Error::Type(${rustString(`missing argument \`${parameter.sourceName}\``)}.to_owned()),
+                    )?)?;`;
+    })
+    .join("\n");
+  let restDecoder = member.rest && restName
+    ? `                let ${restName}: Vec<${renderType(member.rest, context)}> = arguments
+                    .map(::capnweb::FromCapnwebValue::from_capnweb_value)
+                    .collect::<::capnweb::Result<Vec<_>>>()?;`
+    : `                if arguments.next().is_some() {
+                    return Err(::capnweb::Error::Type(
+                        "too many arguments for RPC function".to_owned(),
+                    ));
+                }`;
+  let closureImpl = `\n\nimpl<F, Fut> From<F> for ${name}
+where
+    F: Fn(${argumentTypes}) -> Fut + Send + Sync + 'static,
+    Fut: ::std::future::Future<Output = ${returnValueType}> + Send + 'static,
+{
+    fn from(function: F) -> Self {
+        let function = ::std::sync::Arc::new(function);
+        let target = ::capnweb::function_target(move |arguments| {
+            let function = ::std::sync::Arc::clone(&function);
+            async move {
+                let delivered = arguments.deliver_resolve().await?;
+                let ::capnweb::CapnwebValue::Array(values) = delivered else {
+                    return Err(::capnweb::Error::Type(
+                        "function arguments are not an array".to_owned(),
+                    ));
+                };
+                let mut arguments = values.into_iter();
+${decodedParameters}
+${restDecoder}
+                let result = function(${argumentNames.join(", ")}).await;
+                ::capnweb::IntoCapnwebValue::into_capnweb_value(result)
+            }
+        });
+        Self::new(::capnweb::RpcStub::from_value(target))
+    }
+}`;
+  return {
+    typeName,
+    typeAlias: `pub type ${typeName} = dyn Fn(${argumentTypes}) -> ${returnType} + Send + Sync;\n\n`,
+    debugImpl,
+    resolvedConstructor:
+      "        let callable_inner = inner.clone();\n" +
+      `        let callable: ::std::sync::Arc<${typeName}> = ::std::sync::Arc::new(move |${declarations}| {\n` +
+      `${wrap(resolvedCall)}\n` +
+      "        });\n" +
+      "        Self { inner, callable }",
+    resolvedDeref,
+    closureImpl,
+    pendingConstructor:
+      "        let callable_pipeline = promise.clone();\n" +
+      `        let callable: ::std::sync::Arc<${typeName}> = ::std::sync::Arc::new(move |${declarations}| {\n` +
+      `${wrap(pendingCall)}\n` +
+      "        });\n" +
+      "        Self {\n" +
+      "            inner: ::capnweb::TypedRpcPromise::new(promise.clone()),\n" +
+      "            pipeline: promise,\n" +
+      "            callable,\n" +
+      "        }",
+    pendingDeref,
+  };
 }
 
 function emitFunction(
@@ -317,6 +519,15 @@ function emitUnion(
   context: EmitContext
 ): string {
   let name = requiredName(context, declaration.id);
+  if (declaration.nullable) {
+    let valueName = `${name}Value`;
+    let nonNullable = emitUnion({ ...declaration, nullable: false }, context);
+    let renamed = nonNullable.replace(
+      new RegExp(`\\b${escapeRegExp(name)}\\b`, "g"),
+      valueName
+    );
+    return `pub type ${name} = Option<${valueName}>;\n\n${renamed}`;
+  }
   let literals = declaration.branches.filter(
     (branch): branch is Extract<TypeRef, { kind: "literal" }> =>
       branch.kind === "literal" && typeof branch.value === "string"
@@ -375,8 +586,245 @@ ${encodeArms}
     }
 }`;
   }
+
+  let primitiveBranches = declaration.branches.map(primitiveUnionBranch);
+  if (
+    !declaration.nullable &&
+    primitiveBranches.every((branch) => branch !== undefined) &&
+    new Set(primitiveBranches.map((branch) => branch?.variant)).size ===
+      primitiveBranches.length
+  ) {
+    let branches = primitiveBranches as PrimitiveUnionBranch[];
+    let variants = branches
+      .map((branch) => `    ${branch.variant}(${branch.rustType}),`)
+      .join("\n");
+    let decodeArms = branches
+      .map(
+        (branch) =>
+          `            ::capnweb::CapnwebValue::${branch.valueVariant}(value) => Ok(Self::${branch.variant}(value)),`
+      )
+      .join("\n");
+    let encodeArms = branches
+      .map(
+        (branch) =>
+          `            Self::${branch.variant}(value) => Ok(::capnweb::CapnwebValue::${branch.valueVariant}(value)),`
+      )
+      .join("\n");
+    return `#[derive(Clone, Debug)]
+pub enum ${name} {
+${variants}
+}
+
+impl ::capnweb::FromCapnwebValue for ${name} {
+    fn from_capnweb_value(value: ::capnweb::CapnwebValue) -> ::capnweb::Result<Self> {
+        match value {
+${decodeArms}
+            other => Err(::capnweb::Error::Type(format!(
+                "expected ${name}, got {other:?}",
+            ))),
+        }
+    }
+}
+
+impl ::capnweb::IntoCapnwebValue for ${name} {
+    fn into_capnweb_value(self) -> ::capnweb::Result<::capnweb::CapnwebValue> {
+        match self {
+${encodeArms}
+        }
+    }
+}`;
+  }
+
+  let discriminated = findDiscriminatedUnion(declaration, context);
+  if (discriminated && !declaration.nullable) {
+    let variantAllocator = new NameAllocator();
+    let variants = discriminated.branches.map((branch) => {
+      let fieldAllocator = new NameAllocator();
+      return {
+        ...branch,
+        variantName: variantAllocator.allocate(toRustTypeName(branch.literal)),
+        fields: branch.object.fields.map((field) => ({
+          ...field,
+          rustName: fieldAllocator.allocate(toRustFieldName(field.wireName)),
+        })),
+      };
+    });
+    let variantDeclarations = variants
+      .map((variant) => {
+        let fields = variant.fields
+          .filter((field) => field.wireName !== discriminated.field)
+          .map(
+            (field) =>
+              `        ${field.rustName}: ${renderOptionalType(field.type, field.optional, context)},`
+          )
+          .join("\n");
+        if (!fields) return `    ${variant.variantName},`;
+        let payload = variant.fields.filter(
+          (field) => field.wireName !== discriminated.field
+        );
+        if (payload.length === 1) {
+          let field = payload[0]!;
+          let single = `    ${variant.variantName} { ${field.rustName}: ${renderOptionalType(field.type, field.optional, context)} },`;
+          if (single.length <= 100) return single;
+        }
+        return `    ${variant.variantName} {\n${fields}\n    },`;
+      })
+      .join("\n");
+    let decodeArms = variants
+      .map((variant) => {
+        let payload = variant.fields.filter(
+          (field) => field.wireName !== discriminated.field
+        );
+        let destructured = variant.fields
+          .map((field) =>
+            field.wireName === discriminated.field
+              ? `${field.rustName}: _`
+              : field.rustName
+          )
+          .join(", ");
+        let result = payload.length
+          ? `Self::${variant.variantName} { ${payload.map((field) => field.rustName).join(", ")} }`
+          : `Self::${variant.variantName}`;
+        return `            ${rustString(variant.literal)} => {\n` +
+          `                let ${variant.objectName} { ${destructured} } =\n` +
+          `                    <${variant.objectName} as ::capnweb::FromCapnwebValue>::from_capnweb_value(value)?;\n` +
+          `                Ok(${result})\n` +
+          "            }";
+      })
+      .join("\n");
+    let encodeArms = variants
+      .map((variant) => {
+        let payload = variant.fields.filter(
+          (field) => field.wireName !== discriminated.field
+        );
+        let pattern = payload.length
+          ? `Self::${variant.variantName} { ${payload.map((field) => field.rustName).join(", ")} }`
+          : `Self::${variant.variantName}`;
+        let initializers = variant.fields
+          .map((field) =>
+            field.wireName === discriminated.field
+              ? `                ${field.rustName}: ${rustString(variant.literal)}.to_owned(),`
+              : `                ${field.rustName},`
+          )
+          .join("\n");
+        return `            ${pattern} => ::capnweb::IntoCapnwebValue::into_capnweb_value(${variant.objectName} {\n` +
+          `${initializers}\n` +
+          "            }),";
+      })
+      .join("\n");
+    return `#[derive(Clone, Debug)]
+pub enum ${name} {
+${variantDeclarations}
+}
+
+impl ::capnweb::FromCapnwebValue for ${name} {
+    fn from_capnweb_value(value: ::capnweb::CapnwebValue) -> ::capnweb::Result<Self> {
+        let discriminator = match &value {
+            ::capnweb::CapnwebValue::Object(fields) => fields.get(${rustString(discriminated.field)}),
+            _ => None,
+        };
+        let ::std::option::Option::Some(::capnweb::CapnwebValue::String(discriminator)) =
+            discriminator
+        else {
+            return Err(::capnweb::Error::Type(
+                "expected ${name} discriminator ${discriminated.field}".to_owned(),
+            ));
+        };
+        match discriminator.as_str() {
+${decodeArms}
+            other => Err(::capnweb::Error::Type(format!(
+                "unknown ${name} discriminator {other:?}",
+            ))),
+        }
+    }
+}
+
+impl ::capnweb::IntoCapnwebValue for ${name} {
+    fn into_capnweb_value(self) -> ::capnweb::Result<::capnweb::CapnwebValue> {
+        match self {
+${encodeArms}
+        }
+    }
+}`;
+  }
+
   return `// This union is structurally ambiguous on the wire in v0.
 pub type ${name} = ::capnweb::CapnwebValue;`;
+}
+
+interface PrimitiveUnionBranch {
+  variant: string;
+  rustType: string;
+  valueVariant: string;
+}
+
+function primitiveUnionBranch(type: TypeRef): PrimitiveUnionBranch | undefined {
+  switch (type.kind) {
+    case "string":
+      return { variant: "String", rustType: "String", valueVariant: "String" };
+    case "number":
+      return { variant: "Number", rustType: "f64", valueVariant: "Number" };
+    case "boolean":
+      return { variant: "Boolean", rustType: "bool", valueVariant: "Bool" };
+    case "bigint":
+      return {
+        variant: "BigInt",
+        rustType: "::capnweb::BigInt",
+        valueVariant: "BigInt",
+      };
+    default:
+      return undefined;
+  }
+}
+
+interface DiscriminatedBranch {
+  literal: string;
+  object: ObjectDeclaration;
+  objectName: string;
+}
+
+function findDiscriminatedUnion(
+  declaration: UnionDeclaration,
+  context: EmitContext
+): { field: string; branches: DiscriminatedBranch[] } | undefined {
+  let objects = declaration.branches.map((branch) => {
+    if (branch.kind !== "named") return undefined;
+    let candidate = context.declarations.get(branch.id);
+    return candidate?.kind === "object" ? candidate : undefined;
+  });
+  if (objects.some((object) => !object)) return undefined;
+  let concrete = objects as ObjectDeclaration[];
+  let first = concrete[0];
+  if (!first) return undefined;
+
+  for (let field of first.fields) {
+    if (field.type.kind !== "literal" || typeof field.type.value !== "string") continue;
+    let seen = new Set<string>();
+    let branches: DiscriminatedBranch[] = [];
+    for (let object of concrete) {
+      let discriminator = object.fields.find(
+        (candidate) => candidate.wireName === field.wireName
+      );
+      if (
+        discriminator?.type.kind !== "literal" ||
+        typeof discriminator.type.value !== "string" ||
+        seen.has(discriminator.type.value)
+      ) {
+        branches.length = 0;
+        break;
+      }
+      seen.add(discriminator.type.value);
+      branches.push({
+        literal: discriminator.type.value,
+        object,
+        objectName: requiredName(context, object.id),
+      });
+    }
+    if (branches.length === concrete.length) {
+      return { field: field.wireName, branches };
+    }
+  }
+  return undefined;
 }
 
 function emitClientMethod(
@@ -412,7 +860,15 @@ function emitClientMethod(
           functionLike
         );
   let renderedParameters = signature.join(", ");
-  return `pub fn ${rustName}(&self${renderedParameters ? `, ${renderedParameters}` : ""}) -> ${returnType} {
+  let singleLine = `pub fn ${rustName}(&self${renderedParameters ? `, ${renderedParameters}` : ""}) -> ${returnType} {`;
+  let header =
+    singleLine.length <= 96
+      ? singleLine
+      : `pub fn ${rustName}(\n` +
+        "    &self,\n" +
+        signature.map((parameter) => `    ${parameter},`).join("\n") +
+        `\n) -> ${returnType} {`;
+  return `${header}
     let promise = ${promise};
     ${wrapPending(member.returns, "promise", context)}
 }`;
@@ -426,15 +882,18 @@ function emitCallExpression(
   functionLike: boolean
 ): string {
   if (member.kind !== "method") throw new Error("expected method");
-  let initialArguments = parameterNames
-    .map(
-      (name) =>
-        `::capnweb::IntoCapnwebValue::into_capnweb_value(${name})?`
-    )
-    .join(", ");
-  let declaration = restName
-    ? `            let mut arguments = vec![${initialArguments}];`
-    : `            let arguments = vec![${initialArguments}];`;
+  let argumentExpressions = parameterNames.map(
+    (name) => `::capnweb::IntoCapnwebValue::into_capnweb_value(${name})?`
+  );
+  let inlineDeclaration = `            let ${restName ? "mut " : ""}arguments = vec![${argumentExpressions.join(", ")}];`;
+  let multilineArguments = argumentExpressions
+    .map((expression) => `                ${expression},`)
+    .join("\n");
+  let declaration = restName && parameterNames.length === 0
+    ? "            let mut arguments: Vec<::capnweb::CapnwebValue> = Vec::new();"
+    : inlineDeclaration.length <= 100
+      ? inlineDeclaration
+      : `            let ${restName ? "mut " : ""}arguments = vec![\n${multilineArguments}\n            ];`;
   let restPush = restName
     ? `\n            for value in ${restName} {\n                arguments.push(::capnweb::IntoCapnwebValue::into_capnweb_value(value)?);\n            }`
     : "";
@@ -512,10 +971,10 @@ function renderType(type: TypeRef, context: EmitContext): string {
     case "array":
       return `Vec<${renderType(type.element, context)}>`;
     case "tuple": {
+      if (type.rest) return "::capnweb::CapnwebValue";
       let elements = type.elements.map((element) =>
         renderOptionalType(element.type, element.optional, context)
       );
-      if (type.rest) throw new Error("variadic tuples are not implemented");
       return `(${elements.join(", ")}${elements.length === 1 ? "," : ""})`;
     }
     case "record":
@@ -525,9 +984,8 @@ function renderType(type: TypeRef, context: EmitContext): string {
     case "promise":
       return `::capnweb::RpcPromise`;
     case "readableStream":
-      return `::capnweb::RpcReadStream<${renderType(type.chunk, context)}>`;
     case "writableStream":
-      return `::capnweb::RpcWriteSink<${renderType(type.chunk, context)}>`;
+      return "::capnweb::CapnwebValue";
     case "union":
     case "dynamic":
       return "::capnweb::CapnwebValue";
@@ -540,6 +998,10 @@ function requiredName(context: EmitContext, id: TypeId): string {
   let name = context.names.get(id);
   if (!name) throw new Error(`Schema references missing declaration ${id}`);
   return name;
+}
+
+function escapeRegExp(value: string): string {
+  return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 }
 
 function rustString(value: string): string {
@@ -557,21 +1019,21 @@ function indent(value: string, spaces: number): string {
 }
 
 const BUILTIN_RUST_TYPES = {
-  arrayBuffer: "::capnweb::ArrayBuffer",
-  dataView: "::capnweb::DataView",
-  date: "::capnweb::Date",
-  error: "::capnweb::RemoteError",
-  headers: "::capnweb::Headers",
-  url: "::url::Url",
-  int8Array: "Vec<i8>",
-  uint8Array: "Vec<u8>",
-  uint8ClampedArray: "Vec<u8>",
-  int16Array: "Vec<i16>",
-  uint16Array: "Vec<u16>",
-  int32Array: "Vec<i32>",
-  uint32Array: "Vec<u32>",
-  bigInt64Array: "Vec<i64>",
-  bigUint64Array: "Vec<u64>",
-  float32Array: "Vec<f32>",
-  float64Array: "Vec<f64>",
+  arrayBuffer: "::capnweb::CapnwebValue",
+  dataView: "::capnweb::CapnwebValue",
+  date: "::capnweb::CapnwebValue",
+  error: "::capnweb::CapnwebValue",
+  headers: "::capnweb::CapnwebValue",
+  url: "::capnweb::CapnwebValue",
+  int8Array: "::capnweb::CapnwebValue",
+  uint8Array: "::capnweb::Bytes",
+  uint8ClampedArray: "::capnweb::Bytes",
+  int16Array: "::capnweb::CapnwebValue",
+  uint16Array: "::capnweb::CapnwebValue",
+  int32Array: "::capnweb::CapnwebValue",
+  uint32Array: "::capnweb::CapnwebValue",
+  bigInt64Array: "::capnweb::CapnwebValue",
+  bigUint64Array: "::capnweb::CapnwebValue",
+  float32Array: "::capnweb::CapnwebValue",
+  float64Array: "::capnweb::CapnwebValue",
 } as const;
