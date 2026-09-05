@@ -26,14 +26,20 @@ pub use serialize::{
     DEFAULT_LIMITS, DEFAULT_MAX_DEPTH, EncodingLevel, ExportId, Exporter, ImportId, Importer,
     RpcLimits, deserialize, serialize,
 };
-pub use typed::{FromCapnwebValue, IntoCapnwebValue, RpcInterfaceDescriptor, TypedRpcPromise};
+pub use typed::{
+    Bytes, FromCapnwebValue, IntoCapnwebValue, RpcInterfaceDescriptor, TypedRpcPromise,
+};
 
 // JS: import { RpcTargetBranded, RpcCompatible, Stub, ElideStub, PayloadOrStub,
 // JS:          type RpcPromise as RpcPromiseType, __RPC_TARGET_BRAND } from "./types.js";
 // JS: import { newWebSocketRpcSession as newWebSocketRpcSessionImpl,
 // JS:          newWorkersWebSocketRpcResponse, WebSocketTransport } from "./websocket.js";
+mod websocket;
+pub use websocket::{MAX_CLOSE_REASON_BYTES, WebSocketTransport, new_websocket_rpc_session};
 // JS: import { newHttpBatchRpcSession as newHttpBatchRpcSessionImpl,
 // JS:          newHttpBatchRpcResponse, nodeHttpBatchRpcResponse } from "./batch.js";
+mod batch;
+pub use batch::{http_request, new_http_batch_rpc_response, new_http_batch_rpc_session};
 // JS: import { newMessagePortRpcSession as newMessagePortRpcSessionImpl } from "./messageport.js";
 // JS: import { forceInitMap } from "./map.js";
 mod map;

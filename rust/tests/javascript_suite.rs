@@ -1,5 +1,7 @@
 #![allow(dead_code)]
 
+#[path = "../src/batch.rs"]
+mod batch;
 #[path = "../src/core.rs"]
 mod core;
 #[path = "../src/eager_promise.rs"]
@@ -12,6 +14,8 @@ mod rpc;
 mod serialize;
 #[path = "../src/streams.rs"]
 mod streams;
+#[path = "../src/websocket.rs"]
+mod websocket;
 
 #[path = "javascript/flow_control_test.rs"]
 mod flow_control_test;

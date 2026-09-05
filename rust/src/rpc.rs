@@ -680,6 +680,9 @@ struct RpcImportHook {
     is_promise: bool,
     entry: Arc<Mutex<ImportTableEntry>>,
     shutdown_on_drop: bool,
+    // RUST-DIFF(local refcount): the main hook holds a strong session so JS-style `newHttpBatchRpcSession()`
+    // can return only the stub without dropping the session tables.
+    session_keepalive: Option<Arc<Mutex<RpcSessionState>>>,
 }
 // JS:   public entry?: ImportTableEntry;  // undefined when we're disposed
 // Rust ownership keeps the entry present until the final hook `Arc` is dropped.
@@ -700,6 +703,7 @@ impl RpcImportHook {
             is_promise,
             entry,
             shutdown_on_drop: false,
+            session_keepalive: None,
         }
         // JS:   }
     }
@@ -1174,6 +1178,7 @@ impl RpcSessionImpl {
             .ok_or_else(|| Error::Message("missing main import".to_owned()))?;
         let mut hook = RpcImportHook::new(false, entry);
         hook.shutdown_on_drop = true;
+        hook.session_keepalive = Some(Arc::clone(&self.state));
         Ok(RpcStub::from_hook(Arc::new(hook), None))
         // JS:   }
     }

@@ -14,6 +14,7 @@
 // JS: import { Counter, TestTarget } from "./test-util.js";
 // JS:
 // JS: type CustomEncodingLevel = RpcTransportWithCustomEncoding["encodingLevel"];
+use crate::batch::{http_request, new_http_batch_rpc_response, new_http_batch_rpc_session};
 use crate::core::{
     CapnwebError, CapnwebValue, Error, ErrorStubHook, PayloadStubHook, PromiseStubHook,
     PropertyKey, PropertyPath, Result, RpcPayload, RpcPromise, RpcStub, RpcTargetInner, StubHook,
@@ -21,6 +22,7 @@ use crate::core::{
 };
 use crate::rpc::{AnyRpcTransport, RpcSession, RpcSessionOptions, TransportMessage, TransportSend};
 use crate::serialize::{EncodingLevel, deserialize, serialize, swap_byte_order};
+use crate::websocket::{WebSocketTransport, new_websocket_rpc_session};
 use num_bigint::BigInt;
 use std::collections::BTreeMap;
 use std::future::{Future, pending};
@@ -7054,49 +7056,236 @@ mod constructing_rpc_promise {
 }
 // JS:
 // JS: // =======================================================================================
+async fn start_index_test_server() -> String {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let host = listener.local_addr().unwrap().to_string();
+    tokio::spawn(async move {
+        loop {
+            let Ok((stream, _)) = listener.accept().await else {
+                break;
+            };
+            tokio::spawn(handle_index_test_connection(stream));
+        }
+    });
+    host
+}
+
+async fn handle_index_test_connection(mut stream: tokio::net::TcpStream) {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let mut peek = [0u8; 1024];
+    let Ok(n) = stream.peek(&mut peek).await else {
+        return;
+    };
+    let header = String::from_utf8_lossy(&peek[..n]).to_ascii_lowercase();
+    if header.contains("upgrade: websocket") {
+        let Ok(transport) = WebSocketTransport::accept(stream).await else {
+            return;
+        };
+        let Ok(_session) = RpcSession::new(
+            transport,
+            Some(CapnwebValue::Target(Arc::new(LocalTestTarget))),
+            RpcSessionOptions::default(),
+        ) else {
+            return;
+        };
+        pending::<()>().await;
+        return;
+    }
+    let mut data = Vec::new();
+    loop {
+        let mut chunk = [0u8; 1024];
+        let Ok(n) = stream.read(&mut chunk).await else {
+            return;
+        };
+        if n == 0 {
+            break;
+        }
+        data.extend_from_slice(&chunk[..n]);
+        if let Some(index) = data.windows(4).position(|window| window == b"\r\n\r\n") {
+            let header = String::from_utf8_lossy(&data[..index]);
+            let method = header.split_whitespace().next().unwrap_or("").to_owned();
+            let content_length = header
+                .lines()
+                .find_map(|line| {
+                    line.split_once(':').and_then(|(name, value)| {
+                        (name.eq_ignore_ascii_case("content-length"))
+                            .then(|| value.trim().parse::<usize>().ok())
+                            .flatten()
+                    })
+                })
+                .unwrap_or(0);
+            let mut body = data[index + 4..].to_vec();
+            while body.len() < content_length {
+                let mut chunk = [0u8; 1024];
+                let Ok(n) = stream.read(&mut chunk).await else {
+                    return;
+                };
+                if n == 0 {
+                    break;
+                }
+                body.extend_from_slice(&chunk[..n]);
+            }
+            body.truncate(content_length);
+            let body = String::from_utf8_lossy(&body).into_owned();
+            let Ok((status, response_body)) = new_http_batch_rpc_response(
+                &method,
+                &body,
+                CapnwebValue::Target(Arc::new(LocalTestTarget)),
+                RpcSessionOptions::default(),
+            )
+            .await
+            else {
+                return;
+            };
+            let reason = if status == 405 {
+                "Method Not Allowed"
+            } else {
+                "OK"
+            };
+            let response = format!(
+                "HTTP/1.1 {status} {reason}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{response_body}",
+                response_body.len()
+            );
+            let _ = stream.write_all(response.as_bytes()).await;
+            return;
+        }
+        if n == 0 {
+            return;
+        }
+    }
+}
 // JS:
 // JS: describe("HTTP requests", () => {
-// JS:   it("can perform a batch HTTP request", async () => {
-// JS:     let cap = newHttpBatchRpcSession<TestTarget>(`http://${inject("testServerHost")}`);
-// JS:
-// JS:     let promise1 = cap.square(6);
-// JS:
-// JS:     let counter = cap.makeCounter(2);
-// JS:     let promise2 = counter.increment(3);
-// JS:     let promise3 = cap.incrementCounter(counter, 4);
-// JS:
-// JS:     expect(await Promise.all([promise1, promise2, promise3]))
-// JS:         .toStrictEqual([36, 5, 9]);
-// JS:   });
-// JS:
-// JS:   it("rejects non-POST requests with 405", async () => {
-// JS:     let response = await fetch(`http://${inject("testServerHost")}`, { method: "GET" });
-// JS:     expect(response.status).toBe(405);
-// JS:     await response.text();
-// JS:   });
-// JS: });
+mod http_requests {
+    use super::*;
+    // JS:   it("can perform a batch HTTP request", async () => {
+    #[tokio::test(flavor = "current_thread")]
+    async fn can_perform_a_batch_http_request() {
+        // JS:     let cap = newHttpBatchRpcSession<TestTarget>(`http://${inject("testServerHost")}`);
+        let host = start_index_test_server().await;
+        let cap =
+            new_http_batch_rpc_session(&format!("http://{host}"), RpcSessionOptions::default())
+                .unwrap();
+        // JS:
+        // JS:     let promise1 = cap.square(6);
+        let promise1 = cap.call(vec!["square".to_owned()], one_number_argument(6.0));
+        // JS:
+        // JS:     let counter = cap.makeCounter(2);
+        let counter = cap.call(vec!["makeCounter".to_owned()], one_number_argument(2.0));
+        // JS:     let promise2 = counter.increment(3);
+        let promise2 = counter.call(vec!["increment".to_owned()], one_number_argument(3.0));
+        // JS:     let promise3 = cap.incrementCounter(counter, 4);
+        let promise3 = cap.call(
+            vec!["incrementCounter".to_owned()],
+            RpcPayload::from_app_params(CapnwebValue::Array(vec![
+                CapnwebValue::RpcPromise(counter),
+                CapnwebValue::Number(4.0),
+            ])),
+        );
+        // JS:
+        // JS:     expect(await Promise.all([promise1, promise2, promise3]))
+        let results =
+            futures::future::join_all([promise1.pull(), promise2.pull(), promise3.pull()]).await;
+        // JS:         .toStrictEqual([36, 5, 9]);
+        assert!(matches!(
+            results[0].as_ref().unwrap(),
+            CapnwebValue::Number(36.0)
+        ));
+        assert!(matches!(
+            results[1].as_ref().unwrap(),
+            CapnwebValue::Number(5.0)
+        ));
+        assert!(matches!(
+            results[2].as_ref().unwrap(),
+            CapnwebValue::Number(9.0)
+        ));
+        // JS:   });
+    }
+    // JS:
+    // JS:   it("rejects non-POST requests with 405", async () => {
+    #[tokio::test(flavor = "current_thread")]
+    async fn rejects_non_post_requests_with_405() {
+        // JS:     let response = await fetch(`http://${inject("testServerHost")}`, { method: "GET" });
+        let host = start_index_test_server().await;
+        let (status, _, _) = http_request("GET", &format!("http://{host}"), "")
+            .await
+            .unwrap();
+        // JS:     expect(response.status).toBe(405);
+        assert_eq!(status, 405);
+        // JS:     await response.text();
+        // Body is ignored, matching the JS test.
+        // JS:   });
+    }
+    // JS: });
+}
 // JS:
 // JS: describe("WebSockets", () => {
-// JS:   it("can open a WebSocket connection", async () => {
-// JS:     let url = `ws://${inject("testServerHost")}`;
-// JS:
-// JS:     let cap = newWebSocketRpcSession<TestTarget>(url);
-// JS:
-// JS:     expect(await cap.square(5)).toBe(25);
-// JS:
-// JS:     {
-// JS:       let counter = cap.makeCounter(2);
-// JS:       expect(await counter.increment(3)).toBe(5);
-// JS:     }
-// JS:
-// JS:     {
-// JS:       let counter = new Counter(4);
-// JS:       expect(await cap.incrementCounter(counter, 9)).toBe(13);
-// JS:     }
-// JS:   });
-// JS: });
+mod websockets {
+    use super::*;
+    // JS:   it("can open a WebSocket connection", async () => {
+    #[tokio::test(flavor = "current_thread")]
+    async fn can_open_a_websocket_connection() {
+        // JS:     let url = `ws://${inject("testServerHost")}`;
+        let host = start_index_test_server().await;
+        let url = format!("ws://{host}");
+        // JS:
+        // JS:     let cap = newWebSocketRpcSession<TestTarget>(url);
+        let cap = new_websocket_rpc_session(&url, None, RpcSessionOptions::default())
+            .await
+            .unwrap();
+        // JS:
+        // JS:     expect(await cap.square(5)).toBe(25);
+        assert!(matches!(
+            cap.call(vec!["square".to_owned()], one_number_argument(5.0))
+                .pull()
+                .await
+                .unwrap(),
+            CapnwebValue::Number(25.0)
+        ));
+        // JS:
+        // JS:     {
+        {
+            // JS:       let counter = cap.makeCounter(2);
+            let counter = cap.call(vec!["makeCounter".to_owned()], one_number_argument(2.0));
+            // JS:       expect(await counter.increment(3)).toBe(5);
+            assert!(matches!(
+                counter
+                    .call(vec!["increment".to_owned()], one_number_argument(3.0))
+                    .pull()
+                    .await
+                    .unwrap(),
+                CapnwebValue::Number(5.0)
+            ));
+            // JS:     }
+        }
+        // JS:
+        // JS:     {
+        {
+            // JS:       let counter = new Counter(4);
+            let counter = local_counter(4.0);
+            // JS:       expect(await cap.incrementCounter(counter, 9)).toBe(13);
+            assert!(matches!(
+                cap.call(
+                    vec!["incrementCounter".to_owned()],
+                    RpcPayload::from_app_params(CapnwebValue::Array(vec![
+                        CapnwebValue::Stub(counter),
+                        CapnwebValue::Number(9.0)
+                    ]))
+                )
+                .pull()
+                .await
+                .unwrap(),
+                CapnwebValue::Number(13.0)
+            ));
+            // JS:     }
+        }
+        // JS:   });
+    }
+    // JS: });
+}
 // JS:
 // JS: describe("MessagePorts", () => {
+// RUST-DEFERRED(JS built-in: MessagePort): browser MessageChannel sessions are omitted.
 // JS:   it("can communicate over MessageChannel", async () => {
 // JS:     // Create a MessageChannel for communication
 // JS:     let channel = new MessageChannel();
