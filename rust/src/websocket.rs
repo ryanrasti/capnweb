@@ -146,7 +146,10 @@ impl WebSocketTransport {
 
     /// Connects a client-side WebSocket transport to `url`.
     pub async fn connect(url: &str) -> Result<Arc<Self>> {
-        let (stream, _) = tokio_tungstenite::connect_async(url)
+        // Cap'n Web RPC consists of small request/response messages. Leaving
+        // Nagle enabled can pair badly with delayed ACKs and add ~40 ms to
+        // every round trip, so request TCP_NODELAY from tokio-tungstenite.
+        let (stream, _) = tokio_tungstenite::connect_async_with_config(url, None, true)
             .await
             .map_err(|error| Error::Message(format!("WebSocket connection failed: {error}")))?;
         Ok(Self::attach(stream))
@@ -154,6 +157,9 @@ impl WebSocketTransport {
 
     /// Accepts a server-side WebSocket on an already-connected TCP stream.
     pub async fn accept(stream: tokio::net::TcpStream) -> Result<Arc<Self>> {
+        stream
+            .set_nodelay(true)
+            .map_err(|error| Error::Message(format!("Failed to set TCP_NODELAY: {error}")))?;
         let stream = tokio_tungstenite::accept_async(stream)
             .await
             .map_err(|error| Error::Message(format!("WebSocket accept failed: {error}")))?;
