@@ -13,12 +13,14 @@
 - Stable generated-binding facade
 - HTTP batch and WebSocket transports
 - Transport abort and deserialization hardening tests
+- Focused eager-promise polling, ordering, cancellation, panic, and settlement tests
 - Portable core JavaScript test coverage
 
 ## Remaining
 
 - Deferred special types: Fetch, Blob, streams, Date, and typed arrays
-- More accounting, callback-order, and eager-promise tests
+- Malformed-message, late-resolution, callback-order, and accounting audits
+- Decide executor-shutdown settlement behavior for pending eager promises
 - Stronger mechanical adjacency checking
 - Insertion-ordered object representation for exact key-order parity
 

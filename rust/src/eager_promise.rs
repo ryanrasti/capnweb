@@ -289,3 +289,126 @@ impl<T: Clone + Send + 'static> EagerPromise<T> {
         })
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+
+    use super::*;
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn polls_the_source_eagerly() {
+        let polled = Arc::new(AtomicBool::new(false));
+        let promise = EagerPromise::new({
+            let polled = Arc::clone(&polled);
+            async move {
+                polled.store(true, Ordering::SeqCst);
+                Ok(42)
+            }
+        });
+
+        assert!(polled.load(Ordering::SeqCst));
+        assert_eq!(promise.peek(), Some(42));
+        assert_eq!(promise.into_future().await.unwrap(), 42);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn starts_reactions_in_fifo_order_without_waiting_for_completion() {
+        let resolvers = PromiseWithResolvers::new();
+        let starts = Arc::new(Mutex::new(Vec::new()));
+
+        for id in 1..=3 {
+            let starts = Arc::clone(&starts);
+            let child = resolvers.promise().then_async(move |result| {
+                assert_eq!(result.unwrap(), 7);
+                starts.lock().unwrap().push(id);
+                Box::pin(std::future::pending::<Result<()>>())
+            });
+            drop(child);
+        }
+
+        resolvers.resolve(7);
+        tokio::task::yield_now().await;
+        assert_eq!(*starts.lock().unwrap(), vec![1, 2, 3]);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn dropped_child_does_not_cancel_its_reaction() {
+        let resolvers = PromiseWithResolvers::new();
+        let called = Arc::new(AtomicBool::new(false));
+        let child = resolvers.promise().then({
+            let called = Arc::clone(&called);
+            move |result| {
+                assert_eq!(result.unwrap(), 9);
+                called.store(true, Ordering::SeqCst);
+                Ok(())
+            }
+        });
+        drop(child);
+
+        resolvers.resolve(9);
+        tokio::task::yield_now().await;
+        assert!(called.load(Ordering::SeqCst));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn converts_first_poll_panics_to_rejections() {
+        let promise = EagerPromise::<()>::new(async { panic!("first poll") });
+        let error = promise.into_future().await.unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "eager promise future panicked during its first poll"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn converts_pending_future_panics_to_rejections() {
+        let promise = EagerPromise::<()>::new(async {
+            tokio::task::yield_now().await;
+            panic!("later poll")
+        });
+        let error = promise.into_future().await.unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "eager promise future panicked while pending"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn converts_reaction_panics_to_child_rejections() {
+        let promise = EagerPromise::new(async { Ok(1) });
+        let child = promise.then::<()>(|_| panic!("reaction"));
+        let error = child.into_future().await.unwrap_err();
+        assert_eq!(error.to_string(), "eager promise reaction panicked");
+    }
+
+    #[test]
+    fn rejects_pending_sources_without_an_executor() {
+        let polls = Arc::new(AtomicUsize::new(0));
+        let promise = EagerPromise::<()>::new({
+            let polls = Arc::clone(&polls);
+            async move {
+                polls.fetch_add(1, Ordering::SeqCst);
+                std::future::pending().await
+            }
+        });
+
+        assert_eq!(polls.load(Ordering::SeqCst), 1);
+        let error = futures::executor::block_on(promise.into_future()).unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "pending eager promise requires an active Tokio runtime"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn ignores_settlement_after_the_first_result() {
+        let resolvers = PromiseWithResolvers::new();
+        let promise = resolvers.promise();
+        resolvers.resolve(1);
+        resolvers.reject(Error::Message("late".to_owned()));
+        resolvers.resolve(2);
+
+        assert_eq!(promise.into_future().await.unwrap(), 1);
+    }
+}
