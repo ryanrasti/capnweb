@@ -5,7 +5,7 @@
 - Branch: `rust-port`
 - Package: `capnweb-rs` (library name: `capnweb`)
 - Strict JS line parity: 7,407 runtime lines preserved
-- Tests: 157 JS-suite, 8 RPC-runtime, 7 public-facade, and 9 generated-binding tests passing
+- Tests: 157 translated JS cases, 8 eager-promise, 10 RPC-runtime, 7 public-facade, and 9 generated-binding tests passing
 
 ## Complete
 
