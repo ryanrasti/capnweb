@@ -286,10 +286,14 @@ async fn custom_encoding_transport_receives_value_trees() {
 
 struct OneMessageTransport {
     incoming: Mutex<Option<String>>,
+    sent: Mutex<Vec<String>>,
 }
 
 impl AnyRpcTransport for OneMessageTransport {
-    fn send(&self, _message: TransportMessage) -> Result<TransportSend> {
+    fn send(&self, message: TransportMessage) -> Result<TransportSend> {
+        if let TransportMessage::Text(message) = message {
+            self.sent.lock().unwrap().push(message);
+        }
         Ok(TransportSend::Done(None))
     }
 
@@ -308,6 +312,7 @@ impl AnyRpcTransport for OneMessageTransport {
 async fn oversized_string_message_aborts_before_json_parsing() {
     let transport = Arc::new(OneMessageTransport {
         incoming: Mutex::new(Some("[\"message larger than limit\"]".to_owned())),
+        sent: Mutex::new(Vec::new()),
     });
     let mut limits = DEFAULT_LIMITS;
     limits.max_message_size = 4;
@@ -330,4 +335,78 @@ async fn oversized_string_message_aborts_before_json_parsing() {
     )
     .unwrap_err();
     assert!(error.to_string().contains("maximum size"));
+}
+
+async fn assert_malformed_message_aborts(message: &str, expected: &str) {
+    let transport = Arc::new(OneMessageTransport {
+        incoming: Mutex::new(Some(message.to_owned())),
+        sent: Mutex::new(Vec::new()),
+    });
+    let mut session = RpcSessionImpl::new(
+        transport.clone(),
+        value_hook(CapnwebValue::Null),
+        RpcSessionOptions::default(),
+    )
+    .unwrap();
+
+    for _ in 0..4 {
+        tokio::task::yield_now().await;
+    }
+
+    let error = Exporter::export_stub(
+        &mut session,
+        value_hook(CapnwebValue::String("after malformed message".to_owned())),
+    )
+    .unwrap_err();
+    assert!(error.to_string().contains(expected), "{error}");
+    let sent = transport.sent.lock().unwrap();
+    assert_eq!(sent.len(), 1, "unexpected messages for {message}: {sent:?}");
+    assert!(sent[0].starts_with("[\"abort\","), "{}", sent[0]);
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn malformed_message_shapes_abort_the_session() {
+    for (message, expected) in [
+        ("null", "expected array"),
+        ("[]", "missing tag"),
+        ("[\"unknown\"]", "bad RPC message tag"),
+        ("[\"abort\"]", "bad RPC message tag"),
+        ("[\"pull\",\"not-an-id\"]", "bad pull export ID"),
+        (
+            "[\"resolve\",\"not-an-id\",null]",
+            "bad resolution import ID",
+        ),
+        ("[\"release\",1,-1]", "bad release refcount"),
+    ] {
+        assert_malformed_message_aborts(message, expected).await;
+    }
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn late_resolutions_for_unknown_imports_do_not_abort_the_session() {
+    for message in ["[\"resolve\",999,null]", "[\"reject\",999,null]"] {
+        let transport = Arc::new(OneMessageTransport {
+            incoming: Mutex::new(Some(message.to_owned())),
+            sent: Mutex::new(Vec::new()),
+        });
+        let mut session = RpcSessionImpl::new(
+            transport.clone(),
+            value_hook(CapnwebValue::Null),
+            RpcSessionOptions::default(),
+        )
+        .unwrap();
+
+        for _ in 0..4 {
+            tokio::task::yield_now().await;
+        }
+
+        assert!(
+            Exporter::export_stub(
+                &mut session,
+                value_hook(CapnwebValue::String("session remains usable".to_owned())),
+            )
+            .is_ok()
+        );
+        assert!(transport.sent.lock().unwrap().is_empty());
+    }
 }

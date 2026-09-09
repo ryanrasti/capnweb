@@ -19,7 +19,7 @@
 ## Remaining
 
 - Deferred special types: Fetch, Blob, streams, Date, and typed arrays
-- Malformed-message, late-resolution, callback-order, and accounting audits
+- Callback-order and accounting audits
 - Decide executor-shutdown settlement behavior for pending eager promises
 - Stronger mechanical adjacency checking
 - Insertion-ordered object representation for exact key-order parity
