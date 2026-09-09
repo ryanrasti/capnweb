@@ -22,7 +22,7 @@ use crate::core::{
 };
 use crate::rpc::{AnyRpcTransport, RpcSession, RpcSessionOptions, TransportMessage, TransportSend};
 use crate::serialize::{EncodingLevel, deserialize, serialize, swap_byte_order};
-use crate::websocket::{WebSocketTransport, new_websocket_rpc_session};
+use crate::websocket::{MAX_CLOSE_REASON_BYTES, WebSocketTransport, new_websocket_rpc_session};
 use num_bigint::BigInt;
 use std::collections::BTreeMap;
 use std::future::{Future, pending};
@@ -7899,45 +7899,96 @@ mod websockets {
 // JS: });
 // JS:
 // JS: describe("transport encoding levels", () => {
-// JS:   class EchoService extends RpcTarget {
-// JS:     echo(value: unknown): unknown {
-// JS:       return value;
-// JS:     }
-// JS:   }
-// JS:
-// JS:   // Native values should survive a round trip through a custom-encoding transport at every
-// JS:   // non-string level: base64 bytes at "jsonCompatible", raw Uint8Array at
-// JS:   // "jsonCompatibleWithBytes", and native structured-clone types at "structuredClonable".
-// JS:   for (let level of ["jsonCompatible", "jsonCompatibleWithBytes", "structuredClonable"] as const) {
-// JS:     it(`round-trips native types over a ${level} transport`, async () => {
-// JS:       let clientTransport = new ObjectTestTransport(undefined, level);
-// JS:       let serverTransport = new ObjectTestTransport(clientTransport, level);
-// JS:       let client = new RpcSession<EchoService>(clientTransport);
-// JS:       new RpcSession(serverTransport, new EchoService());
-// JS:       using stub = client.getRemoteMain();
-// JS:
-// JS:       let bytes = await stub.echo(new Uint8Array([1, 2, 3])) as Uint8Array;
-// JS:       expect(new Uint8Array(bytes)).toStrictEqual(new Uint8Array([1, 2, 3]));
-// JS:
-// JS:       let typedArray = await stub.echo(new Uint32Array([0x01020304, 0xa0b0c0d0])) as Uint32Array;
-// JS:       expect(Object.getPrototypeOf(typedArray)).toBe(Uint32Array.prototype);
-// JS:       expect(typedArray).toStrictEqual(new Uint32Array([0x01020304, 0xa0b0c0d0]));
-// JS:
-// JS:       let date = await stub.echo(new Date(1234567890)) as Date;
-// JS:       expect(date).toBeInstanceOf(Date);
-// JS:       expect(date.getTime()).toBe(1234567890);
-// JS:
-// JS:       expect(await stub.echo(123n)).toBe(123n);
-// JS:     });
-// JS:   }
-// JS:
-// JS:   it("aborts the receive loop when the transport is aborted", async () => {
-// JS:     let transport = new ObjectTestTransport();
-// JS:     let pending = transport.receive();
-// JS:     transport.abort(new Error("boom"));
-// JS:     await expect(pending).rejects.toThrow("boom");
-// JS:   });
-// JS: });
+mod transport_encoding_levels {
+    use super::*;
+
+    struct AbortableTransport {
+        error: std::sync::Mutex<Option<Error>>,
+        ready: tokio::sync::Notify,
+    }
+
+    impl AbortableTransport {
+        fn new() -> Arc<Self> {
+            Arc::new(Self {
+                error: std::sync::Mutex::new(None),
+                ready: tokio::sync::Notify::new(),
+            })
+        }
+    }
+
+    impl AnyRpcTransport for AbortableTransport {
+        fn send(&self, _message: TransportMessage) -> Result<TransportSend> {
+            Ok(TransportSend::Done(None))
+        }
+
+        fn receive(
+            self: Arc<Self>,
+        ) -> Pin<Box<dyn Future<Output = Result<TransportMessage>> + Send>> {
+            Box::pin(async move {
+                loop {
+                    let notified = self.ready.notified();
+                    if let Some(error) = self.error.lock().unwrap().clone() {
+                        return Err(error);
+                    }
+                    notified.await;
+                }
+            })
+        }
+
+        fn abort(&self, reason: Error) {
+            *self.error.lock().unwrap() = Some(reason);
+            self.ready.notify_waiters();
+        }
+    }
+    // JS:   class EchoService extends RpcTarget {
+    // RUST-DEFERRED(JS built-in: typed arrays and Date): native custom-encoding round trips.
+    // JS:     echo(value: unknown): unknown {
+    // JS:       return value;
+    // JS:     }
+    // JS:   }
+    // JS:
+    // JS:   // Native values should survive a round trip through a custom-encoding transport at every
+    // JS:   // non-string level: base64 bytes at "jsonCompatible", raw Uint8Array at
+    // JS:   // "jsonCompatibleWithBytes", and native structured-clone types at "structuredClonable".
+    // JS:   for (let level of ["jsonCompatible", "jsonCompatibleWithBytes", "structuredClonable"] as const) {
+    // JS:     it(`round-trips native types over a ${level} transport`, async () => {
+    // JS:       let clientTransport = new ObjectTestTransport(undefined, level);
+    // JS:       let serverTransport = new ObjectTestTransport(clientTransport, level);
+    // JS:       let client = new RpcSession<EchoService>(clientTransport);
+    // JS:       new RpcSession(serverTransport, new EchoService());
+    // JS:       using stub = client.getRemoteMain();
+    // JS:
+    // JS:       let bytes = await stub.echo(new Uint8Array([1, 2, 3])) as Uint8Array;
+    // JS:       expect(new Uint8Array(bytes)).toStrictEqual(new Uint8Array([1, 2, 3]));
+    // JS:
+    // JS:       let typedArray = await stub.echo(new Uint32Array([0x01020304, 0xa0b0c0d0])) as Uint32Array;
+    // JS:       expect(Object.getPrototypeOf(typedArray)).toBe(Uint32Array.prototype);
+    // JS:       expect(typedArray).toStrictEqual(new Uint32Array([0x01020304, 0xa0b0c0d0]));
+    // JS:
+    // JS:       let date = await stub.echo(new Date(1234567890)) as Date;
+    // JS:       expect(date).toBeInstanceOf(Date);
+    // JS:       expect(date.getTime()).toBe(1234567890);
+    // JS:
+    // JS:       expect(await stub.echo(123n)).toBe(123n);
+    // JS:     });
+    // JS:   }
+    // JS:
+    // JS:   it("aborts the receive loop when the transport is aborted", async () => {
+    #[tokio::test(flavor = "current_thread")]
+    async fn aborts_the_receive_loop_when_the_transport_is_aborted() {
+        // JS:     let transport = new ObjectTestTransport();
+        let transport = AbortableTransport::new();
+        // JS:     let pending = transport.receive();
+        let pending = Arc::clone(&transport).receive();
+        // JS:     transport.abort(new Error("boom"));
+        transport.abort(Error::Message("boom".to_owned()));
+        // JS:     await expect(pending).rejects.toThrow("boom");
+        let error = pending.await.err().expect("receive should reject");
+        assert_eq!(error.to_string(), "boom");
+        // JS:   });
+    }
+    // JS: });
+}
 // JS:
 // JS: describe("ReadableStream over RPC", () => {
 // JS:   it("can send a ReadableStream and read all chunks", async () => {
@@ -8708,127 +8759,266 @@ mod websockets {
 // JS: });
 // JS:
 // JS: describe("deserialization and transport correctness", () => {
-// JS:   it("does not let serialized error properties override Object.prototype members", () => {
-// JS:     // Wire format for an error is ["error", name, message, stack, propsBag]. The props bag
-// JS:     // carries own properties the sender attached to the error. These must be filtered the same
-// JS:     // way the plain-object deserializer filters them, so that keys like `__proto__`, `toString`,
-// JS:     // `valueOf`, `hasOwnProperty` and `toJSON` cannot be assigned onto the resulting error.
-// JS:     let wire = '["error","Error","boom","at test (x:1:1)",' +
-// JS:       '{"code":"E_TEST","toString":"nope","valueOf":"nope","hasOwnProperty":"nope",' +
-// JS:       '"toJSON":"nope","__proto__":{"polluted":true}}]';
-// JS:     let err = deserialize(wire) as Error & Record<string, unknown>;
-// JS:
-// JS:     expect(err).toBeInstanceOf(Error);
-// JS:     expect(err.message).toBe("boom");
-// JS:
-// JS:     // The legitimate own property is still copied across.
-// JS:     expect(Object.prototype.hasOwnProperty.call(err, "code")).toBe(true);
-// JS:     expect(err.code).toBe("E_TEST");
-// JS:
-// JS:     // Object.prototype members and toJSON must not become own properties of the error.
-// JS:     for (let key of ["toString", "valueOf", "hasOwnProperty", "toJSON", "__proto__"]) {
-// JS:       expect(Object.prototype.hasOwnProperty.call(err, key)).toBe(false);
-// JS:     }
-// JS:
-// JS:     // The error's prototype and behavior are unchanged.
-// JS:     expect(Object.getPrototypeOf(err)).toBe(Error.prototype);
-// JS:     expect(typeof err.toString).toBe("function");
-// JS:     expect(err.toString()).toBe("Error: boom");
-// JS:     expect((err as any).polluted).toBeUndefined();
-// JS:     expect(({} as any).polluted).toBeUndefined();
-// JS:   });
-// JS:
-// JS:   it("does not let an error type name resolve to an Object.prototype member (type confusion)", () => {
-// JS:     // The error type name (value[1]) is attacker-controlled and is used to look up the error
-// JS:     // class in ERROR_TYPES. ERROR_TYPES must not resolve names to inherited Object.prototype
-// JS:     // members. Before it was given a null prototype, ERROR_TYPES["constructor"] resolved to
-// JS:     // `Object` (truthy, so the `|| Error` fallback was skipped), so `new Object(message)`
-// JS:     // produced a `String` wrapper rather than an `Error` -- an `instanceof Error` bypass that
-// JS:     // still carried the attacker's own-property bag. A name like "toString" resolved to a
-// JS:     // non-constructor and threw, aborting the RPC session.
-// JS:     let confused = deserialize(
+mod deserialization_and_transport_correctness {
+    use super::*;
+    // JS:   it("does not let serialized error properties override Object.prototype members", () => {
+    #[test]
+    fn does_not_let_serialized_error_properties_override_object_prototype_members() {
+        // JS:     // Wire format for an error is ["error", name, message, stack, propsBag]. The props bag
+        // JS:     // carries own properties the sender attached to the error. These must be filtered the same
+        // JS:     // way the plain-object deserializer filters them, so that keys like `__proto__`, `toString`,
+        // JS:     // `valueOf`, `hasOwnProperty` and `toJSON` cannot be assigned onto the resulting error.
+        // JS:     let wire = '["error","Error","boom","at test (x:1:1)",' +
+        let wire = concat!(
+            "[\"error\",\"Error\",\"boom\",\"at test (x:1:1)\",",
+            // JS:       '{"code":"E_TEST","toString":"nope","valueOf":"nope","hasOwnProperty":"nope",' +
+            "{\"code\":\"E_TEST\",\"toString\":\"nope\",\"valueOf\":\"nope\",\"hasOwnProperty\":\"nope\",",
+            // JS:       '"toJSON":"nope","__proto__":{"polluted":true}}]';
+            "\"toJSON\":\"nope\",\"__proto__\":{\"polluted\":true}}]"
+        );
+        // JS:     let err = deserialize(wire) as Error & Record<string, unknown>;
+        let CapnwebValue::Error(err) = deserialize(&wire).unwrap() else {
+            panic!("expected error");
+        };
+        // JS:
+        // JS:     expect(err).toBeInstanceOf(Error);
+        assert_eq!(err.name, "Error");
+        // JS:     expect(err.message).toBe("boom");
+        assert_eq!(err.message, "boom");
+        // JS:
+        // JS:     // The legitimate own property is still copied across.
+        // JS:     expect(Object.prototype.hasOwnProperty.call(err, "code")).toBe(true);
+        assert!(err.properties.contains_key("code"));
+        // JS:     expect(err.code).toBe("E_TEST");
+        assert!(
+            matches!(err.properties.get("code"), Some(CapnwebValue::String(value)) if value == "E_TEST")
+        );
+        // JS:
+        // JS:     // Object.prototype members and toJSON must not become own properties of the error.
+        // JS:     for (let key of ["toString", "valueOf", "hasOwnProperty", "toJSON", "__proto__"]) {
+        for key in [
+            "toString",
+            "valueOf",
+            "hasOwnProperty",
+            "toJSON",
+            "__proto__",
+        ] {
+            // JS:       expect(Object.prototype.hasOwnProperty.call(err, key)).toBe(false);
+            assert!(!err.properties.contains_key(key));
+            // JS:     }
+        }
+        // JS:
+        // JS:     // The error's prototype and behavior are unchanged.
+        // JS:     expect(Object.getPrototypeOf(err)).toBe(Error.prototype);
+        assert_eq!(err.name, "Error");
+        // JS:     expect(typeof err.toString).toBe("function");
+        let rendered = Error::Serialized(err.clone()).to_string();
+        // JS:     expect(err.toString()).toBe("Error: boom");
+        assert_eq!(rendered, "Error: boom");
+        // JS:     expect((err as any).polluted).toBeUndefined();
+        assert!(!err.properties.contains_key("polluted"));
+        // JS:     expect(({} as any).polluted).toBeUndefined();
+        // Rust maps have no shared object prototype to pollute.
+        // JS:   });
+    }
+    // JS:
+    // JS:   it("does not let an error type name resolve to an Object.prototype member (type confusion)", () => {
+    #[test]
+    fn does_not_let_an_error_type_name_resolve_to_an_object_prototype_member() {
+        // JS:     // The error type name (value[1]) is attacker-controlled and is used to look up the error
+        // JS:     // class in ERROR_TYPES. ERROR_TYPES must not resolve names to inherited Object.prototype
+        // JS:     // members. Before it was given a null prototype, ERROR_TYPES["constructor"] resolved to
+        // JS:     // `Object` (truthy, so the `|| Error` fallback was skipped), so `new Object(message)`
+        // JS:     // produced a `String` wrapper rather than an `Error` -- an `instanceof Error` bypass that
+        // JS:     // still carried the attacker's own-property bag. A name like "toString" resolved to a
+        // JS:     // non-constructor and threw, aborting the RPC session.
+        // JS:     let confused = deserialize(
+        let CapnwebValue::Error(confused) = deserialize(
 // JS:       '["error","constructor","attacker-payload",null,{"injected":true,"httpStatus":200}]'
+            "[\"error\",\"constructor\",\"attacker-payload\",null,{\"injected\":true,\"httpStatus\":200}]",
 // JS:     ) as Error & Record<string, unknown>;
-// JS:
-// JS:     // Must be a real Error, not a type-confused String wrapper.
-// JS:     expect(confused).toBeInstanceOf(Error);
-// JS:     expect(confused).not.toBeInstanceOf(String);
-// JS:     expect(confused.name).toBe("Error");
-// JS:     expect(confused.message).toBe("attacker-payload");
-// JS:     // Legitimate (non-prototype) own properties still round-trip onto the correctly-typed Error.
-// JS:     expect(confused.injected).toBe(true);
-// JS:     expect(confused.httpStatus).toBe(200);
-// JS:
-// JS:     // Any Object.prototype member name used as the error type must fall back to Error and must
-// JS:     // never throw.
-// JS:     for (let name of ["constructor", "toString", "valueOf", "hasOwnProperty", "__proto__",
-// JS:                       "isPrototypeOf", "propertyIsEnumerable"]) {
-// JS:       let err = deserialize(`["error",${JSON.stringify(name)},"msg"]`) as Error;
-// JS:       expect(err).toBeInstanceOf(Error);
-// JS:       expect(err.name).toBe("Error");
-// JS:       expect(err.message).toBe("msg");
-// JS:     }
-// JS:
-// JS:     // Legitimate built-in error types still resolve correctly.
-// JS:     expect(deserialize('["error","TypeError","t"]')).toBeInstanceOf(TypeError);
-// JS:     expect(deserialize('["error","RangeError","r"]')).toBeInstanceOf(RangeError);
-// JS:   });
-// JS:
-// JS:   it("delivers the unwrapped abort reason to onRpcBroken (not the payload wrapper)", async () => {
-// JS:     // Intentionally not using `using` here: the session is deliberately aborted below, so the
-// JS:     // end-of-test "everything disposed" check would not apply.
-// JS:     let harness = new TestHarness(new TestTarget());
-// JS:     let captured: any[] = [];
-// JS:     harness.stub.onRpcBroken(error => { captured.push(error); });
-// JS:
-// JS:     // Feed the server a malformed message so its read loop throws. The server responds by
-// JS:     // sending an ["abort", reason] message back to the client, exercising the client's "abort"
-// JS:     // handler. That handler must forward the unwrapped reason value, not the payload wrapper.
-// JS:     await harness.clientTransport.send('["not a valid message"]');
-// JS:     await pumpMicrotasks();
-// JS:
-// JS:     expect(captured.length).toBe(1);
-// JS:     let error = captured[0];
-// JS:     expect(error).toBeInstanceOf(Error);
-// JS:     expect(String(error.message)).toContain("bad RPC message");
-// JS:   });
-// JS:
-// JS:   it("truncates an over-long WebSocket close reason on a code-point boundary", async () => {
-// JS:     let closeArgs: { code: number, reason: string }[] = [];
-// JS:     let closeThrew = false;
-// JS:     let listeners: Record<string, ((ev: any) => void)[]> = {};
-// JS:
-// JS:     let fakeWs: any = {
-// JS:       readyState: (globalThis as any).WebSocket.OPEN,
-// JS:       addEventListener(type: string, cb: (ev: any) => void) {
-// JS:         (listeners[type] ||= []).push(cb);
-// JS:       },
-// JS:       send(_message: string) { return Promise.resolve(); },
-// JS:       close(code: number, reason: string) {
-// JS:         // Mimic the real contract: an over-long reason throws.
-// JS:         if (new TextEncoder().encode(reason).length > MAX_CLOSE_REASON_BYTES) {
-// JS:           closeThrew = true;
-// JS:           throw new Error("close reason too long");
-// JS:         }
-// JS:         closeArgs.push({ code, reason });
-// JS:       },
-// JS:     };
-// JS:
-// JS:     newWebSocketRpcSession(fakeWs);
-// JS:
-// JS:     // Peer-supplied abort reason that straddles the limit with a multi-byte character: the 2-byte
-// JS:     // "é" begins at the last allowed byte, so truncation must drop the partial "é" rather than emit
-// JS:     // a replacement character (itself 3 bytes, which would re-exceed the limit).
-// JS:     let reason = "a".repeat(MAX_CLOSE_REASON_BYTES - 1) + "\u00e9";
-// JS:     for (let cb of listeners["message"] || []) cb({ data: JSON.stringify(["abort", reason]) });
-// JS:     await pumpMicrotasks();
-// JS:
-// JS:     expect(closeThrew).toBe(false);
-// JS:     expect(closeArgs.length).toBe(1);
-// JS:     expect(closeArgs[0].code).toBe(3000);
-// JS:     let sentReason = closeArgs[0].reason;
-// JS:     expect(new TextEncoder().encode(sentReason).length).toBeLessThanOrEqual(MAX_CLOSE_REASON_BYTES);
-// JS:     expect(sentReason).not.toContain("\uFFFD");
-// JS:     expect(sentReason).toBe("a".repeat(MAX_CLOSE_REASON_BYTES - 1));
-// JS:   });
-// JS: });
+        ).unwrap() else { panic!("expected error") };
+        // JS:
+        // JS:     // Must be a real Error, not a type-confused String wrapper.
+        // JS:     expect(confused).toBeInstanceOf(Error);
+        assert_eq!(confused.name, "Error");
+        // JS:     expect(confused).not.toBeInstanceOf(String);
+        // `CapnwebError` cannot be type-confused with a Rust string.
+        // JS:     expect(confused.name).toBe("Error");
+        assert_eq!(confused.name, "Error");
+        // JS:     expect(confused.message).toBe("attacker-payload");
+        assert_eq!(confused.message, "attacker-payload");
+        // JS:     // Legitimate (non-prototype) own properties still round-trip onto the correctly-typed Error.
+        // JS:     expect(confused.injected).toBe(true);
+        assert!(matches!(
+            confused.properties.get("injected"),
+            Some(CapnwebValue::Bool(true))
+        ));
+        // JS:     expect(confused.httpStatus).toBe(200);
+        assert!(matches!(
+            confused.properties.get("httpStatus"),
+            Some(CapnwebValue::Number(200.0))
+        ));
+        // JS:
+        // JS:     // Any Object.prototype member name used as the error type must fall back to Error and must
+        // JS:     // never throw.
+        // JS:     for (let name of ["constructor", "toString", "valueOf", "hasOwnProperty", "__proto__",
+        for name in [
+            "constructor",
+            "toString",
+            "valueOf",
+            "hasOwnProperty",
+            "__proto__",
+            // JS:                       "isPrototypeOf", "propertyIsEnumerable"]) {
+            "isPrototypeOf",
+            "propertyIsEnumerable",
+        ] {
+            // JS:       let err = deserialize(`["error",${JSON.stringify(name)},"msg"]`) as Error;
+            let CapnwebValue::Error(err) =
+                deserialize(&format!("[\"error\",{name:?},\"msg\"]")).unwrap()
+            else {
+                panic!("expected error")
+            };
+            // JS:       expect(err).toBeInstanceOf(Error);
+            assert_eq!(err.name, "Error");
+            // JS:       expect(err.name).toBe("Error");
+            assert_eq!(err.name, "Error");
+            // JS:       expect(err.message).toBe("msg");
+            assert_eq!(err.message, "msg");
+            // JS:     }
+        }
+        // JS:
+        // JS:     // Legitimate built-in error types still resolve correctly.
+        // JS:     expect(deserialize('["error","TypeError","t"]')).toBeInstanceOf(TypeError);
+        assert!(
+            matches!(deserialize("[\"error\",\"TypeError\",\"t\"]").unwrap(), CapnwebValue::Error(error) if error.name == "TypeError")
+        );
+        // JS:     expect(deserialize('["error","RangeError","r"]')).toBeInstanceOf(RangeError);
+        assert!(
+            matches!(deserialize("[\"error\",\"RangeError\",\"r\"]").unwrap(), CapnwebValue::Error(error) if error.name == "RangeError")
+        );
+        // JS:   });
+    }
+    // JS:
+    // JS:   it("delivers the unwrapped abort reason to onRpcBroken (not the payload wrapper)", async () => {
+    #[tokio::test(flavor = "current_thread")]
+    async fn delivers_the_unwrapped_abort_reason_to_on_rpc_broken() {
+        // JS:     // Intentionally not using `using` here: the session is deliberately aborted below, so the
+        // JS:     // end-of-test "everything disposed" check would not apply.
+        // JS:     let harness = new TestHarness(new TestTarget());
+        let harness = IndexRpcHarness::new(Arc::new(LocalTestTarget));
+        // JS:     let captured: any[] = [];
+        let captured = Arc::new(std::sync::Mutex::new(Vec::new()));
+        // JS:     harness.stub.onRpcBroken(error => { captured.push(error); });
+        harness.stub.on_rpc_broken({
+            let captured = captured.clone();
+            move |error| captured.lock().unwrap().push(error)
+        });
+        // JS:
+        // JS:     // Feed the server a malformed message so its read loop throws. The server responds by
+        // JS:     // sending an ["abort", reason] message back to the client, exercising the client's "abort"
+        // JS:     // handler. That handler must forward the unwrapped reason value, not the payload wrapper.
+        // JS:     await harness.clientTransport.send('["not a valid message"]');
+        harness
+            .client_transport
+            .send(TransportMessage::Text(
+                "[\"not a valid message\"]".to_owned(),
+            ))
+            .unwrap();
+        // JS:     await pumpMicrotasks();
+        for _ in 0..8 {
+            tokio::task::yield_now().await;
+        }
+        // JS:
+        // JS:     expect(captured.length).toBe(1);
+        assert_eq!(captured.lock().unwrap().len(), 1);
+        // JS:     let error = captured[0];
+        let error = captured.lock().unwrap()[0].clone();
+        // JS:     expect(error).toBeInstanceOf(Error);
+        assert!(matches!(
+            error,
+            Error::Serialized(_) | Error::Message(_) | Error::Type(_)
+        ));
+        // JS:     expect(String(error.message)).toContain("bad RPC message");
+        assert!(error.to_string().contains("bad RPC message"), "{error}");
+        // JS:   });
+    }
+    // JS:
+    // JS:   it("truncates an over-long WebSocket close reason on a code-point boundary", async () => {
+    #[tokio::test(flavor = "current_thread")]
+    async fn truncates_an_over_long_websocket_close_reason_on_a_code_point_boundary() {
+        use futures::{SinkExt, StreamExt};
+        // JS:     let closeArgs: { code: number, reason: string }[] = [];
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        // JS:     let closeThrew = false;
+        let host = listener.local_addr().unwrap();
+        // JS:     let listeners: Record<string, ((ev: any) => void)[]> = {};
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut socket = tokio_tungstenite::accept_async(stream).await.unwrap();
+            let reason = "a".repeat(MAX_CLOSE_REASON_BYTES - 1) + "é";
+            socket
+                .send(tokio_tungstenite::tungstenite::Message::Text(
+                    format!("[\"abort\",{reason:?}]").into(),
+                ))
+                .await
+                .unwrap();
+            while let Some(message) = socket.next().await {
+                if let tokio_tungstenite::tungstenite::Message::Close(frame) = message.unwrap() {
+                    return frame.unwrap();
+                }
+            }
+            panic!("client did not send a close frame")
+        });
+        // JS:
+        // JS:     let fakeWs: any = {
+        // JS:       readyState: (globalThis as any).WebSocket.OPEN,
+        // JS:       addEventListener(type: string, cb: (ev: any) => void) {
+        // JS:         (listeners[type] ||= []).push(cb);
+        // JS:       },
+        // JS:       send(_message: string) { return Promise.resolve(); },
+        // JS:       close(code: number, reason: string) {
+        // JS:         // Mimic the real contract: an over-long reason throws.
+        // JS:         if (new TextEncoder().encode(reason).length > MAX_CLOSE_REASON_BYTES) {
+        // JS:           closeThrew = true;
+        // JS:           throw new Error("close reason too long");
+        // JS:         }
+        // JS:         closeArgs.push({ code, reason });
+        // JS:       },
+        // JS:     };
+        // JS:
+        // JS:     newWebSocketRpcSession(fakeWs);
+        let _stub =
+            new_websocket_rpc_session(&format!("ws://{host}"), None, RpcSessionOptions::default())
+                .await
+                .unwrap();
+        // JS:
+        // JS:     // Peer-supplied abort reason that straddles the limit with a multi-byte character: the 2-byte
+        // JS:     // "é" begins at the last allowed byte, so truncation must drop the partial "é" rather than emit
+        // JS:     // a replacement character (itself 3 bytes, which would re-exceed the limit).
+        // JS:     let reason = "a".repeat(MAX_CLOSE_REASON_BYTES - 1) + "\u00e9";
+        let reason = "a".repeat(MAX_CLOSE_REASON_BYTES - 1) + "é";
+        // JS:     for (let cb of listeners["message"] || []) cb({ data: JSON.stringify(["abort", reason]) });
+        let frame = server.await.unwrap();
+        // JS:     await pumpMicrotasks();
+        tokio::task::yield_now().await;
+        // JS:
+        // JS:     expect(closeThrew).toBe(false);
+        // The real tungstenite peer accepted the close frame without throwing.
+        // JS:     expect(closeArgs.length).toBe(1);
+        // Exactly one close frame was returned by the server task.
+        // JS:     expect(closeArgs[0].code).toBe(3000);
+        assert_eq!(u16::from(frame.code), 3000);
+        // JS:     let sentReason = closeArgs[0].reason;
+        let sent_reason = frame.reason.to_string();
+        // JS:     expect(new TextEncoder().encode(sentReason).length).toBeLessThanOrEqual(MAX_CLOSE_REASON_BYTES);
+        assert!(sent_reason.len() <= MAX_CLOSE_REASON_BYTES);
+        // JS:     expect(sentReason).not.toContain("\uFFFD");
+        assert!(!sent_reason.contains('\u{fffd}'));
+        // JS:     expect(sentReason).toBe("a".repeat(MAX_CLOSE_REASON_BYTES - 1));
+        assert_eq!(sent_reason, "a".repeat(MAX_CLOSE_REASON_BYTES - 1));
+        assert!(reason.len() > MAX_CLOSE_REASON_BYTES);
+        // JS:   });
+    }
+    // JS: });
+}
