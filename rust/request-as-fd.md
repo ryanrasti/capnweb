@@ -69,64 +69,50 @@ node or machines on a network.
 
 ## Current Rust status
 
-The Rust port now has the basic local descriptor transport:
+The Rust port now has the basic local descriptor transport and the generic
+custom-value seam needed to keep it out of Cap'n Web core semantics:
 
-- `CapnwebValue::Fd` and an owning, clonable `Fd` wrapper;
-- structured-clonable preservation of FD values;
+- `CapnwebValue::Custom` with checked dynamic values;
+- transport-defined `CustomTypeRegistry` and `CustomTypeHandler` hooks;
+- per-message `CustomMessageCodec` state;
 - an asynchronous `SOCK_SEQPACKET` `UdsTransport`;
+- an UDS `OwnedFd` handler using the reserved `fd` tag;
 - `SCM_RIGHTS` send/receive with close-on-exec;
-- `["fd", index]` transport encoding;
 - message and descriptor bounds;
-- a real RPC round-trip test returning a socket FD.
+- custom-value isolation and real FD RPC round-trip tests.
 
 Remaining Rust work for the celld integration:
 
-1. Expose typed `IntoCapnwebValue` and `FromCapnwebValue` conversions if the
-   generated local-session API names `Fd` directly.
-2. Add construction from an inherited or connected control descriptor; the
-   production session will not normally call `UdsTransport::pair()` itself.
-3. Decide and document whether cloning an `Fd` means duplicate-capability
-   semantics or whether the first successful send consumes shared transfer
-   state. The current `Arc<OwnedFd>` implements duplicate-capability semantics.
-4. Make peer shutdown deterministic. A capability session must wake pending
-   receive calls when its peer exits rather than depending only on an explicit
-   RPC abort.
-5. Test multiple and nested FDs, malformed or forged indexes, ancillary
-   truncation, unreferenced descriptors, peer exit, cancellation, and FD leak
-   counts.
+1. Add ergonomic typed conversion for the UDS `OwnedFd` custom value if the
+   generated local-session API names descriptor arguments directly.
+2. Confirm construction and startup conventions for inherited control
+   descriptors; production will not normally call `UdsTransport::pair()`.
+3. Document the chosen duplicate-capability behavior. The current custom value
+   shares an `Arc<OwnedFd>` while SCM_RIGHTS creates a new descriptor in each
+   receiving process.
+4. Make peer shutdown deterministic and prove pending receives wake when the
+   other process exits.
+5. Extend malformed-marker, multiple/nested FD, ancillary truncation,
+   unreferenced-descriptor, cancellation, and FD-leak tests.
 6. Confirm the control-frame size contract. HTTP data will be externalized,
    but other Cap'n Web values can still exceed a practical seqpacket payload.
-7. Add typed local control methods only after celld's generic session seam is
+7. Add typed local control methods only after the generic session seam is
    fixed; no HTTP or consumer-specific types belong in capnweb-rs.
 
-The JavaScript custom transport remains responsible for preserving its opaque
-host FD value and delegating frames to celld. Rust continues to see only the
-generic `Fd` variant.
+The JavaScript custom transport still needs equivalent custom-value hooks and
+an opaque host descriptor supplied by celld.
 
 ## Keep the Cap'n Web boundary simple
 
-Cap'n Web should understand only a new generic `Fd` value, analogous to its
-special handling for bytes. It should not know what a `Request`, `Response`,
-HTTP exchange, socketpair, or celld handler is.
+Cap'n Web understands generic transport-defined custom values, not FDs,
+`Request`, `Response`, HTTP exchanges, socketpairs, or celld handlers. The UDS
+transport registers `OwnedFd` as one custom value and owns its message-local
+SCM_RIGHTS sidecar state.
 
-The RPC system already gives a custom transport a partially encoded value tree
-through `TransportMessage::Value(CapnwebValue)`. Keep that boundary. Do not add
-an attachment list to `TransportMessage` and do not make the core RPC session
-manage ancillary data.
-
-Add an FD variant to the value tree:
-
-```rust
-pub enum CapnwebValue {
-    // existing variants
-    Bytes(Vec<u8>),
-    Fd(Fd),
-}
-```
-
-At the custom local encoding level, RPC serialization leaves both bytes and
-FDs unencoded. Only an FD-capable UDS transport accepts a value tree containing
-`Fd`.
+The RPC system gives a custom transport a partially encoded value tree and the
+message-local codec created by that transport. HTTP batch and WebSocket
+transports do not register the FD handler, so attempting to send that custom
+value through them fails without introducing FD logic into those transports.
 
 ## UDS transport encoding
 
@@ -151,46 +137,34 @@ On receive, the transport:
 
 1. receives one framed payload and its ancillary descriptors;
 2. parses the JSON-compatible value tree;
-3. replaces valid `["fd", index]` markers with `CapnwebValue::Fd`;
-4. returns `TransportMessage::Value` to the unchanged RPC machinery.
+3. uses the registered UDS handler to replace valid `["fd", index]` markers
+   with a checked custom value containing `OwnedFd`;
+4. returns the value and message codec to the RPC machinery.
 
 This is transport encoding in the same spirit as keeping bytes raw instead of
 base64 encoding them. HTTP batch and WebSocket transports never see an
 unencoded FD and reject one if asked to send it.
 
-A dedicated encoding level such as `jsonCompatibleWithBytesAndFds`, or an
-equivalent explicit transport capability, should make that constraint visible
-to the serializer. It must not be inferred from a concrete transport type.
+The transport opts into custom values by creating a message codec with its
+registered handlers. No FD-specific encoding level or transport type check is
+needed in the RPC core.
 
 ## Rust FD value
 
-Rust must expose an owning wrapper around `OwnedFd`, never a bare numeric FD:
+The UDS handler stores `OwnedFd` inside a checked `CustomValue`; a bare numeric
+descriptor never reaches application code. The message context holds outgoing
+`Arc<OwnedFd>` values until `sendmsg()` completes and consumes each received
+descriptor at most once while decoding its marker.
 
-```rust
-pub struct Fd {
-    // private owning/transfer state
-}
+`CapnwebValue` remains clonable, so the current behavior is capability
+copying: clones refer to the same local open file description and each
+successful SCM_RIGHTS send creates a descriptor in the receiving process.
+This behavior must be documented and covered by repeated-send and failed-send
+leak tests.
 
-impl Fd {
-    pub fn into_owned_fd(self) -> OwnedFd;
-}
-```
-
-`CapnwebValue` is currently clonable, while an FD transfer is linear. The
-wrapper therefore needs explicit shared transfer state or another rule that
-preserves `CapnwebValue` cloning without duplicating ownership accidentally. A
-safe initial semantic is:
-
-- one FD value may be transferred once;
-- clones refer to the same transferable resource;
-- a second extraction or send fails;
-- dropping the final untransferred value closes the descriptor;
-- a failed send has deterministic ownership and cannot leak the descriptor.
-
-`SCM_RIGHTS` creates a descriptor in the receiving process. Receive with
-`MSG_CMSG_CLOEXEC` and immediately place it in `OwnedFd`. Celld or the runtime
-may subsequently validate `SO_TYPE` and expected socket state; semantic FD
-validation does not belong in Cap'n Web.
+Receive uses `MSG_CMSG_CLOEXEC` and immediately places descriptors in
+`OwnedFd`. Celld or the remote runtime may subsequently validate `SO_TYPE` and
+expected socket state; semantic FD validation does not belong in Cap'n Web.
 
 ## JavaScript FD value
 
