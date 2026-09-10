@@ -26,6 +26,12 @@ impl RpcTargetInner for EchoFdTarget {
             let CapnwebValue::Fd(fd) = args.remove(0) else {
                 return Err(Error::Type("argument is not an fd".to_owned()));
             };
+            let literal = args.remove(0);
+            assert!(matches!(
+                literal,
+                CapnwebValue::Array(values)
+                    if matches!(values.as_slice(), [CapnwebValue::String(tag), CapnwebValue::Number(0.0)] if tag == "fd")
+            ));
             Ok(Arc::new(PayloadStubHook::new(RpcPayload::from_app_return(
                 CapnwebValue::Fd(fd),
             ))) as StubHook)
@@ -62,7 +68,13 @@ async fn passes_a_real_fd_over_uds_with_scm_rights() {
         .get_remote_main()
         .call(
             vec!["echoFd".to_owned()],
-            RpcPayload::from_app_params(CapnwebValue::Array(vec![CapnwebValue::Fd(fd)])),
+            RpcPayload::from_app_params(CapnwebValue::Array(vec![
+                CapnwebValue::Fd(fd),
+                CapnwebValue::Array(vec![
+                    CapnwebValue::String("fd".to_owned()),
+                    CapnwebValue::Number(0.0),
+                ]),
+            ])),
         )
         .pull()
         .await
