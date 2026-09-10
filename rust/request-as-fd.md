@@ -18,12 +18,26 @@ Possession of the descriptor is the capability. There is no callback URL,
 rendezvous token, named Unix socket, or application-data multiplexing inside
 Cap'n Web.
 
-The FD is the local implementation of a broader duplex-stream attachment, not
-the public request-transport abstraction. A future cross-machine session can
-provide the same reliable bidirectional stream semantics using QUIC streams,
-independent authenticated TCP connections, or a multiplexed network transport.
-The HTTP codec should depend only on the duplex-stream contract; only the local
-Cap'n Web transport should depend on `SCM_RIGHTS` and `Fd`.
+The FD is the local implementation of broader channel attachments, not the
+public request-transport abstraction. The chosen local design has two branded
+host types over the same generic FD transfer:
+
+```text
+CapabilityChannel -> SOCK_SEQPACKET endpoint -> nested framed session
+RequestChannel    -> SOCK_STREAM endpoint    -> HTTP exchange
+```
+
+Capability-channel endpoints are recursively transferable. A bootstrap
+session can create a pair, inherit one end into a child, return the other end
+to JavaScript, and then close; the new peer-to-peer session carries subsequent
+control messages without protocol proxying through the bootstrap service.
+This transfers a session endpoint, not existing Cap'n Web import/export IDs,
+which remain scoped to their original session unless explicitly re-exported.
+
+A future cross-machine session can provide equivalent reliable bidirectional
+semantics using QUIC streams, independent authenticated TCP connections, or a
+multiplexed network transport. The HTTP codec should depend only on the duplex
+stream contract; only the local transport depends on `SCM_RIGHTS` and `Fd`.
 
 ## Higher-level session abstraction
 
@@ -45,11 +59,13 @@ local AF_UNIX session   -> socketpair endpoint transferred as Fd
 cross-machine session   -> QUIC stream ID, authenticated TCP stream, etc.
 ```
 
-Request serialization is a configured HTTP-over-duplex codec. It creates a
-stream, runs the native HTTP client or server on its local endpoint, and places
-the transport's remote stream attachment in the control frame. This keeps
-request forwarding and application dispatch independent of whether the peers
-are processes on one node or machines on a network.
+Two configured codecs sit above generic descriptor transfer. The capability-
+channel codec creates or adopts a seqpacket endpoint and exposes it as another
+framed session. The request-channel codec creates a stream, runs the native
+HTTP client or server on its local endpoint, and places the transport's remote
+stream attachment in the control frame. This keeps request forwarding and
+application dispatch independent of whether the peers are processes on one
+node or machines on a network.
 
 ## Current Rust status
 
@@ -296,6 +312,8 @@ Cover:
 
 - JS-to-Rust and Rust-to-JS FD transfer;
 - bidirectional bytes through a transferred socketpair;
+- a transferred seqpacket endpoint used as a nested RPC session;
+- third-party channel handoff and bootstrap-session shutdown;
 - multiple FDs in one value and consecutive frames;
 - nested FD values and repeated references;
 - split/coalesced `SOCK_STREAM` frame reads;
