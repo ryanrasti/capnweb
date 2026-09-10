@@ -51,6 +51,42 @@ the transport's remote stream attachment in the control frame. This keeps
 request forwarding and application dispatch independent of whether the peers
 are processes on one node or machines on a network.
 
+## Current Rust status
+
+The Rust port now has the basic local descriptor transport:
+
+- `CapnwebValue::Fd` and an owning, clonable `Fd` wrapper;
+- structured-clonable preservation of FD values;
+- an asynchronous `SOCK_SEQPACKET` `UdsTransport`;
+- `SCM_RIGHTS` send/receive with close-on-exec;
+- `["fd", index]` transport encoding;
+- message and descriptor bounds;
+- a real RPC round-trip test returning a socket FD.
+
+Remaining Rust work for the celld integration:
+
+1. Expose typed `IntoCapnwebValue` and `FromCapnwebValue` conversions if the
+   generated local-session API names `Fd` directly.
+2. Add construction from an inherited or connected control descriptor; the
+   production session will not normally call `UdsTransport::pair()` itself.
+3. Decide and document whether cloning an `Fd` means duplicate-capability
+   semantics or whether the first successful send consumes shared transfer
+   state. The current `Arc<OwnedFd>` implements duplicate-capability semantics.
+4. Make peer shutdown deterministic. A capability session must wake pending
+   receive calls when its peer exits rather than depending only on an explicit
+   RPC abort.
+5. Test multiple and nested FDs, malformed or forged indexes, ancillary
+   truncation, unreferenced descriptors, peer exit, cancellation, and FD leak
+   counts.
+6. Confirm the control-frame size contract. HTTP data will be externalized,
+   but other Cap'n Web values can still exceed a practical seqpacket payload.
+7. Add typed local control methods only after celld's generic session seam is
+   fixed; no HTTP or consumer-specific types belong in capnweb-rs.
+
+The JavaScript custom transport remains responsible for preserving its opaque
+host FD value and delegating frames to celld. Rust continues to see only the
+generic `Fd` variant.
+
 ## Keep the Cap'n Web boundary simple
 
 Cap'n Web should understand only a new generic `Fd` value, analogous to its
