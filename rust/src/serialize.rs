@@ -13,8 +13,8 @@ use std::sync::Arc;
 use base64::Engine as _;
 
 use crate::core::{
-    CapnwebError, CapnwebValue, Error, PropertyKey, Result, RpcPayload, StubHook,
-    unwrap_stub_and_path,
+    CapnwebError, CapnwebValue, CustomMessageCodec, Error, PropertyKey, Result, RpcPayload,
+    StubHook, unwrap_stub_and_path,
 };
 // JS:
 // JS: export type ImportId = number;
@@ -341,6 +341,7 @@ pub struct Devaluator<'a> {
     source: Option<&'a RpcPayload>,
     // JS:     private encodingLevel: EncodingLevel
     encoding_level: EncodingLevel,
+    custom_codec: Option<&'a mut CustomMessageCodec>,
     // JS:   ) {}
     // Rust fields must be contiguous; this field corresponds to `exports` declared below.
     exports: Vec<ExportId>,
@@ -369,11 +370,22 @@ impl<'a> Devaluator<'a> {
         source: Option<&'a RpcPayload>,
         encoding_level: EncodingLevel,
     ) -> Result<CapnwebValue> {
+        Self::devaluate_with_codec(value, exporter, source, encoding_level, None)
+    }
+
+    pub(crate) fn devaluate_with_codec(
+        value: &CapnwebValue,
+        exporter: &'a mut dyn Exporter,
+        source: Option<&'a RpcPayload>,
+        encoding_level: EncodingLevel,
+        custom_codec: Option<&'a mut CustomMessageCodec>,
+    ) -> Result<CapnwebValue> {
         // JS:     let devaluator = new Devaluator(exporter, source, encodingLevel);
         let mut devaluator = Self {
             exporter,
             source,
             encoding_level,
+            custom_codec,
             exports: Vec::new(),
         };
         // JS:     try {
@@ -569,14 +581,11 @@ impl<'a> Devaluator<'a> {
             // JS:         }
             // JS:         b64 = b64.replace(/=+$/, "");
             // JS:         return alternateTypeName === undefined ? ["bytes", b64] : ["bytes", b64, alternateTypeName];
-            #[cfg(unix)]
-            CapnwebValue::Fd(value) if self.encoding_level == EncodingLevel::StructuredClonable => {
-                Ok(CapnwebValue::Fd(value.clone()))
-            }
-            #[cfg(unix)]
-            CapnwebValue::Fd(_) => Err(Error::Type(
-                "file descriptors require a structured-clonable transport".to_owned(),
-            )),
+            CapnwebValue::Custom(value) => self
+                .custom_codec
+                .as_deref_mut()
+                .ok_or_else(|| Error::Type("custom value requires a transport handler".to_owned()))?
+                .encode(value),
             CapnwebValue::Bytes(value)
                 if matches!(
                     self.encoding_level,
@@ -1103,9 +1112,8 @@ pub(crate) fn capnweb_to_json(value: &CapnwebValue) -> Result<serde_json::Value>
         | CapnwebValue::Unsupported(_) => Err(Error::Type(
             "devalued string-level tree contains a non-JSON value".to_owned(),
         )),
-        #[cfg(unix)]
-        CapnwebValue::Fd(_) => Err(Error::Type(
-            "devalued string-level tree contains a file descriptor".to_owned(),
+        CapnwebValue::Custom(_) => Err(Error::Type(
+            "devalued string-level tree contains a custom value".to_owned(),
         )),
     }
 }
@@ -1242,6 +1250,7 @@ pub struct Evaluator<'a> {
     // JS:   constructor(private importer: Importer, private encodingLevel: EncodingLevel = "string") {
     importer: &'a mut dyn Importer,
     encoding_level: EncodingLevel,
+    custom_codec: Option<&'a mut CustomMessageCodec>,
     // JS:     this.limits = importer.getLimits();
     // The constructor below initializes `limits` from `importer`.
     // JS:   }
@@ -1254,6 +1263,21 @@ impl<'a> Evaluator<'a> {
         Self {
             importer,
             encoding_level,
+            custom_codec: None,
+            limits,
+        }
+    }
+
+    pub(crate) fn with_custom_codec(
+        importer: &'a mut dyn Importer,
+        encoding_level: EncodingLevel,
+        custom_codec: &'a mut CustomMessageCodec,
+    ) -> Self {
+        let limits = importer.get_limits();
+        Self {
+            importer,
+            encoding_level,
+            custom_codec: Some(custom_codec),
             limits,
         }
     }
@@ -1321,8 +1345,6 @@ impl<'a> Evaluator<'a> {
         // JS:     if (this.encodingLevel === "structuredClonable") {
         // JS:       if (value instanceof Date || typeof value === "bigint") {
         let is_structured_native = matches!(&value, CapnwebValue::BigInt(_));
-        #[cfg(unix)]
-        let is_structured_native = is_structured_native || matches!(&value, CapnwebValue::Fd(_));
         if self.encoding_level == EncodingLevel::StructuredClonable && is_structured_native {
             // JS:         return value;
             return Ok(value);
@@ -1331,6 +1353,13 @@ impl<'a> Evaluator<'a> {
         // JS:     }
         // RUST-DEFERRED(JS built-in: structured clone Date): no dynamic Date variant exists.
         // JS:
+        if let CapnwebValue::Array(expression) = &value {
+            if let Some(codec) = self.custom_codec.as_deref_mut() {
+                if let Some(value) = codec.decode(expression)? {
+                    return Ok(value);
+                }
+            }
+        }
         // JS:     if (value instanceof Array) {
         match value {
             CapnwebValue::Array(mut expression) => {
@@ -2005,8 +2034,9 @@ impl<'a> Evaluator<'a> {
             CapnwebValue::Number(value) => Ok(CapnwebValue::Number(value)),
             CapnwebValue::String(value) => Ok(CapnwebValue::String(value)),
             CapnwebValue::Undefined => Ok(CapnwebValue::Undefined),
-            #[cfg(unix)]
-            CapnwebValue::Fd(value) => Ok(CapnwebValue::Fd(value)),
+            CapnwebValue::Custom(_) => Err(Error::Type(
+                "encoded input contains an unhandled custom value".to_owned(),
+            )),
             CapnwebValue::BigInt(_)
             | CapnwebValue::Bytes(_)
             | CapnwebValue::Function(_)

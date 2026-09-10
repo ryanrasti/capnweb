@@ -10,8 +10,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, Weak};
 
 use crate::core::{
-    CapnwebError, CapnwebValue, Error, ErrorStubHook, MapInstructions, MaybePromise,
-    PayloadStubHook, PropertyPath, Result, RpcPayload, RpcStub, StreamCall, StubHook,
+    CapnwebError, CapnwebValue, CustomMessageCodec, Error, ErrorStubHook, MapInstructions,
+    MaybePromise, PayloadStubHook, PropertyPath, Result, RpcPayload, RpcStub, StreamCall, StubHook,
     StubHookInner, unwrap_stub_and_path,
 };
 // JS: import { Devaluator, Evaluator, ExportId, ImportId, Exporter, Importer, serialize, EncodingLevel, RpcLimits, DEFAULT_LIMITS } from "./serialize.js";
@@ -106,8 +106,13 @@ use crate::serialize::{
 pub enum TransportMessage {
     /// Fully JSON-stringified transport data.
     Text(String),
-    /// A partially encoded Cap'n Web value tree.
-    Value(CapnwebValue),
+    /// A partially encoded Cap'n Web value tree and optional message-local custom codec.
+    Value {
+        /// Devalued transport value.
+        value: CapnwebValue,
+        /// Message-local custom type state.
+        codec: Option<Box<CustomMessageCodec>>,
+    },
 }
 
 /// Result of starting a transport send.
@@ -123,6 +128,11 @@ pub trait AnyRpcTransport: Send + Sync + 'static {
     /// Returns this transport's encoding level.
     fn encoding_level(&self) -> EncodingLevel {
         EncodingLevel::String
+    }
+
+    /// Creates message-local custom encoding state, if supported.
+    fn new_custom_codec(&self) -> Option<Box<CustomMessageCodec>> {
+        None
     }
 
     /// Sends one message and optionally reports its encoded byte size.
@@ -169,6 +179,18 @@ fn wire_integer(value: &CapnwebValue) -> Option<i64> {
         Some(*value as i64)
     } else {
         None
+    }
+}
+
+fn evaluate_transport_value(
+    importer: &mut dyn Importer,
+    encoding: EncodingLevel,
+    value: CapnwebValue,
+    custom_codec: Option<&mut CustomMessageCodec>,
+) -> Result<RpcPayload> {
+    match custom_codec {
+        Some(codec) => Evaluator::with_custom_codec(importer, encoding, codec).evaluate(value),
+        None => Evaluator::new(importer, encoding).evaluate(value),
     }
 }
 
@@ -224,8 +246,7 @@ fn estimate_encoded_size(value: &CapnwebValue, depth: usize) -> usize {
         CapnwebValue::Null => 8,
         // JS:       if (ArrayBuffer.isView(value)) return ESTIMATED_BINARY_OVERHEAD + value.byteLength;
         CapnwebValue::Bytes(value) => ESTIMATED_BINARY_OVERHEAD + value.len(),
-        #[cfg(unix)]
-        CapnwebValue::Fd(_) => 16,
+        CapnwebValue::Custom(_) => 16,
         // JS:       if (value instanceof ArrayBuffer) return ESTIMATED_BINARY_OVERHEAD + value.byteLength;
         // JS:       if (typeof Blob !== "undefined" && value instanceof Blob) {
         // JS:         return ESTIMATED_BINARY_OVERHEAD + value.size;
@@ -1444,23 +1465,12 @@ impl RpcSessionImpl {
                     // JS:           // We don't transfer ownership of stubs in the payload since the payload
                     // JS:           // belongs to the hook which sticks around to handle pipelined requests.
                     // JS:           let value = Devaluator.devaluate(payload.value, undefined, this, payload, this.encodingLevel);
-                    let encoding = state
-                        .lock()
-                        .expect("RPC session mutex poisoned")
-                        .encoding_level;
-                    let mut session = RpcSessionImpl {
-                        state: Arc::clone(&state),
-                    };
-                    match Devaluator::devaluate(
-                        &payload.value,
-                        &mut session,
-                        Some(&payload),
-                        encoding,
-                    ) {
-                        Ok(value) => {
+                    match Self::devaluate_for_send(&state, &payload.value, Some(&payload)) {
+                        Ok((value, codec)) => {
                             let _ = Self::send(
                                 &state,
                                 tagged("resolve", [CapnwebValue::Number(export_id as f64), value]),
+                                codec,
                             );
                         }
                         Err(error) => Self::send_rejection(&state, export_id, error),
@@ -1523,17 +1533,11 @@ impl RpcSessionImpl {
 
     fn send_rejection(state: &Arc<Mutex<RpcSessionState>>, export_id: ExportId, error: Error) {
         let value = CapnwebValue::Error(error.into());
-        let encoding = state
-            .lock()
-            .expect("RPC session mutex poisoned")
-            .encoding_level;
-        let mut session = RpcSessionImpl {
-            state: Arc::clone(state),
-        };
-        if let Ok(value) = Devaluator::devaluate(&value, &mut session, None, encoding) {
+        if let Ok((value, codec)) = Self::devaluate_for_send(state, &value, None) {
             let _ = Self::send(
                 state,
                 tagged("reject", [CapnwebValue::Number(export_id as f64), value]),
+                codec,
             );
         }
     }
@@ -1701,7 +1705,34 @@ impl RpcSessionImpl {
         );
     }
 
-    fn send(state: &Arc<Mutex<RpcSessionState>>, message: CapnwebValue) -> Result<Option<usize>> {
+    fn devaluate_for_send<'a>(
+        state: &Arc<Mutex<RpcSessionState>>,
+        value: &CapnwebValue,
+        source: Option<&'a RpcPayload>,
+    ) -> Result<(CapnwebValue, Option<Box<CustomMessageCodec>>)> {
+        let (transport, encoding_level) = {
+            let state = state.lock().expect("RPC session mutex poisoned");
+            (Arc::clone(&state.transport), state.encoding_level)
+        };
+        let mut codec = transport.new_custom_codec();
+        let mut session = RpcSessionImpl {
+            state: Arc::clone(state),
+        };
+        let value = Devaluator::devaluate_with_codec(
+            value,
+            &mut session,
+            source,
+            encoding_level,
+            codec.as_deref_mut(),
+        )?;
+        Ok((value, codec))
+    }
+
+    fn send(
+        state: &Arc<Mutex<RpcSessionState>>,
+        message: CapnwebValue,
+        custom_codec: Option<Box<CustomMessageCodec>>,
+    ) -> Result<Option<usize>> {
         // JS:     if (this.abortReason !== undefined) {
         let (transport, encoding_level, aborted) = {
             let state = state.lock().expect("RPC session mutex poisoned");
@@ -1770,7 +1801,10 @@ impl RpcSessionImpl {
             // JS:       // is unavailable (e.g. structured clone).
             // JS:       try {
             // JS:         let size = (this.transport as RpcTransportWithCustomEncoding).send(msg);
-            let size = match transport.send(TransportMessage::Value(message)) {
+            let size = match transport.send(TransportMessage::Value {
+                value: message,
+                codec: custom_codec,
+            }) {
                 Ok(TransportSend::Done(size)) => size,
                 Ok(TransportSend::Pending(pending)) => {
                     Self::observe_send(state, pending);
@@ -1831,20 +1865,14 @@ impl RpcSessionImpl {
             CapnwebValue::Number(id as f64),
             path_to_value(path),
         ];
+        let mut custom_codec = None;
         // JS:     if (args) {
         if let Some(args) = args.as_ref() {
             // JS:       let devalue: unknown;
             // JS:       try {
             // JS:         devalue = Devaluator.devaluate(args.value, undefined, this, args, this.encodingLevel);
-            let encoding_level = state
-                .lock()
-                .expect("RPC session mutex poisoned")
-                .encoding_level;
-            let mut session = RpcSessionImpl {
-                state: Arc::clone(state),
-            };
-            let devalued =
-                Devaluator::devaluate(&args.value, &mut session, Some(&args), encoding_level)?;
+            let (devalued, codec) = Self::devaluate_for_send(state, &args.value, Some(args))?;
+            custom_codec = codec;
             // JS:       } catch (err) {
             // JS:         args.dispose();
             // JS:         throw err;
@@ -1867,7 +1895,11 @@ impl RpcSessionImpl {
             // JS:     }
         }
         // JS:     this.send(["push", value]);
-        Self::send(state, tagged("push", [CapnwebValue::Array(value)]))?;
+        Self::send(
+            state,
+            tagged("push", [CapnwebValue::Array(value)]),
+            custom_codec,
+        )?;
         // JS:
         // JS:     let entry = new ImportTableEntry(this, this.imports.length, false);
         let entry = {
@@ -1917,15 +1949,7 @@ impl RpcSessionImpl {
         // JS:     let devalue: unknown;
         // JS:     try {
         // JS:       devalue = Devaluator.devaluate(args.value, undefined, this, args, this.encodingLevel);
-        let encoding_level = state
-            .lock()
-            .expect("RPC session mutex poisoned")
-            .encoding_level;
-        let mut session = RpcSessionImpl {
-            state: Arc::clone(state),
-        };
-        let devalued =
-            Devaluator::devaluate(&args.value, &mut session, Some(&args), encoding_level)?;
+        let (devalued, custom_codec) = Self::devaluate_for_send(state, &args.value, Some(&args))?;
         // JS:     } catch (err) {
         // JS:       // Disposing the partially-serialized payload is safe for the same reasons as in sendCall().
         // JS:       args.dispose();
@@ -1945,7 +1969,7 @@ impl RpcSessionImpl {
         // JS:     let msg = ["stream", value];
         let message = tagged("stream", [CapnwebValue::Array(value)]);
         // JS:     let size = this.send(msg);
-        let size = Self::send(state, message.clone())?;
+        let size = Self::send(state, message.clone(), custom_codec)?;
         // JS:     if (size === undefined) {
         // JS:       size = estimateEncodedSize(msg);
         let size = size.unwrap_or_else(|| estimate_encoded_size(&message, 0));
@@ -2071,7 +2095,7 @@ impl RpcSessionImpl {
         ]);
         // JS:
         // JS:     this.send(["push", value]);
-        Self::send(state, tagged("push", [value]))?;
+        Self::send(state, tagged("push", [value]), None)?;
         // JS:
         // JS:     let entry = new ImportTableEntry(this, this.imports.length, false);
         let entry = {
@@ -2103,7 +2127,11 @@ impl RpcSessionImpl {
         }
         // JS:
         // JS:     this.send(["pull", id]);
-        Self::send(state, tagged("pull", [CapnwebValue::Number(id as f64)]))?;
+        Self::send(
+            state,
+            tagged("pull", [CapnwebValue::Number(id as f64)]),
+            None,
+        )?;
         // JS:   }
         Ok(())
     }
@@ -2134,6 +2162,7 @@ impl RpcSessionImpl {
                     CapnwebValue::Number(remote_refcount as f64),
                 ],
             ),
+            None,
         )?;
         // JS:     delete this.imports[id];
         state
@@ -2166,15 +2195,8 @@ impl RpcSessionImpl {
             // JS:       try {
             // JS:         let abortMsg = ["abort", Devaluator.devaluate(error, undefined, this, undefined, this.encodingLevel)];
             let value = CapnwebValue::Error(error.clone().into());
-            let encoding_level = state
-                .lock()
-                .expect("RPC session mutex poisoned")
-                .encoding_level;
-            let mut session = RpcSessionImpl {
-                state: Arc::clone(state),
-            };
-            if let Ok(value) = Devaluator::devaluate(&value, &mut session, None, encoding_level) {
-                let _ = Self::send(state, tagged("abort", [value]));
+            if let Ok((value, codec)) = Self::devaluate_for_send(state, &value, None) {
+                let _ = Self::send(state, tagged("abort", [value]), codec);
             }
             // JS:         if (this.encodingLevel === "string") {
             // JS:           let sent = (this.transport as RpcTransport)
@@ -2363,16 +2385,24 @@ impl RpcSessionImpl {
                         serde::Deserialize::deserialize(deserializer)
                             .map_err(|error| Error::Type(format!("invalid RPC JSON: {error}")))
                             .and_then(json_to_capnweb)
+                            .map(|value| (value, None))
                     }
                     (EncodingLevel::String, _) => Err(Error::Type(
                         "string transport returned a non-string message".to_owned(),
                     )),
-                    (_, TransportMessage::Value(value)) => Ok(value),
+                    (_, TransportMessage::Value { value, codec }) => Ok((value, codec)),
                     (_, _) => Err(Error::Type(
                         "custom transport returned a string message".to_owned(),
                     )),
                 };
-                let result = message.and_then(|message| Self::process_message(&state, message));
+                let result = message.and_then(|(message, mut codec)| {
+                    let result = Self::process_message(&state, message, codec.as_deref_mut());
+                    match (result, codec.as_deref_mut().map(CustomMessageCodec::finish)) {
+                        (Err(error), _) => Err(error),
+                        (Ok(()), Some(result)) => result,
+                        (Ok(()), None) => Ok(()),
+                    }
+                });
                 if let Err(error) = result {
                     Self::abort(&state, error, true);
                     return;
@@ -2494,7 +2524,11 @@ impl RpcSessionImpl {
             .read_loop_abort = Some(task.abort_handle());
     }
 
-    fn process_message(state: &Arc<Mutex<RpcSessionState>>, message: CapnwebValue) -> Result<()> {
+    fn process_message(
+        state: &Arc<Mutex<RpcSessionState>>,
+        message: CapnwebValue,
+        mut custom_codec: Option<&mut CustomMessageCodec>,
+    ) -> Result<()> {
         let CapnwebValue::Array(message) = message else {
             return Err(Error::Type("bad RPC message: expected array".to_owned()));
         };
@@ -2510,8 +2544,12 @@ impl RpcSessionImpl {
                 let mut session = RpcSessionImpl {
                     state: Arc::clone(state),
                 };
-                let payload =
-                    Evaluator::new(&mut session, encoding).evaluate(message[1].clone())?;
+                let payload = evaluate_transport_value(
+                    &mut session,
+                    encoding,
+                    message[1].clone(),
+                    custom_codec.as_deref_mut(),
+                )?;
                 let hook: StubHook = Arc::new(PayloadStubHook::new(payload));
                 hook.ignore_unhandled_rejections();
                 let (export_id, auto_release) = {
@@ -2554,8 +2592,12 @@ impl RpcSessionImpl {
                     let mut session = RpcSessionImpl {
                         state: Arc::clone(state),
                     };
-                    let payload =
-                        Evaluator::new(&mut session, encoding).evaluate(message[2].clone())?;
+                    let payload = evaluate_transport_value(
+                        &mut session,
+                        encoding,
+                        message[2].clone(),
+                        custom_codec.as_deref_mut(),
+                    )?;
                     let resolution: StubHook = if tag == "resolve" {
                         Arc::new(PayloadStubHook::new(payload))
                     } else {
@@ -2566,7 +2608,12 @@ impl RpcSessionImpl {
                     let mut session = RpcSessionImpl {
                         state: Arc::clone(state),
                     };
-                    drop(Evaluator::new(&mut session, encoding).evaluate(message[2].clone())?);
+                    drop(evaluate_transport_value(
+                        &mut session,
+                        encoding,
+                        message[2].clone(),
+                        custom_codec.as_deref_mut(),
+                    )?);
                 }
                 Ok(())
             }
@@ -2582,8 +2629,12 @@ impl RpcSessionImpl {
                 let mut session = RpcSessionImpl {
                     state: Arc::clone(state),
                 };
-                let payload =
-                    Evaluator::new(&mut session, encoding).evaluate(message[1].clone())?;
+                let payload = evaluate_transport_value(
+                    &mut session,
+                    encoding,
+                    message[1].clone(),
+                    custom_codec.as_deref_mut(),
+                )?;
                 Self::abort(state, value_to_error(payload.value), false);
                 Ok(())
             }

@@ -13,7 +13,7 @@
 - Stable generated-binding facade
 - HTTP batch, WebSocket, and UDS/SCM_RIGHTS transports
 - Transport abort and deserialization hardening tests
-- Native `Fd` values with real bidirectional SCM_RIGHTS coverage
+- Generic custom-value codecs plus a UDS `OwnedFd` handler with real bidirectional SCM_RIGHTS coverage
 - Focused eager-promise polling, ordering, cancellation, panic, and settlement tests
 - Portable core JavaScript test coverage
 

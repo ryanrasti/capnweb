@@ -7,15 +7,11 @@
 // JS:
 
 // JS: import type { RpcTargetBranded, __RPC_TARGET_BRAND } from "./types.js";
-use std::collections::BTreeMap;
+use std::any::{Any, TypeId};
+use std::collections::{BTreeMap, HashMap};
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::{Arc, Mutex};
-#[cfg(unix)]
-use std::{
-    io,
-    os::fd::{AsFd, BorrowedFd, OwnedFd},
-};
 
 use num_bigint::BigInt;
 use thiserror::Error as ThisError;
@@ -74,44 +70,174 @@ impl From<Error> for CapnwebError {
     }
 }
 
-/// A Unix file descriptor carried by a custom structured-clonable transport.
-#[cfg(unix)]
+/// A transport-defined value stored with checked dynamic type information.
 #[derive(Clone)]
-pub struct Fd(Arc<OwnedFd>);
+pub struct CustomValue {
+    inner: Arc<dyn Any + Send + Sync>,
+    type_name: &'static str,
+}
 
-#[cfg(unix)]
-impl Fd {
-    /// Wraps an owned descriptor for transport.
-    pub fn new(fd: OwnedFd) -> Self {
-        Self(Arc::new(fd))
+impl CustomValue {
+    /// Wraps an application value for a registered custom transport codec.
+    pub fn new<T: Any + Send + Sync>(value: T) -> Self {
+        Self {
+            inner: Arc::new(value),
+            type_name: std::any::type_name::<T>(),
+        }
     }
 
-    /// Borrows the underlying descriptor.
-    pub fn as_fd(&self) -> BorrowedFd<'_> {
-        self.0.as_fd()
+    /// Returns the concrete Rust type identifier.
+    pub fn type_id(&self) -> TypeId {
+        self.inner.as_ref().type_id()
     }
 
-    /// Duplicates the underlying descriptor into independent ownership.
-    pub fn try_clone_owned(&self) -> io::Result<OwnedFd> {
-        self.as_fd().try_clone_to_owned()
-    }
-
-    pub(crate) fn from_shared(fd: Arc<OwnedFd>) -> Self {
-        Self(fd)
+    /// Downcasts to the checked concrete application type.
+    pub fn downcast<T: Any + Send + Sync>(&self) -> Result<Arc<T>> {
+        Arc::clone(&self.inner).downcast::<T>().map_err(|_| {
+            Error::Type(format!(
+                "custom value is {}, not {}",
+                self.type_name,
+                std::any::type_name::<T>()
+            ))
+        })
     }
 }
 
-#[cfg(unix)]
-impl From<OwnedFd> for Fd {
-    fn from(fd: OwnedFd) -> Self {
-        Self::new(fd)
+/// Per-message transport state used by custom type handlers.
+pub trait CustomMessageContext: Any + Send {
+    /// Exposes checked mutable context downcasting.
+    fn as_any_mut(&mut self) -> &mut dyn Any;
+
+    /// Validates that all message-local resources were consumed.
+    fn finish(&mut self) -> Result<()> {
+        Ok(())
     }
 }
 
-#[cfg(unix)]
-impl From<Fd> for CapnwebValue {
-    fn from(fd: Fd) -> Self {
-        Self::Fd(fd)
+/// Dynamically dispatched encoder and decoder for one custom application type.
+pub trait CustomTypeHandler: Send + Sync {
+    /// Concrete Rust type accepted by this handler.
+    fn value_type_id(&self) -> TypeId;
+
+    /// Reserved Cap’n Web special-value tag emitted on the wire.
+    fn wire_tag(&self) -> &'static str;
+
+    /// Encodes the fields following this handler's special-value tag.
+    fn encode_fields(
+        &self,
+        value: &CustomValue,
+        context: &mut dyn CustomMessageContext,
+    ) -> Result<Vec<CapnwebValue>>;
+
+    /// Decodes the fields following this handler's special-value tag.
+    fn decode_fields(
+        &self,
+        fields: &[CapnwebValue],
+        context: &mut dyn CustomMessageContext,
+    ) -> Result<CustomValue>;
+}
+
+/// Immutable custom-type dispatch table shared by a transport.
+#[derive(Default)]
+pub struct CustomTypeRegistry {
+    encoders: HashMap<TypeId, Arc<dyn CustomTypeHandler>>,
+    decoders: HashMap<&'static str, Arc<dyn CustomTypeHandler>>,
+}
+
+impl CustomTypeRegistry {
+    /// Creates an empty custom-type registry.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Registers one handler by concrete Rust type and wire tag.
+    pub fn register(&mut self, handler: Arc<dyn CustomTypeHandler>) -> Result<()> {
+        let type_id = handler.value_type_id();
+        let tag = handler.wire_tag();
+        if matches!(
+            tag,
+            "bigint"
+                | "date"
+                | "bytes"
+                | "error"
+                | "undefined"
+                | "inf"
+                | "-inf"
+                | "nan"
+                | "url"
+                | "headers"
+                | "request"
+                | "response"
+                | "blob"
+                | "import"
+                | "pipeline"
+                | "remap"
+                | "export"
+                | "promise"
+                | "writable"
+                | "readable"
+        ) {
+            return Err(Error::Type(format!(
+                "custom handler cannot override reserved wire tag: {tag}"
+            )));
+        }
+        if self.encoders.contains_key(&type_id) {
+            return Err(Error::Type(
+                "duplicate custom value type handler".to_owned(),
+            ));
+        }
+        if self.decoders.contains_key(tag) {
+            return Err(Error::Type(format!("duplicate custom wire tag: {tag}")));
+        }
+        self.encoders.insert(type_id, Arc::clone(&handler));
+        self.decoders.insert(tag, handler);
+        Ok(())
+    }
+}
+
+/// Per-message custom-type dispatcher and transport sidecar state.
+pub struct CustomMessageCodec {
+    registry: Arc<CustomTypeRegistry>,
+    context: Box<dyn CustomMessageContext>,
+}
+
+impl CustomMessageCodec {
+    /// Starts a message using a registry and transport-defined context.
+    pub fn new(registry: Arc<CustomTypeRegistry>, context: Box<dyn CustomMessageContext>) -> Self {
+        Self { registry, context }
+    }
+
+    pub(crate) fn encode(&mut self, value: &CustomValue) -> Result<CapnwebValue> {
+        let handler = self
+            .registry
+            .encoders
+            .get(&value.type_id())
+            .ok_or_else(|| Error::Type("no handler for custom value type".to_owned()))?;
+        let mut expression = vec![CapnwebValue::String(handler.wire_tag().to_owned())];
+        expression.extend(handler.encode_fields(value, self.context.as_mut())?);
+        Ok(CapnwebValue::Array(expression))
+    }
+
+    pub(crate) fn decode(&mut self, expression: &[CapnwebValue]) -> Result<Option<CapnwebValue>> {
+        let Some(tag) = expression.first().and_then(CapnwebValue::as_str) else {
+            return Ok(None);
+        };
+        let Some(handler) = self.registry.decoders.get(tag) else {
+            return Ok(None);
+        };
+        handler
+            .decode_fields(&expression[1..], self.context.as_mut())
+            .map(CapnwebValue::Custom)
+            .map(Some)
+    }
+
+    /// Downcasts the transport-defined message context.
+    pub fn context_mut<T: Any>(&mut self) -> Option<&mut T> {
+        self.context.as_any_mut().downcast_mut()
+    }
+
+    pub(crate) fn finish(&mut self) -> Result<()> {
+        self.context.finish()
     }
 }
 
@@ -132,9 +258,8 @@ pub enum CapnwebValue {
     BigInt(BigInt),
     /// A byte string.
     Bytes(Vec<u8>),
-    /// A Unix file descriptor for a custom structured-clonable transport.
-    #[cfg(unix)]
-    Fd(Fd),
+    /// An application value handled by a transport-provided custom codec.
+    Custom(CustomValue),
     /// An array.
     Array(Vec<Self>),
     /// A plain string-keyed object.
@@ -163,8 +288,10 @@ impl std::fmt::Debug for CapnwebValue {
             Self::String(value) => formatter.debug_tuple("String").field(value).finish(),
             Self::BigInt(value) => formatter.debug_tuple("BigInt").field(value).finish(),
             Self::Bytes(value) => formatter.debug_tuple("Bytes").field(value).finish(),
-            #[cfg(unix)]
-            Self::Fd(value) => formatter.debug_tuple("Fd").field(&value.as_fd()).finish(),
+            Self::Custom(value) => formatter
+                .debug_tuple("Custom")
+                .field(&value.type_name)
+                .finish(),
             Self::Array(value) => formatter.debug_tuple("Array").field(value).finish(),
             Self::Object(value) => formatter.debug_tuple("Object").field(value).finish(),
             Self::Function(_) => formatter.write_str("Function(..)"),
@@ -178,6 +305,19 @@ impl std::fmt::Debug for CapnwebValue {
 }
 
 impl CapnwebValue {
+    /// Wraps a concrete application value for transport-specific encoding.
+    pub fn custom<T: Any + Send + Sync>(value: T) -> Self {
+        Self::Custom(CustomValue::new(value))
+    }
+
+    /// Downcasts a custom application value to its checked concrete type.
+    pub fn downcast_custom<T: Any + Send + Sync>(&self) -> Result<Arc<T>> {
+        match self {
+            Self::Custom(value) => value.downcast::<T>(),
+            _ => Err(Error::Type("value is not custom transport data".to_owned())),
+        }
+    }
+
     pub(crate) fn is_array(&self) -> bool {
         matches!(self, Self::Array(_))
     }
@@ -590,8 +730,7 @@ pub(crate) fn type_for_rpc(value: &CapnwebValue) -> TypeForRpc {
         // JS:       if (value instanceof Error) {
         // JS:         return "error";
         CapnwebValue::Error(_) => TypeForRpc::Error,
-        #[cfg(unix)]
-        CapnwebValue::Fd(_) => TypeForRpc::Unsupported,
+        CapnwebValue::Custom(_) => TypeForRpc::Unsupported,
         CapnwebValue::Unsupported(_) => TypeForRpc::Unsupported,
         // JS:       }
         // JS:
@@ -2023,8 +2162,7 @@ impl RpcPayload {
             | CapnwebValue::Bytes(_)
             | CapnwebValue::Error(_)
             | CapnwebValue::Unsupported(_) => value.clone(),
-            #[cfg(unix)]
-            CapnwebValue::Fd(_) => value.clone(),
+            CapnwebValue::Custom(_) => value.clone(),
             // JS:
             // JS:       case "array": {
             // JS:         // We have to construct the new array first, then fill it in, so we can pass it as the
@@ -2690,17 +2828,16 @@ impl RpcPayload {
             CapnwebValue::Unsupported(_) => {
                 let _unsupported_value_has_no_rejection = ();
             } // Unsupported values contain no promises.
-            #[cfg(unix)]
-            CapnwebValue::Fd(_) => {},
-              // JS:
-              // JS:       case "rpc-thenable":
-              // JS:         (<any>value).then((_: any) => {}, (_: any) => {});
-              // JS:         return;
-              // JS:
-              // JS:       default:
-              // JS:         kind satisfies never;
-              // JS:         return;
-              // JS:     }
+            CapnwebValue::Custom(_) => {}
+            // JS:
+            // JS:       case "rpc-thenable":
+            // JS:         (<any>value).then((_: any) => {}, (_: any) => {});
+            // JS:         return;
+            // JS:
+            // JS:       default:
+            // JS:         kind satisfies never;
+            // JS:         return;
+            // JS:     }
         }
         // JS:   }
     }

@@ -252,7 +252,7 @@ impl AnyRpcTransport for CustomEncodingTransport {
     }
 
     fn send(&self, message: TransportMessage) -> Result<TransportSend> {
-        let TransportMessage::Value(message) = message else {
+        let TransportMessage::Value { value: message, .. } = message else {
             panic!("custom transport received string-level data")
         };
         self.sent.lock().unwrap().push(message);
