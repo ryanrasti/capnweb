@@ -13,6 +13,8 @@ use futures::{SinkExt, StreamExt};
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio_tungstenite::WebSocketStream;
 use tokio_tungstenite::tungstenite::Message;
+use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+use tokio_tungstenite::tungstenite::http::{HeaderName, HeaderValue};
 
 use crate::core::{CapnwebValue, Error, Result, RpcStub};
 // JS: import { RpcSession, RpcSessionOptions } from "./rpc.js";
@@ -146,10 +148,30 @@ impl WebSocketTransport {
 
     /// Connects a client-side WebSocket transport to `url`.
     pub async fn connect(url: &str) -> Result<Arc<Self>> {
+        Self::connect_with_headers(url, std::iter::empty::<(String, String)>()).await
+    }
+
+    /// Connects while adding caller-provided HTTP handshake headers.
+    pub async fn connect_with_headers(
+        url: &str,
+        headers: impl IntoIterator<Item = (String, String)>,
+    ) -> Result<Arc<Self>> {
+        let mut request = url
+            .into_client_request()
+            .map_err(|error| Error::Message(format!("Invalid WebSocket URL: {error}")))?;
+        for (name, value) in headers {
+            let name = HeaderName::try_from(name).map_err(|error| {
+                Error::Message(format!("Invalid WebSocket header name: {error}"))
+            })?;
+            let value = HeaderValue::try_from(value).map_err(|error| {
+                Error::Message(format!("Invalid WebSocket header value: {error}"))
+            })?;
+            request.headers_mut().append(name, value);
+        }
         // Cap'n Web RPC consists of small request/response messages. Leaving
         // Nagle enabled can pair badly with delayed ACKs and add ~40 ms to
         // every round trip, so request TCP_NODELAY from tokio-tungstenite.
-        let (stream, _) = tokio_tungstenite::connect_async_with_config(url, None, true)
+        let (stream, _) = tokio_tungstenite::connect_async_with_config(request, None, true)
             .await
             .map_err(|error| Error::Message(format!("WebSocket connection failed: {error}")))?;
         Ok(Self::attach(stream))
@@ -327,3 +349,34 @@ impl AnyRpcTransport for WebSocketTransport {
 // JS: // This class is generic, so it can't `implements RpcTransport` (that would require every `T` to
 // JS: // conform, but the ArrayBuffer instantiation intentionally doesn't). The default string
 // JS: // instantiation's conformance is asserted in __type-tests__/rpc-types.test.ts.
+
+#[cfg(test)]
+mod tests {
+    use super::WebSocketTransport;
+
+    #[tokio::test]
+    async fn client_sends_custom_handshake_headers() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            tokio_tungstenite::accept_hdr_async(
+                stream,
+                |request: &tokio_tungstenite::tungstenite::handshake::server::Request, response| {
+                    assert_eq!(request.headers()["x-capability-route"], "volume");
+                    Ok(response)
+                },
+            )
+            .await
+            .unwrap()
+        });
+        let transport = WebSocketTransport::connect_with_headers(
+            &format!("ws://{address}/rpc"),
+            [("x-capability-route".to_string(), "volume".to_string())],
+        )
+        .await
+        .unwrap();
+        drop(transport);
+        server.await.unwrap();
+    }
+}
