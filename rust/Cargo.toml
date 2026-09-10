@@ -21,6 +21,7 @@ base64 = "0.22"
 capnweb-macros = { path = "macros" }
 futures = "0.3"
 num-bigint = "0.4"
+rustix = { version = "1", features = ["net"] }
 serde = "1"
 serde_json = { version = "1", features = ["unbounded_depth"] }
 serde_stacker = "0.1"

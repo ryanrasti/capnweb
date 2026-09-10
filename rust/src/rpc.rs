@@ -224,6 +224,8 @@ fn estimate_encoded_size(value: &CapnwebValue, depth: usize) -> usize {
         CapnwebValue::Null => 8,
         // JS:       if (ArrayBuffer.isView(value)) return ESTIMATED_BINARY_OVERHEAD + value.byteLength;
         CapnwebValue::Bytes(value) => ESTIMATED_BINARY_OVERHEAD + value.len(),
+        #[cfg(unix)]
+        CapnwebValue::Fd(_) => 16,
         // JS:       if (value instanceof ArrayBuffer) return ESTIMATED_BINARY_OVERHEAD + value.byteLength;
         // JS:       if (typeof Blob !== "undefined" && value instanceof Blob) {
         // JS:         return ESTIMATED_BINARY_OVERHEAD + value.size;

@@ -569,6 +569,14 @@ impl<'a> Devaluator<'a> {
             // JS:         }
             // JS:         b64 = b64.replace(/=+$/, "");
             // JS:         return alternateTypeName === undefined ? ["bytes", b64] : ["bytes", b64, alternateTypeName];
+            #[cfg(unix)]
+            CapnwebValue::Fd(value) if self.encoding_level == EncodingLevel::StructuredClonable => {
+                Ok(CapnwebValue::Fd(value.clone()))
+            }
+            #[cfg(unix)]
+            CapnwebValue::Fd(_) => Err(Error::Type(
+                "file descriptors require a structured-clonable transport".to_owned(),
+            )),
             CapnwebValue::Bytes(value)
                 if matches!(
                     self.encoding_level,
@@ -1095,6 +1103,10 @@ pub(crate) fn capnweb_to_json(value: &CapnwebValue) -> Result<serde_json::Value>
         | CapnwebValue::Unsupported(_) => Err(Error::Type(
             "devalued string-level tree contains a non-JSON value".to_owned(),
         )),
+        #[cfg(unix)]
+        CapnwebValue::Fd(_) => Err(Error::Type(
+            "devalued string-level tree contains a file descriptor".to_owned(),
+        )),
     }
 }
 // JS:
@@ -1308,9 +1320,10 @@ impl<'a> Evaluator<'a> {
         // JS:     // and `Error` values are intentionally *not* accepted here.
         // JS:     if (this.encodingLevel === "structuredClonable") {
         // JS:       if (value instanceof Date || typeof value === "bigint") {
-        if self.encoding_level == EncodingLevel::StructuredClonable
-            && matches!(&value, CapnwebValue::BigInt(_))
-        {
+        let is_structured_native = matches!(&value, CapnwebValue::BigInt(_));
+        #[cfg(unix)]
+        let is_structured_native = is_structured_native || matches!(&value, CapnwebValue::Fd(_));
+        if self.encoding_level == EncodingLevel::StructuredClonable && is_structured_native {
             // JS:         return value;
             return Ok(value);
             // JS:       }
@@ -1992,6 +2005,8 @@ impl<'a> Evaluator<'a> {
             CapnwebValue::Number(value) => Ok(CapnwebValue::Number(value)),
             CapnwebValue::String(value) => Ok(CapnwebValue::String(value)),
             CapnwebValue::Undefined => Ok(CapnwebValue::Undefined),
+            #[cfg(unix)]
+            CapnwebValue::Fd(value) => Ok(CapnwebValue::Fd(value)),
             CapnwebValue::BigInt(_)
             | CapnwebValue::Bytes(_)
             | CapnwebValue::Function(_)

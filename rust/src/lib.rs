@@ -12,6 +12,8 @@ mod serialize;
 mod rpc;
 // JS: import { RpcLimits, DEFAULT_LIMITS, DEFAULT_MAX_DEPTH } from "./serialize.js";
 pub use capnweb_macros::{rpc_interface, rpc_target};
+#[cfg(unix)]
+pub use core::Fd;
 pub use core::{
     CapnwebError, CapnwebValue, Error, IntoPropertyPath, MapInstructions, MaybePromise,
     PayloadStubHook, PromiseStubHook, PropertyKey, PropertyPath, Result, RpcPayload, RpcPromise,
@@ -47,6 +49,10 @@ pub use map::force_init_map;
 // JS: import { forceInitStreams } from "./streams.js";
 mod streams;
 pub use streams::{FlowController, SendToken};
+#[cfg(unix)]
+mod uds;
+#[cfg(unix)]
+pub use uds::UdsTransport;
 // JS:
 // JS: forceInitMap();
 // JS: forceInitStreams();

@@ -11,6 +11,11 @@ use std::collections::BTreeMap;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::{Arc, Mutex};
+#[cfg(unix)]
+use std::{
+    io,
+    os::fd::{AsFd, BorrowedFd, OwnedFd},
+};
 
 use num_bigint::BigInt;
 use thiserror::Error as ThisError;
@@ -69,6 +74,47 @@ impl From<Error> for CapnwebError {
     }
 }
 
+/// A Unix file descriptor carried by a custom structured-clonable transport.
+#[cfg(unix)]
+#[derive(Clone)]
+pub struct Fd(Arc<OwnedFd>);
+
+#[cfg(unix)]
+impl Fd {
+    /// Wraps an owned descriptor for transport.
+    pub fn new(fd: OwnedFd) -> Self {
+        Self(Arc::new(fd))
+    }
+
+    /// Borrows the underlying descriptor.
+    pub fn as_fd(&self) -> BorrowedFd<'_> {
+        self.0.as_fd()
+    }
+
+    /// Duplicates the underlying descriptor into independent ownership.
+    pub fn try_clone_owned(&self) -> io::Result<OwnedFd> {
+        self.as_fd().try_clone_to_owned()
+    }
+
+    pub(crate) fn from_shared(fd: Arc<OwnedFd>) -> Self {
+        Self(fd)
+    }
+}
+
+#[cfg(unix)]
+impl From<OwnedFd> for Fd {
+    fn from(fd: OwnedFd) -> Self {
+        Self::new(fd)
+    }
+}
+
+#[cfg(unix)]
+impl From<Fd> for CapnwebValue {
+    fn from(fd: Fd) -> Self {
+        Self::Fd(fd)
+    }
+}
+
 /// An owned dynamic value accepted by the Rust RPC boundary.
 #[derive(Clone)]
 pub enum CapnwebValue {
@@ -86,6 +132,9 @@ pub enum CapnwebValue {
     BigInt(BigInt),
     /// A byte string.
     Bytes(Vec<u8>),
+    /// A Unix file descriptor for a custom structured-clonable transport.
+    #[cfg(unix)]
+    Fd(Fd),
     /// An array.
     Array(Vec<Self>),
     /// A plain string-keyed object.
@@ -114,6 +163,8 @@ impl std::fmt::Debug for CapnwebValue {
             Self::String(value) => formatter.debug_tuple("String").field(value).finish(),
             Self::BigInt(value) => formatter.debug_tuple("BigInt").field(value).finish(),
             Self::Bytes(value) => formatter.debug_tuple("Bytes").field(value).finish(),
+            #[cfg(unix)]
+            Self::Fd(value) => formatter.debug_tuple("Fd").field(&value.as_fd()).finish(),
             Self::Array(value) => formatter.debug_tuple("Array").field(value).finish(),
             Self::Object(value) => formatter.debug_tuple("Object").field(value).finish(),
             Self::Function(_) => formatter.write_str("Function(..)"),
@@ -539,6 +590,8 @@ pub(crate) fn type_for_rpc(value: &CapnwebValue) -> TypeForRpc {
         // JS:       if (value instanceof Error) {
         // JS:         return "error";
         CapnwebValue::Error(_) => TypeForRpc::Error,
+        #[cfg(unix)]
+        CapnwebValue::Fd(_) => TypeForRpc::Unsupported,
         CapnwebValue::Unsupported(_) => TypeForRpc::Unsupported,
         // JS:       }
         // JS:
@@ -1970,6 +2023,8 @@ impl RpcPayload {
             | CapnwebValue::Bytes(_)
             | CapnwebValue::Error(_)
             | CapnwebValue::Unsupported(_) => value.clone(),
+            #[cfg(unix)]
+            CapnwebValue::Fd(_) => value.clone(),
             // JS:
             // JS:       case "array": {
             // JS:         // We have to construct the new array first, then fill it in, so we can pass it as the
@@ -2635,6 +2690,8 @@ impl RpcPayload {
             CapnwebValue::Unsupported(_) => {
                 let _unsupported_value_has_no_rejection = ();
             } // Unsupported values contain no promises.
+            #[cfg(unix)]
+            CapnwebValue::Fd(_) => {},
               // JS:
               // JS:       case "rpc-thenable":
               // JS:         (<any>value).then((_: any) => {}, (_: any) => {});
