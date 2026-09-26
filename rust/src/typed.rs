@@ -8,6 +8,7 @@ use std::task::{Context, Poll};
 
 use num_bigint::BigInt;
 
+use crate::channel::ByteChannel;
 use crate::core::{CapnwebValue, Error, Result, RpcPromise, RpcStub};
 
 /// An opaque byte string, distinct from a Cap'n Web array of numeric values.
@@ -158,6 +159,23 @@ impl FromCapnwebValue for Bytes {
         match value {
             CapnwebValue::Bytes(value) => Ok(Self(value)),
             other => Err(type_mismatch("bytes", &other)),
+        }
+    }
+}
+
+impl IntoCapnwebValue for ByteChannel {
+    fn into_capnweb_value(self) -> Result<CapnwebValue> {
+        Ok(CapnwebValue::custom(self))
+    }
+}
+
+impl FromCapnwebValue for ByteChannel {
+    fn from_capnweb_value(value: CapnwebValue) -> Result<Self> {
+        match value {
+            CapnwebValue::Custom(value) => value
+                .downcast::<ByteChannel>()
+                .map(|channel| channel.as_ref().clone()),
+            other => Err(type_mismatch("byte channel", &other)),
         }
     }
 }

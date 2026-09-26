@@ -48,6 +48,13 @@ pub use map::force_init_map;
 // JS: import { forceInitStreams } from "./streams.js";
 mod streams;
 pub use streams::{FlowController, SendToken};
+pub mod channel;
+pub use channel::{BYTE_CHANNEL_VERSION, ByteChannel, ByteChannelSession};
+mod framed_stream;
+pub use framed_stream::{
+    DEFAULT_MAX_FRAME_BYTES, FramedStreamTransport, FramedStreamTransportBuilder,
+    TransportAbortHandler,
+};
 #[cfg(unix)]
 mod uds;
 #[cfg(unix)]

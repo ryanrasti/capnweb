@@ -11,10 +11,14 @@ use std::sync::Arc;
 use rustix::net::{
     AddressFamily, RecvAncillaryBuffer, RecvAncillaryMessage, RecvFlags, ReturnFlags,
     SendAncillaryBuffer, SendAncillaryMessage, SendFlags, Shutdown, SocketFlags, SocketType,
-    recvmsg, sendmsg, shutdown, socketpair,
+    getpeername, recvmsg, sendmsg, shutdown, socketpair,
 };
 use tokio::io::unix::AsyncFd;
 
+use crate::channel::{
+    ByteChannel, ByteChannelEndpoint, ByteChannelFd, ByteChannelTransportAdapter,
+    ByteChannelTypeHandler, RevocationGroup,
+};
 use crate::core::{
     CapnwebValue, CustomMessageCodec, CustomMessageContext, CustomTypeHandler, CustomTypeRegistry,
     CustomValue, Error, Result,
@@ -35,20 +39,30 @@ pub struct UdsTransport {
     registry: Arc<CustomTypeRegistry>,
     send_lock: Arc<tokio::sync::Mutex<()>>,
     receive_lock: tokio::sync::Mutex<()>,
+    revocations: Arc<RevocationGroup>,
 }
 
 impl UdsTransport {
     /// Wraps a connected, non-blocking Unix `SOCK_SEQPACKET` socket.
     pub fn new(socket: OwnedFd) -> std::io::Result<Self> {
+        let revocations = Arc::new(RevocationGroup::default());
         let mut registry = CustomTypeRegistry::new();
         registry
             .register(Arc::new(UdsFdHandler))
+            .map_err(|error| std::io::Error::other(error.to_string()))?;
+        registry
+            .register(Arc::new(ByteChannelTypeHandler::new(Arc::new(
+                UdsByteChannelAdapter {
+                    revocations: Arc::clone(&revocations),
+                },
+            ))))
             .map_err(|error| std::io::Error::other(error.to_string()))?;
         Ok(Self {
             socket: Arc::new(AsyncFd::new(socket)?),
             registry: Arc::new(registry),
             send_lock: Arc::new(tokio::sync::Mutex::new(())),
             receive_lock: tokio::sync::Mutex::new(()),
+            revocations,
         })
     }
 
@@ -61,6 +75,34 @@ impl UdsTransport {
             None,
         )?;
         Ok((Arc::new(Self::new(left)?), Arc::new(Self::new(right)?)))
+    }
+
+    /// Creates a stream attachment and a local FD tied to this control transport.
+    pub fn open_byte_channel(&self) -> std::io::Result<(ByteChannel, ByteChannelFd)> {
+        let (local, attachment) = socketpair(
+            AddressFamily::UNIX,
+            SocketType::STREAM,
+            SocketFlags::CLOEXEC,
+            None,
+        )?;
+        Ok(self.attach_byte_channel(attachment, local))
+    }
+
+    /// Adopts both ends of an existing stream pair under this control transport.
+    ///
+    /// `attachment` is transferred in RPC while `local` remains with the caller.
+    /// Retain the returned [`ByteChannelFd`] while any duplicate is installed in
+    /// a VMM or bridge so control-session abort can shut the channel down.
+    pub fn attach_byte_channel(
+        &self,
+        attachment: OwnedFd,
+        local: OwnedFd,
+    ) -> (ByteChannel, ByteChannelFd) {
+        let local = ByteChannelFd::new(local);
+        local.bind(&self.revocations);
+        let attachment = ByteChannelEndpoint::file_descriptor(attachment);
+        attachment.bind(&self.revocations);
+        (ByteChannel::from_endpoint(attachment), local)
     }
 
     fn encode_message(message: &CapnwebValue) -> Result<Vec<u8>> {
@@ -150,6 +192,15 @@ impl UdsTransport {
     }
 }
 
+impl Drop for UdsTransport {
+    fn drop(&mut self) {
+        self.revocations.revoke_all(Error::Message(
+            "UDS control transport was dropped".to_owned(),
+        ));
+        let _ = shutdown(self.socket.get_ref(), Shutdown::Both);
+    }
+}
+
 impl AnyRpcTransport for UdsTransport {
     fn encoding_level(&self) -> EncodingLevel {
         EncodingLevel::JsonCompatible
@@ -227,7 +278,8 @@ impl AnyRpcTransport for UdsTransport {
         })
     }
 
-    fn abort(&self, _reason: Error) {
+    fn abort(&self, reason: Error) {
+        self.revocations.revoke_all(reason);
         let _ = shutdown(self.socket.get_ref(), Shutdown::Both);
     }
 }
@@ -252,6 +304,35 @@ impl UdsMessageContext {
         Self {
             descriptors: UdsDescriptors::Incoming(descriptors.into_iter().map(Some).collect()),
         }
+    }
+
+    fn push_outgoing(&mut self, descriptor: Arc<OwnedFd>) -> Result<usize> {
+        let UdsDescriptors::Outgoing(descriptors) = &mut self.descriptors else {
+            return Err(Error::Type(
+                "UDS codec has incoming state during send".to_owned(),
+            ));
+        };
+        if descriptors.len() >= MAX_MESSAGE_FDS {
+            return Err(Error::Message(format!(
+                "UDS message exceeds maximum descriptor count of {MAX_MESSAGE_FDS}"
+            )));
+        }
+        let index = descriptors.len();
+        descriptors.push(descriptor);
+        Ok(index)
+    }
+
+    fn take_incoming(&mut self, index: usize) -> Result<OwnedFd> {
+        let UdsDescriptors::Incoming(descriptors) = &mut self.descriptors else {
+            return Err(Error::Type(
+                "UDS codec has outgoing state during receive".to_owned(),
+            ));
+        };
+        descriptors
+            .get_mut(index)
+            .ok_or_else(|| Error::Type("UDS descriptor index is out of range".to_owned()))?
+            .take()
+            .ok_or_else(|| Error::Type("UDS descriptor index was used twice".to_owned()))
     }
 
     fn take_outgoing(&mut self) -> Result<Vec<Arc<OwnedFd>>> {
@@ -302,18 +383,7 @@ impl CustomTypeHandler for UdsFdHandler {
             .as_any_mut()
             .downcast_mut::<UdsMessageContext>()
             .ok_or_else(|| Error::Type("fd handler received the wrong context".to_owned()))?;
-        let UdsDescriptors::Outgoing(descriptors) = &mut context.descriptors else {
-            return Err(Error::Type(
-                "fd handler cannot encode while receiving".to_owned(),
-            ));
-        };
-        if descriptors.len() >= MAX_MESSAGE_FDS {
-            return Err(Error::Message(format!(
-                "UDS message exceeds maximum descriptor count of {MAX_MESSAGE_FDS}"
-            )));
-        }
-        let index = descriptors.len();
-        descriptors.push(descriptor);
+        let index = context.push_outgoing(descriptor)?;
         Ok(vec![CapnwebValue::Number(index as f64)])
     }
 
@@ -334,16 +404,77 @@ impl CustomTypeHandler for UdsFdHandler {
             .as_any_mut()
             .downcast_mut::<UdsMessageContext>()
             .ok_or_else(|| Error::Type("fd handler received the wrong context".to_owned()))?;
-        let UdsDescriptors::Incoming(descriptors) = &mut context.descriptors else {
-            return Err(Error::Type(
-                "fd handler cannot decode while sending".to_owned(),
-            ));
-        };
-        let descriptor = descriptors
-            .get_mut(index)
-            .ok_or_else(|| Error::Type("UDS fd marker index is out of range".to_owned()))?
-            .take()
-            .ok_or_else(|| Error::Type("UDS fd marker index was used twice".to_owned()))?;
+        let descriptor = context.take_incoming(index)?;
         Ok(CustomValue::new(descriptor))
     }
+}
+
+struct UdsByteChannelAdapter {
+    revocations: Arc<RevocationGroup>,
+}
+
+impl ByteChannelTransportAdapter for UdsByteChannelAdapter {
+    fn encode(
+        &self,
+        channel: &ByteChannel,
+        context: &mut dyn CustomMessageContext,
+    ) -> Result<Vec<CapnwebValue>> {
+        let descriptor = channel.take_ready_for_transport()?.into_file_descriptor()?;
+        validate_connected_stream(&descriptor)?;
+        descriptor.bind(&self.revocations);
+        let outgoing = descriptor.try_clone_to_owned().map_err(|error| {
+            Error::Message(format!("failed to duplicate byte channel: {error}"))
+        })?;
+        let context = context
+            .as_any_mut()
+            .downcast_mut::<UdsMessageContext>()
+            .ok_or_else(|| Error::Type("byte channel received the wrong UDS context".to_owned()))?;
+        let index = context.push_outgoing(Arc::new(outgoing))?;
+        Ok(vec![CapnwebValue::Number(index as f64)])
+    }
+
+    fn decode(
+        &self,
+        fields: &[CapnwebValue],
+        context: &mut dyn CustomMessageContext,
+    ) -> Result<ByteChannel> {
+        let [index] = fields else {
+            return Err(Error::Type("invalid UDS byte channel marker".to_owned()));
+        };
+        let index = index
+            .as_i64()
+            .filter(|index| *index >= 0)
+            .map(|index| index as usize)
+            .ok_or_else(|| Error::Type("invalid UDS byte channel descriptor index".to_owned()))?;
+        let context = context
+            .as_any_mut()
+            .downcast_mut::<UdsMessageContext>()
+            .ok_or_else(|| Error::Type("byte channel received the wrong UDS context".to_owned()))?;
+        let descriptor = context.take_incoming(index)?;
+        validate_connected_stream(&descriptor)?;
+        let descriptor = ByteChannelFd::new(descriptor);
+        descriptor.bind(&self.revocations);
+        Ok(ByteChannel::from_endpoint(
+            ByteChannelEndpoint::FileDescriptor(descriptor),
+        ))
+    }
+}
+
+fn validate_connected_stream(descriptor: &impl AsFd) -> Result<()> {
+    let socket_type = rustix::net::sockopt::socket_type(descriptor)
+        .map_err(|error| Error::Type(format!("byte channel is not a socket: {error}")))?;
+    if socket_type != SocketType::STREAM {
+        return Err(Error::Type(
+            "UDS byte channel descriptor is not SOCK_STREAM".to_owned(),
+        ));
+    }
+    if getpeername(descriptor)
+        .map_err(|error| Error::Type(format!("failed to inspect byte channel peer: {error}")))?
+        .is_none()
+    {
+        return Err(Error::Type(
+            "UDS byte channel descriptor is not connected".to_owned(),
+        ));
+    }
+    Ok(())
 }

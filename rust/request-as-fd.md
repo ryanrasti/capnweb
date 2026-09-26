@@ -69,35 +69,45 @@ node or machines on a network.
 
 ## Current Rust status
 
-The Rust port now has the basic local descriptor transport and the generic
-custom-value seam needed to keep it out of Cap'n Web core semantics:
+The Rust port now has both the local descriptor transport and a generic,
+single-use byte-channel seam:
 
 - `CapnwebValue::Custom` with checked dynamic values;
 - transport-defined `CustomTypeRegistry` and `CustomTypeHandler` hooks;
-- per-message `CustomMessageCodec` state;
+- typed `ByteChannel` arguments and results in generated interfaces;
+- exactly-once channel claiming across cloned Rust handles;
+- session-bound claimed streams and FDs with per-channel reset;
+- control-session abort revoking queued, unmatched, and already-claimed channels;
+- `ChannelReference` with protocol version, session ID, and never-reused channel ID;
+- bounded `ChannelRendezvous` pairing references and streams in either order;
+- `ByteChannelSession` for bounded outgoing queues, periodic expiry, and abort;
+- one canonical fixed-size binary header for independent network streams;
+- transport-facing `ByteChannelTransportAdapter` and `ByteChannelTypeHandler`;
 - an asynchronous `SOCK_SEQPACKET` `UdsTransport`;
-- an UDS `OwnedFd` handler using the reserved `fd` tag;
-- `SCM_RIGHTS` send/receive with close-on-exec;
+- direct `ByteChannel` transfer as connected `SOCK_STREAM` descriptors;
+- `SCM_RIGHTS` send/receive with close-on-exec and descriptor-type validation;
+- deterministic wakeup of pending UDS receives and byte-channel I/O on shutdown;
+- `UdsTransport::open_byte_channel()` for control-bound local socketpairs;
 - message and descriptor bounds;
-- custom-value isolation and real FD RPC round-trip tests.
+- custom-value isolation and real typed FD RPC round-trip tests.
+
+The older raw `OwnedFd` custom value remains available for generic descriptor
+transfer and retains copying semantics: clones share an `Arc<OwnedFd>`, while
+each successful SCM_RIGHTS send creates a descriptor in the receiver. In
+contrast, `ByteChannel` is consumed by its first claim or transport encoding;
+a second use is an error.
 
 Remaining Rust work for the celld integration:
 
-1. Add ergonomic typed conversion for the UDS `OwnedFd` custom value if the
-   generated local-session API names descriptor arguments directly.
-2. Confirm construction and startup conventions for inherited control
+1. Confirm construction and startup conventions for inherited control
    descriptors; production will not normally call `UdsTransport::pair()`.
-3. Document the chosen duplicate-capability behavior. The current custom value
-   shares an `Arc<OwnedFd>` while SCM_RIGHTS creates a new descriptor in each
-   receiving process.
-4. Make peer shutdown deterministic and prove pending receives wake when the
-   other process exits.
-5. Extend malformed-marker, multiple/nested FD, ancillary truncation,
+2. Extend malformed-marker, multiple/nested FD, ancillary truncation,
    unreferenced-descriptor, cancellation, and FD-leak tests.
-6. Confirm the control-frame size contract. HTTP data will be externalized,
-   but other Cap'n Web values can still exceed a practical seqpacket payload.
-7. Add typed local control methods only after the generic session seam is
-   fixed; no HTTP or consumer-specific types belong in capnweb-rs.
+3. Confirm or configure the control-frame size contract. HTTP and terminal data
+   are externalized, but other Cap'n Web values can still exceed a practical
+   seqpacket payload.
+4. Integrate a real QUIC/iroh adapter with `ByteChannelSession` and publish
+   interoperability fixtures for the canonical stream-header format.
 
 The JavaScript custom transport still needs equivalent custom-value hooks and
 an opaque host descriptor supplied by celld.

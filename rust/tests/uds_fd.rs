@@ -6,10 +6,46 @@ use std::os::unix::net::UnixStream;
 use std::sync::Arc;
 
 use capnweb::{
-    AnyRpcTransport, CapnwebValue, Error, PayloadStubHook, PromiseStubHook, PropertyKey,
-    PropertyPath, Result, RpcPayload, RpcSession, RpcSessionOptions, RpcTargetInner, StubHook,
-    UdsTransport, serialize,
+    AnyRpcTransport, ByteChannel, CapnwebValue, Error, PayloadStubHook, PromiseStubHook,
+    PropertyKey, PropertyPath, Result, RpcPayload, RpcSession, RpcSessionOptions, RpcTargetInner,
+    StubHook, UdsTransport, rpc_interface, rpc_target, serialize,
 };
+
+#[rpc_interface]
+trait ChannelApi {
+    fn consume(channel: ByteChannel);
+}
+
+struct ChannelTarget;
+
+#[rpc_target(ChannelApi)]
+impl ChannelTarget {
+    async fn consume(&self, channel: ByteChannel) -> Result<()> {
+        let descriptor = channel.claim_fd().await?;
+        let mut stream = std::fs::File::from(
+            descriptor
+                .try_clone_to_owned()
+                .map_err(|error| Error::Message(error.to_string()))?,
+        );
+        stream
+            .write_all(b"typed byte channel")
+            .map_err(|error| Error::Message(error.to_string()))?;
+        Ok(())
+    }
+}
+
+struct HoldingChannelTarget {
+    claimed: Arc<tokio::sync::Notify>,
+}
+
+#[rpc_target(ChannelApi)]
+impl HoldingChannelTarget {
+    async fn consume(&self, channel: ByteChannel) -> Result<()> {
+        let _descriptor = channel.claim_fd().await?;
+        self.claimed.notify_one();
+        std::future::pending().await
+    }
+}
 
 struct EchoFdTarget;
 
@@ -42,6 +78,106 @@ impl RpcTargetInner for EchoFdTarget {
     fn get(self: Arc<Self>, path: PropertyPath) -> Result<StubHook> {
         Err(Error::Type(format!("No such RPC property: {path:?}")))
     }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn typed_byte_channel_passes_a_connected_stream_over_uds() {
+    let (client_transport, server_transport) = UdsTransport::pair().unwrap();
+    let client =
+        RpcSession::new(client_transport.clone(), None, RpcSessionOptions::default()).unwrap();
+    let server = RpcSession::new(
+        server_transport.clone(),
+        Some(CapnwebValue::Target(Arc::new(ChannelTarget))),
+        RpcSessionOptions::default(),
+    )
+    .unwrap();
+    let api = ChannelApiStub::new(client.get_remote_main());
+    let (mut reader, writer) = UnixStream::pair().unwrap();
+    let channel = ByteChannel::from_fd(OwnedFd::from(writer));
+
+    api.consume(channel).await.unwrap();
+    let mut bytes = vec![0; b"typed byte channel".len()];
+    reader.read_exact(&mut bytes).unwrap();
+    assert_eq!(bytes, b"typed byte channel");
+
+    client_transport.abort(Error::Message("test complete".to_owned()));
+    server_transport.abort(Error::Message("test complete".to_owned()));
+    drop(server);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn byte_channel_rejects_non_stream_descriptors() {
+    let (client_transport, server_transport) = UdsTransport::pair().unwrap();
+    let client =
+        RpcSession::new(client_transport.clone(), None, RpcSessionOptions::default()).unwrap();
+    let server = RpcSession::new(
+        server_transport.clone(),
+        Some(CapnwebValue::Target(Arc::new(ChannelTarget))),
+        RpcSessionOptions::default(),
+    )
+    .unwrap();
+    let api = ChannelApiStub::new(client.get_remote_main());
+    let (_peer, datagram) = std::os::unix::net::UnixDatagram::pair().unwrap();
+    let channel = ByteChannel::from_fd(OwnedFd::from(datagram));
+
+    let error = api.consume(channel).await.unwrap_err();
+    assert!(error.to_string().contains("SOCK_STREAM"));
+
+    client_transport.abort(Error::Message("test complete".to_owned()));
+    server_transport.abort(Error::Message("test complete".to_owned()));
+    drop(server);
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn aborting_uds_control_revokes_locally_opened_data_channels() {
+    let (transport, _peer) = UdsTransport::pair().unwrap();
+    let (_attachment, local) = transport.open_byte_channel().unwrap();
+    let mut stream = std::fs::File::from(local.try_clone_to_owned().unwrap());
+
+    transport.abort(Error::Message("self-fenced".to_owned()));
+    assert!(stream.write_all(b"must not escape").is_err());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn aborting_uds_control_revokes_a_remotely_claimed_data_channel() {
+    let (client_transport, server_transport) = UdsTransport::pair().unwrap();
+    let client =
+        RpcSession::new(client_transport.clone(), None, RpcSessionOptions::default()).unwrap();
+    let claimed = Arc::new(tokio::sync::Notify::new());
+    let server = RpcSession::new(
+        server_transport.clone(),
+        Some(CapnwebValue::Target(Arc::new(HoldingChannelTarget {
+            claimed: Arc::clone(&claimed),
+        }))),
+        RpcSessionOptions::default(),
+    )
+    .unwrap();
+    let api = ChannelApiStub::new(client.get_remote_main());
+    let (attachment, local) = client_transport.open_byte_channel().unwrap();
+    let mut stream = std::fs::File::from(local.try_clone_to_owned().unwrap());
+    let call = tokio::spawn(async move { api.consume(attachment).await });
+
+    tokio::time::timeout(std::time::Duration::from_secs(1), claimed.notified())
+        .await
+        .expect("server did not claim the byte channel");
+    server_transport.abort(Error::Message("self-fenced".to_owned()));
+    assert!(stream.write_all(b"must not escape").is_err());
+
+    call.abort();
+    client_transport.abort(Error::Message("test complete".to_owned()));
+    drop(server);
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn peer_shutdown_wakes_a_pending_uds_receive() {
+    let (waiting, peer) = UdsTransport::pair().unwrap();
+    let receive = waiting.clone().receive();
+    peer.abort(Error::Message("peer stopped".to_owned()));
+
+    let result = tokio::time::timeout(std::time::Duration::from_secs(1), receive)
+        .await
+        .expect("pending UDS receive did not wake");
+    assert!(result.is_err());
 }
 
 #[test]
