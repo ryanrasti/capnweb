@@ -4,8 +4,8 @@ use std::time::Duration;
 use capnweb::channel::{ByteChannelTransportAdapter, ChannelRendezvousLimits};
 use capnweb::{
     AnyRpcTransport, ByteChannel, ByteChannelSession, CapnwebValue, Error, FramedStreamTransport,
-    Result, RpcSession, RpcSessionOptions, TransportMessage, TransportSend, rpc_interface,
-    rpc_target,
+    IntoCapnwebValue, Result, RpcPayload, RpcSession, RpcSessionOptions, RpcStub, TransportMessage,
+    TransportSend, rpc_interface, rpc_target,
 };
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
@@ -138,6 +138,20 @@ impl ChannelTarget {
     }
 }
 
+async fn connect_next_channel(source: &ByteChannelSession, destination: &ByteChannelSession) {
+    let outgoing = source.accept_outgoing().await.unwrap();
+    let (incoming, mut bridge) = tokio::io::duplex(1024);
+    let mut outgoing_stream = outgoing.endpoint.into_stream().unwrap();
+    tokio::spawn(async move {
+        tokio::io::copy_bidirectional(&mut outgoing_stream, &mut bridge)
+            .await
+            .unwrap();
+    });
+    destination
+        .arrive_stream(outgoing.reference, incoming)
+        .unwrap();
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn typed_byte_channel_crosses_framed_control_and_independent_streams() {
     let limits = ChannelRendezvousLimits::default();
@@ -170,17 +184,7 @@ async fn typed_byte_channel_crosses_framed_control_and_independent_streams() {
     let (attachment, mut local) = client_channels.open(1024).unwrap();
     let result = api.consume(attachment);
 
-    let outgoing = client_channels.accept_outgoing().await.unwrap();
-    let (incoming, mut bridge) = tokio::io::duplex(1024);
-    let mut outgoing_stream = outgoing.endpoint.into_stream().unwrap();
-    tokio::spawn(async move {
-        tokio::io::copy_bidirectional(&mut outgoing_stream, &mut bridge)
-            .await
-            .unwrap();
-    });
-    server_channels
-        .arrive_stream(outgoing.reference, incoming)
-        .unwrap();
+    connect_next_channel(&client_channels, &server_channels).await;
     local.write_all(b"outside RPC").await.unwrap();
     local.shutdown().await.unwrap();
 
@@ -189,6 +193,110 @@ async fn typed_byte_channel_crosses_framed_control_and_independent_streams() {
     client_transport.abort(Error::Message("test complete".to_owned()));
     server_transport.abort(Error::Message("test complete".to_owned()));
     drop(server);
+}
+
+#[rpc_interface]
+trait BrokerApi {
+    fn get_a() -> RpcStub;
+}
+
+struct BrokerTarget {
+    a: RpcStub,
+}
+
+#[rpc_target(BrokerApi)]
+impl BrokerTarget {
+    fn get_a(&self) -> RpcStub {
+        self.a.clone()
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn channel_transparently_follows_a_three_party_proxied_stub() {
+    let limits = ChannelRendezvousLimits::default();
+
+    // C's client connection to A.
+    let c_to_a_channels = ByteChannelSession::new(1, 301, limits, 4).unwrap();
+    let a_channels = ByteChannelSession::new(1, 301, limits, 4).unwrap();
+    let (c_to_a_stream, a_stream) = tokio::io::duplex(4096);
+    let c_to_a_transport = Arc::new(
+        FramedStreamTransport::builder()
+            .byte_channels(Arc::clone(&c_to_a_channels))
+            .unwrap()
+            .build(c_to_a_stream)
+            .unwrap(),
+    );
+    let a_transport = Arc::new(
+        FramedStreamTransport::builder()
+            .byte_channels(Arc::clone(&a_channels))
+            .unwrap()
+            .build(a_stream)
+            .unwrap(),
+    );
+    let c_to_a =
+        RpcSession::new(c_to_a_transport.clone(), None, RpcSessionOptions::default()).unwrap();
+    let a_server = RpcSession::new(
+        a_transport.clone(),
+        Some(CapnwebValue::Target(Arc::new(ChannelTarget))),
+        RpcSessionOptions::default(),
+    )
+    .unwrap();
+
+    // B's client connection to C. C returns A's foreign stub without
+    // implementing or observing A's calls.
+    let b_channels = ByteChannelSession::new(1, 302, limits, 4).unwrap();
+    let c_to_b_channels = ByteChannelSession::new(1, 302, limits, 4).unwrap();
+    let (b_stream, c_to_b_stream) = tokio::io::duplex(4096);
+    let b_transport = Arc::new(
+        FramedStreamTransport::builder()
+            .byte_channels(Arc::clone(&b_channels))
+            .unwrap()
+            .build(b_stream)
+            .unwrap(),
+    );
+    let c_to_b_transport = Arc::new(
+        FramedStreamTransport::builder()
+            .byte_channels(Arc::clone(&c_to_b_channels))
+            .unwrap()
+            .build(c_to_b_stream)
+            .unwrap(),
+    );
+    let b = RpcSession::new(b_transport.clone(), None, RpcSessionOptions::default()).unwrap();
+    let c_server = RpcSession::new(
+        c_to_b_transport.clone(),
+        Some(CapnwebValue::Target(Arc::new(BrokerTarget {
+            a: c_to_a.get_remote_main(),
+        }))),
+        RpcSessionOptions::default(),
+    )
+    .unwrap();
+
+    let broker = BrokerApiStub::new(b.get_remote_main());
+    let a_proxy = broker.get_a().await.unwrap();
+    let (attachment, mut local) = b_channels.open(1024).unwrap();
+    let result = a_proxy.call(
+        vec!["consume".to_owned()],
+        RpcPayload::from_app_params(CapnwebValue::Array(vec![
+            attachment.into_capnweb_value().unwrap(),
+        ])),
+    );
+
+    // B -> C delivers the source endpoint. Re-encoding C -> A creates the
+    // transparent relay and a fresh destination attachment.
+    connect_next_channel(&b_channels, &c_to_b_channels).await;
+    connect_next_channel(&c_to_a_channels, &a_channels).await;
+    local.write_all(b"three party").await.unwrap();
+    local.shutdown().await.unwrap();
+
+    assert!(matches!(
+        result.pull().await.unwrap(),
+        CapnwebValue::String(value) if value == "three party"
+    ));
+
+    for transport in [b_transport, c_to_b_transport, c_to_a_transport, a_transport] {
+        transport.abort(Error::Message("test complete".to_owned()));
+    }
+    drop((a_server, c_server));
 }
 
 #[tokio::test(flavor = "current_thread")]

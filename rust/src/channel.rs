@@ -17,7 +17,7 @@ use std::task::{Context, Poll, Waker};
 use std::time::{Duration, Instant};
 
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
-use tokio::sync::{Notify, mpsc, oneshot};
+use tokio::sync::{Notify, OwnedSemaphorePermit, Semaphore, mpsc, oneshot};
 
 use crate::core::{
     CapnwebValue, CustomMessageContext, CustomTypeHandler, CustomValue, Error, Result,
@@ -275,6 +275,58 @@ impl ByteChannelFd {
     pub fn try_clone_to_owned(&self) -> io::Result<OwnedFd> {
         self.state.descriptor.try_clone()
     }
+
+    pub(crate) fn into_relay_stream(self) -> Result<ByteChannelStream> {
+        let descriptor = self
+            .try_clone_to_owned()
+            .map_err(|error| Error::Message(format!("failed to duplicate relay FD: {error}")))?;
+        let stream = std::os::unix::net::UnixStream::from(descriptor);
+        stream
+            .set_nonblocking(true)
+            .map_err(|error| Error::Message(format!("failed to configure relay FD: {error}")))?;
+        let stream = tokio::net::UnixStream::from_std(stream)
+            .map_err(|error| Error::Message(format!("failed to adopt relay FD: {error}")))?;
+        Ok(ByteChannelStream::new(FdRelayStream {
+            stream,
+            _revocation: self,
+        }))
+    }
+}
+
+#[cfg(unix)]
+struct FdRelayStream {
+    stream: tokio::net::UnixStream,
+    _revocation: ByteChannelFd,
+}
+
+#[cfg(unix)]
+impl AsyncRead for FdRelayStream {
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        context: &mut Context<'_>,
+        buffer: &mut tokio::io::ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.stream).poll_read(context, buffer)
+    }
+}
+
+#[cfg(unix)]
+impl AsyncWrite for FdRelayStream {
+    fn poll_write(
+        mut self: Pin<&mut Self>,
+        context: &mut Context<'_>,
+        buffer: &[u8],
+    ) -> Poll<io::Result<usize>> {
+        Pin::new(&mut self.stream).poll_write(context, buffer)
+    }
+
+    fn poll_flush(mut self: Pin<&mut Self>, context: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.stream).poll_flush(context)
+    }
+
+    fn poll_shutdown(mut self: Pin<&mut Self>, context: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.stream).poll_shutdown(context)
+    }
 }
 
 #[cfg(unix)]
@@ -341,6 +393,14 @@ impl ByteChannelEndpoint {
             Self::Stream(stream) => stream.bind(group),
             #[cfg(unix)]
             Self::FileDescriptor(descriptor) => descriptor.bind(group),
+        }
+    }
+
+    fn into_relay_stream(self) -> Result<ByteChannelStream> {
+        match self {
+            Self::Stream(stream) => Ok(stream),
+            #[cfg(unix)]
+            Self::FileDescriptor(descriptor) => descriptor.into_relay_stream(),
         }
     }
 }
@@ -469,12 +529,18 @@ impl ChannelReference {
     }
 }
 
-type EndpointFuture = Pin<Box<dyn Future<Output = Result<ByteChannelEndpoint>> + Send + 'static>>;
+pub(crate) type EndpointFuture =
+    Pin<Box<dyn Future<Output = Result<ByteChannelEndpoint>> + Send + 'static>>;
 
 enum ByteChannelState {
-    Ready(ByteChannelEndpoint),
-    Pending(EndpointFuture),
+    Local(ByteChannelEndpoint),
+    Incoming(EndpointFuture),
     Claimed,
+}
+
+pub(crate) enum ByteChannelTransfer {
+    Local(ByteChannelEndpoint),
+    Incoming(EndpointFuture),
 }
 
 struct ByteChannelInner {
@@ -504,11 +570,15 @@ impl ByteChannel {
 
     /// Creates a channel from a transport endpoint.
     pub fn from_endpoint(endpoint: ByteChannelEndpoint) -> Self {
-        Self::with_state(ByteChannelState::Ready(endpoint))
+        Self::with_state(ByteChannelState::Local(endpoint))
     }
 
-    fn pending(future: EndpointFuture) -> Self {
-        Self::with_state(ByteChannelState::Pending(future))
+    fn incoming(future: EndpointFuture) -> Self {
+        Self::with_state(ByteChannelState::Incoming(future))
+    }
+
+    pub(crate) fn incoming_endpoint(endpoint: ByteChannelEndpoint) -> Self {
+        Self::incoming(Box::pin(async move { Ok(endpoint) }))
     }
 
     fn with_state(state: ByteChannelState) -> Self {
@@ -522,8 +592,8 @@ impl ByteChannel {
     /// Claims and resolves the endpoint exactly once.
     pub async fn claim(&self) -> Result<ByteChannelEndpoint> {
         match self.take_state()? {
-            ByteChannelState::Ready(endpoint) => Ok(endpoint),
-            ByteChannelState::Pending(future) => future.await,
+            ByteChannelState::Local(endpoint) => Ok(endpoint),
+            ByteChannelState::Incoming(future) => future.await,
             ByteChannelState::Claimed => unreachable!("take_state rejects claimed channels"),
         }
     }
@@ -539,17 +609,47 @@ impl ByteChannel {
         self.claim().await?.into_file_descriptor()
     }
 
-    /// Claims an endpoint synchronously for a transport encoder.
-    ///
-    /// This is useful for transports such as UDS where the endpoint is attached
-    /// atomically to the control frame. Pending channels cannot be re-exported.
-    pub fn take_ready_for_transport(&self) -> Result<ByteChannelEndpoint> {
+    pub(crate) fn take_for_transport(&self) -> Result<ByteChannelTransfer> {
         match self.take_state()? {
-            ByteChannelState::Ready(endpoint) => Ok(endpoint),
-            ByteChannelState::Pending(_) => Err(Error::Type(
-                "a pending byte channel cannot be sent to another transport".to_owned(),
-            )),
+            ByteChannelState::Local(endpoint) => Ok(ByteChannelTransfer::Local(endpoint)),
+            ByteChannelState::Incoming(future) => Ok(ByteChannelTransfer::Incoming(future)),
             ByteChannelState::Claimed => unreachable!("take_state rejects claimed channels"),
+        }
+    }
+
+    fn needs_stream_relay(&self) -> Result<bool> {
+        let state = self
+            .inner
+            .state
+            .lock()
+            .expect("byte channel mutex poisoned");
+        match &*state {
+            ByteChannelState::Local(ByteChannelEndpoint::Stream(_)) => Ok(false),
+            #[cfg(unix)]
+            ByteChannelState::Local(ByteChannelEndpoint::FileDescriptor(_))
+            | ByteChannelState::Incoming(_) => Ok(true),
+            #[cfg(not(unix))]
+            ByteChannelState::Incoming(_) => Ok(true),
+            ByteChannelState::Claimed => {
+                Err(Error::Type("byte channel was already claimed".to_owned()))
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    pub(crate) fn needs_fd_relay(&self) -> Result<bool> {
+        let state = self
+            .inner
+            .state
+            .lock()
+            .expect("byte channel mutex poisoned");
+        match &*state {
+            ByteChannelState::Local(ByteChannelEndpoint::FileDescriptor(_)) => Ok(false),
+            ByteChannelState::Local(ByteChannelEndpoint::Stream(_))
+            | ByteChannelState::Incoming(_) => Ok(true),
+            ByteChannelState::Claimed => {
+                Err(Error::Type("byte channel was already claimed".to_owned()))
+            }
         }
     }
 
@@ -723,7 +823,7 @@ impl ChannelRendezvous {
                         "byte channel reference does not match the pending stream".to_owned(),
                     ));
                 }
-                Ok(ByteChannel::from_endpoint(endpoint))
+                Ok(ByteChannel::incoming_endpoint(endpoint))
             }
             Some(entry @ RendezvousEntry::Reference { .. }) => {
                 state.entries.insert(reference.channel_id, entry);
@@ -747,7 +847,7 @@ impl ChannelRendezvous {
                         ))
                     })
                 });
-                Ok(ByteChannel::pending(future))
+                Ok(ByteChannel::incoming(future))
             }
         }
     }
@@ -882,6 +982,252 @@ impl ChannelRendezvous {
     }
 }
 
+/// Bounds transparent relays created when a received channel is re-encoded.
+#[derive(Clone, Copy, Debug)]
+pub struct ByteChannelRelayLimits {
+    /// Maximum relays concurrently awaiting or pumping endpoints.
+    pub max_active: usize,
+    /// Copy buffer bytes allocated per direction of each relay.
+    pub buffer_bytes: usize,
+    /// Maximum wait for the source attachment to arrive.
+    pub setup_timeout: Duration,
+    /// Maximum inactivity while reading or writing in either direction.
+    pub idle_timeout: Duration,
+}
+
+impl Default for ByteChannelRelayLimits {
+    fn default() -> Self {
+        Self {
+            max_active: 64,
+            buffer_bytes: 64 * 1024,
+            setup_timeout: Duration::from_secs(10),
+            idle_timeout: Duration::from_secs(300),
+        }
+    }
+}
+
+pub(crate) struct RelayManager {
+    limits: ByteChannelRelayLimits,
+    permits: Arc<Semaphore>,
+}
+
+pub(crate) struct RelayReservation {
+    permit: OwnedSemaphorePermit,
+    runtime: tokio::runtime::Handle,
+    limits: ByteChannelRelayLimits,
+}
+
+impl RelayManager {
+    pub(crate) fn new(limits: ByteChannelRelayLimits) -> Result<Self> {
+        if limits.max_active == 0
+            || limits.buffer_bytes == 0
+            || limits.setup_timeout.is_zero()
+            || limits.idle_timeout.is_zero()
+        {
+            return Err(Error::Type(
+                "byte channel relay limits must all be nonzero".to_owned(),
+            ));
+        }
+        Ok(Self {
+            limits,
+            permits: Arc::new(Semaphore::new(limits.max_active)),
+        })
+    }
+
+    pub(crate) fn reserve(&self) -> Result<RelayReservation> {
+        let permit = Arc::clone(&self.permits)
+            .try_acquire_owned()
+            .map_err(|_| Error::Message("byte channel relay limit exceeded".to_owned()))?;
+        let runtime = tokio::runtime::Handle::try_current().map_err(|_| {
+            Error::Message("transparent byte channel relay requires a Tokio runtime".to_owned())
+        })?;
+        Ok(RelayReservation {
+            permit,
+            runtime,
+            limits: self.limits,
+        })
+    }
+
+    fn relay_reserved(
+        source: EndpointFuture,
+        reservation: RelayReservation,
+    ) -> ByteChannelEndpoint {
+        let (relay, outgoing) = tokio::io::duplex(reservation.limits.buffer_bytes);
+        Self::spawn_to_reserved(source, relay, reservation);
+        ByteChannelEndpoint::stream(outgoing)
+    }
+
+    pub(crate) fn spawn_to_reserved(
+        source: EndpointFuture,
+        destination: impl AsyncByteStream,
+        reservation: RelayReservation,
+    ) {
+        let RelayReservation {
+            permit,
+            runtime,
+            limits,
+        } = reservation;
+        runtime.spawn(async move {
+            let _permit = permit;
+            let source = match tokio::time::timeout(limits.setup_timeout, source).await {
+                Ok(Ok(source)) => source,
+                Ok(Err(_)) | Err(_) => return,
+            };
+            let Ok(source) = source.into_relay_stream() else {
+                return;
+            };
+            let _ = pump_streams(source, destination, limits).await;
+        });
+    }
+}
+
+struct RelayActivity {
+    last_progress: Mutex<Instant>,
+    changed: Notify,
+}
+
+impl RelayActivity {
+    fn new() -> Self {
+        Self {
+            last_progress: Mutex::new(Instant::now()),
+            changed: Notify::new(),
+        }
+    }
+
+    fn progress(&self) {
+        *self
+            .last_progress
+            .lock()
+            .expect("byte channel relay activity mutex poisoned") = Instant::now();
+        self.changed.notify_one();
+    }
+
+    async fn wait_for_idle(&self, timeout: Duration) {
+        loop {
+            let deadline = *self
+                .last_progress
+                .lock()
+                .expect("byte channel relay activity mutex poisoned")
+                + timeout;
+            tokio::select! {
+                () = tokio::time::sleep_until(deadline.into()) => {
+                    if self
+                        .last_progress
+                        .lock()
+                        .expect("byte channel relay activity mutex poisoned")
+                        .elapsed() >= timeout
+                    {
+                        return;
+                    }
+                }
+                () = self.changed.notified() => {}
+            }
+        }
+    }
+}
+
+async fn pump_streams(
+    source: ByteChannelStream,
+    destination: impl AsyncByteStream,
+    limits: ByteChannelRelayLimits,
+) -> Result<()> {
+    let (source_read, source_write) = tokio::io::split(source);
+    let (destination_read, destination_write) = tokio::io::split(destination);
+    let activity = Arc::new(RelayActivity::new());
+    let forward = pump_direction(
+        source_read,
+        destination_write,
+        limits.buffer_bytes,
+        Arc::clone(&activity),
+    );
+    let reverse = pump_direction(
+        destination_read,
+        source_write,
+        limits.buffer_bytes,
+        Arc::clone(&activity),
+    );
+    tokio::select! {
+        result = async { tokio::try_join!(forward, reverse) } => {
+            result?;
+            Ok(())
+        }
+        () = activity.wait_for_idle(limits.idle_timeout) => {
+            Err(Error::Message("byte channel relay idle timeout".to_owned()))
+        }
+    }
+}
+
+async fn pump_direction<R, W>(
+    mut reader: R,
+    mut writer: W,
+    buffer_bytes: usize,
+    activity: Arc<RelayActivity>,
+) -> Result<()>
+where
+    R: AsyncRead + Unpin,
+    W: AsyncWrite + Unpin,
+{
+    let mut buffer = vec![0; buffer_bytes];
+    loop {
+        let count = reader
+            .read(&mut buffer)
+            .await
+            .map_err(|error| Error::Message(format!("byte channel relay read failed: {error}")))?;
+        if count == 0 {
+            writer.shutdown().await.map_err(|error| {
+                Error::Message(format!("byte channel relay shutdown failed: {error}"))
+            })?;
+            return Ok(());
+        }
+        activity.progress();
+        writer
+            .write_all(&buffer[..count])
+            .await
+            .map_err(|error| Error::Message(format!("byte channel relay write failed: {error}")))?;
+        activity.progress();
+    }
+}
+
+/// Builder for a connection-local [`ByteChannelSession`].
+pub struct ByteChannelSessionBuilder {
+    version: u16,
+    session_id: u128,
+    rendezvous_limits: ChannelRendezvousLimits,
+    relay_limits: ByteChannelRelayLimits,
+    outgoing_capacity: usize,
+}
+
+impl ByteChannelSessionBuilder {
+    /// Overrides unmatched incoming attachment limits.
+    pub fn rendezvous_limits(mut self, limits: ChannelRendezvousLimits) -> Self {
+        self.rendezvous_limits = limits;
+        self
+    }
+
+    /// Overrides transparent forwarding limits.
+    pub fn relay_limits(mut self, limits: ByteChannelRelayLimits) -> Self {
+        self.relay_limits = limits;
+        self
+    }
+
+    /// Sets the bounded outgoing attachment queue capacity.
+    pub fn outgoing_capacity(mut self, capacity: usize) -> Self {
+        self.outgoing_capacity = capacity;
+        self
+    }
+
+    /// Builds the channel session.
+    pub fn build(self) -> Result<Arc<ByteChannelSession>> {
+        ByteChannelSession::build(
+            self.version,
+            self.session_id,
+            self.rendezvous_limits,
+            self.relay_limits,
+            self.outgoing_capacity,
+        )
+    }
+}
+
 /// One outgoing attachment accepted by a network transport task.
 pub struct OutgoingByteChannel {
     /// Header/reference to write at the start of the out-of-band stream.
@@ -916,6 +1262,7 @@ pub struct ByteChannelSession {
     version: u16,
     session_id: u128,
     rendezvous: ChannelRendezvous,
+    relays: RelayManager,
     revocations: RevocationGroup,
     state: Mutex<ByteChannelSessionState>,
     receiver: tokio::sync::Mutex<mpsc::Receiver<OutgoingByteChannel>>,
@@ -923,11 +1270,38 @@ pub struct ByteChannelSession {
 }
 
 impl ByteChannelSession {
+    /// Starts configuring a connection-local channel session.
+    pub fn builder(version: u16, session_id: u128) -> ByteChannelSessionBuilder {
+        ByteChannelSessionBuilder {
+            version,
+            session_id,
+            rendezvous_limits: ChannelRendezvousLimits::default(),
+            relay_limits: ByteChannelRelayLimits::default(),
+            outgoing_capacity: 64,
+        }
+    }
+
     /// Creates a session adapter with a bounded outgoing attachment queue.
     pub fn new(
         version: u16,
         session_id: u128,
         limits: ChannelRendezvousLimits,
+        outgoing_capacity: usize,
+    ) -> Result<Arc<Self>> {
+        Self::build(
+            version,
+            session_id,
+            limits,
+            ByteChannelRelayLimits::default(),
+            outgoing_capacity,
+        )
+    }
+
+    fn build(
+        version: u16,
+        session_id: u128,
+        limits: ChannelRendezvousLimits,
+        relay_limits: ByteChannelRelayLimits,
         outgoing_capacity: usize,
     ) -> Result<Arc<Self>> {
         if outgoing_capacity == 0 {
@@ -945,6 +1319,7 @@ impl ByteChannelSession {
             version,
             session_id,
             rendezvous: ChannelRendezvous::new(version, session_id, limits),
+            relays: RelayManager::new(relay_limits)?,
             revocations: RevocationGroup::default(),
             state: Mutex::new(ByteChannelSessionState {
                 next_channel_id: 1,
@@ -1059,8 +1434,10 @@ impl ByteChannelSession {
         self.abort_notify.notify_one();
     }
 
-    fn queue_outgoing(&self, endpoint: ByteChannelEndpoint) -> Result<ChannelReference> {
-        endpoint.bind(&self.revocations);
+    fn queue_outgoing_with(
+        &self,
+        make_endpoint: impl FnOnce() -> Result<ByteChannelEndpoint>,
+    ) -> Result<ChannelReference> {
         let mut state = self
             .state
             .lock()
@@ -1073,22 +1450,30 @@ impl ByteChannelSession {
             .checked_add(1)
             .ok_or_else(|| Error::Message("byte channel ID space was exhausted".to_owned()))?;
         let reference = ChannelReference::new(self.version, self.session_id, channel_id);
-        state
-            .sender
-            .as_ref()
-            .ok_or_else(|| Error::Message("byte channel session was shut down".to_owned()))?
-            .try_send(OutgoingByteChannel {
-                reference: reference.clone(),
-                endpoint,
-            })
-            .map_err(|error| match error {
-                mpsc::error::TrySendError::Full(_) => {
+
+        // Reserve bounded queue capacity before consuming the single-use
+        // attachment or starting a relay. This makes queue backpressure a
+        // retryable serialization failure rather than a destructive claim.
+        {
+            let sender = state
+                .sender
+                .as_ref()
+                .ok_or_else(|| Error::Message("byte channel session was shut down".to_owned()))?;
+            let permit = sender.try_reserve().map_err(|error| match error {
+                mpsc::error::TrySendError::Full(()) => {
                     Error::Message("byte channel outgoing queue is full".to_owned())
                 }
-                mpsc::error::TrySendError::Closed(_) => {
+                mpsc::error::TrySendError::Closed(()) => {
                     Error::Message("byte channel session was shut down".to_owned())
                 }
             })?;
+            let endpoint = make_endpoint()?;
+            endpoint.bind(&self.revocations);
+            permit.send(OutgoingByteChannel {
+                reference: reference.clone(),
+                endpoint,
+            });
+        }
         state.next_channel_id = next_channel_id;
         Ok(reference)
     }
@@ -1109,9 +1494,30 @@ impl ByteChannelTransportAdapter for ByteChannelSession {
         channel: &ByteChannel,
         _context: &mut dyn CustomMessageContext,
     ) -> Result<Vec<CapnwebValue>> {
-        let endpoint = channel.take_ready_for_transport()?;
-        self.queue_outgoing(endpoint)
-            .map(|reference| reference.to_fields())
+        self.queue_outgoing_with(|| {
+            // Reserve every bounded resource before consuming the attachment.
+            let relay = channel
+                .needs_stream_relay()?
+                .then(|| self.relays.reserve())
+                .transpose()?;
+            Ok(match channel.take_for_transport()? {
+                ByteChannelTransfer::Local(ByteChannelEndpoint::Stream(stream)) => {
+                    ByteChannelEndpoint::Stream(stream)
+                }
+                #[cfg(unix)]
+                ByteChannelTransfer::Local(endpoint @ ByteChannelEndpoint::FileDescriptor(_)) => {
+                    RelayManager::relay_reserved(
+                        Box::pin(async move { Ok(endpoint) }),
+                        relay.expect("file descriptor requires a relay reservation"),
+                    )
+                }
+                ByteChannelTransfer::Incoming(source) => RelayManager::relay_reserved(
+                    source,
+                    relay.expect("incoming channel requires a relay reservation"),
+                ),
+            })
+        })
+        .map(|reference| reference.to_fields())
     }
 
     fn decode(

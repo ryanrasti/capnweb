@@ -15,12 +15,12 @@ transports, `ByteChannelSession` pairs a connection-local `ChannelReference` wit
 stream in either arrival order:
 
 ```rust
-let channels = capnweb::ByteChannelSession::new(
+let channels = capnweb::ByteChannelSession::builder(
     capnweb::BYTE_CHANNEL_VERSION,
     session_id,
-    capnweb::ChannelRendezvousLimits::default(),
-    16,
-)?;
+)
+.outgoing_capacity(16)
+.build()?;
 let (attachment, local_stream) = channels.open(64 * 1024)?;
 
 // Pass `attachment` as an ordinary typed RPC argument. The transport task
@@ -33,7 +33,9 @@ A custom network transport registers `channels.custom_type_handler()`, runs
 `channels.run_maintenance()`, and calls `arrive_stream()` after reading a header from an independently
 accepted stream. Its control transport must call `channels.abort(reason)` when the Cap'n Web session
 ends. This revokes queued, unmatched, and already-claimed streams and wakes pending I/O. Individual
-claimed streams also support `reset(reason)` without affecting siblings.
+claimed streams also support `reset(reason)` without affecting siblings. If a received channel is
+re-encoded through a proxied capability, the destination codec automatically creates a bounded
+out-of-band relay; application code does not need to observe or forward the call.
 
 UDS users should create outbound pairs with `UdsTransport::open_byte_channel()`, or adopt both ends
 of an existing pair with `attach_byte_channel()`. Both return the RPC attachment and a session-bound
@@ -43,8 +45,8 @@ while the revocation handle is retained.
 
 Session IDs bind references to the authenticated transport; channel IDs are never reusable, pending
 entries expire, and queues are bounded. Application meaning such as terminal, logs, or archive
-remains in the typed RPC method rather than the generic channel protocol. See
-[request-as-fd.md](request-as-fd.md).
+remains in the typed RPC method rather than the generic channel protocol. See the complete
+[byte-channel design](byte-channels.md) and the older [request-as-FD notes](request-as-fd.md).
 
 ## Framed stream control
 

@@ -7,8 +7,8 @@ use std::sync::Arc;
 
 use capnweb::{
     AnyRpcTransport, ByteChannel, CapnwebValue, Error, PayloadStubHook, PromiseStubHook,
-    PropertyKey, PropertyPath, Result, RpcPayload, RpcSession, RpcSessionOptions, RpcTargetInner,
-    StubHook, UdsTransport, rpc_interface, rpc_target, serialize,
+    PropertyKey, PropertyPath, Result, RpcPayload, RpcSession, RpcSessionOptions, RpcStub,
+    RpcTargetInner, StubHook, UdsTransport, rpc_interface, rpc_target, serialize,
 };
 
 #[rpc_interface]
@@ -31,6 +31,22 @@ impl ChannelTarget {
             .write_all(b"typed byte channel")
             .map_err(|error| Error::Message(error.to_string()))?;
         Ok(())
+    }
+}
+
+#[rpc_interface]
+trait BrokerApi {
+    fn get_a() -> RpcStub;
+}
+
+struct BrokerTarget {
+    a: RpcStub,
+}
+
+#[rpc_target(BrokerApi)]
+impl BrokerTarget {
+    fn get_a(&self) -> RpcStub {
+        self.a.clone()
     }
 }
 
@@ -136,6 +152,48 @@ async fn aborting_uds_control_revokes_locally_opened_data_channels() {
 
     transport.abort(Error::Message("self-fenced".to_owned()));
     assert!(stream.write_all(b"must not escape").is_err());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn uds_channel_transparently_follows_a_three_party_proxied_stub() {
+    let (c_to_a_transport, a_transport) = UdsTransport::pair().unwrap();
+    let c_to_a =
+        RpcSession::new(c_to_a_transport.clone(), None, RpcSessionOptions::default()).unwrap();
+    let a_server = RpcSession::new(
+        a_transport.clone(),
+        Some(CapnwebValue::Target(Arc::new(ChannelTarget))),
+        RpcSessionOptions::default(),
+    )
+    .unwrap();
+
+    let (b_transport, c_to_b_transport) = UdsTransport::pair().unwrap();
+    let b = RpcSession::new(b_transport.clone(), None, RpcSessionOptions::default()).unwrap();
+    let c_server = RpcSession::new(
+        c_to_b_transport.clone(),
+        Some(CapnwebValue::Target(Arc::new(BrokerTarget {
+            a: c_to_a.get_remote_main(),
+        }))),
+        RpcSessionOptions::default(),
+    )
+    .unwrap();
+    let broker = BrokerApiStub::new(b.get_remote_main());
+    let a_proxy = broker.get_a().await.unwrap();
+    let (attachment, local) = b_transport.open_byte_channel().unwrap();
+    let mut local = std::fs::File::from(local.try_clone_to_owned().unwrap());
+
+    let call = a_proxy.call(
+        vec!["consume".to_owned()],
+        RpcPayload::from_app_params(CapnwebValue::Array(vec![CapnwebValue::custom(attachment)])),
+    );
+    call.pull().await.unwrap();
+    let mut bytes = vec![0; b"typed byte channel".len()];
+    local.read_exact(&mut bytes).unwrap();
+    assert_eq!(bytes, b"typed byte channel");
+
+    for transport in [b_transport, c_to_b_transport, c_to_a_transport, a_transport] {
+        transport.abort(Error::Message("test complete".to_owned()));
+    }
+    drop((a_server, c_server));
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

@@ -2,8 +2,8 @@ use std::any::Any;
 use std::time::Duration;
 
 use capnweb::channel::{
-    ByteChannelEndpoint, ByteChannelTransportAdapter, ChannelReference, ChannelRendezvous,
-    ChannelRendezvousLimits,
+    ByteChannelEndpoint, ByteChannelRelayLimits, ByteChannelTransportAdapter, ChannelReference,
+    ChannelRendezvous, ChannelRendezvousLimits,
 };
 use capnweb::{
     ByteChannel, ByteChannelSession, CustomMessageContext, Error, FromCapnwebValue,
@@ -215,6 +215,12 @@ async fn session_adapter_bounds_queues_and_stops_maintenance_on_abort() {
     let error = session.encode(&second, &mut EmptyContext).unwrap_err();
     assert!(error.to_string().contains("queue is full"));
 
+    // A failed reservation must not consume the single-use attachment.
+    let _first_outgoing = session.accept_outgoing().await.unwrap();
+    session
+        .encode(&second, &mut EmptyContext)
+        .expect("attachment should remain usable after queue backpressure");
+
     let maintenance = {
         let session = session.clone();
         tokio::spawn(async move { session.run_maintenance().await })
@@ -258,6 +264,209 @@ async fn canonical_stream_header_round_trips_and_is_bounded() {
     let mut malformed = encoded;
     malformed[0] ^= 0xff;
     assert!(ChannelReference::decode_header(&malformed).is_err());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_received_channel_transparently_reencodes_on_another_session() {
+    let source = ByteChannelSession::new(1, 101, ChannelRendezvousLimits::default(), 4).unwrap();
+    let destination =
+        ByteChannelSession::new(1, 202, ChannelRendezvousLimits::default(), 4).unwrap();
+    let source_reference = ChannelReference::new(1, 101, 1);
+    let received = source
+        .decode(&source_reference.to_fields(), &mut EmptyContext)
+        .unwrap();
+
+    let destination_fields = destination
+        .encode(&received, &mut EmptyContext)
+        .expect("foreign channel should transparently re-encode");
+    let destination_reference = ChannelReference::from_fields(&destination_fields).unwrap();
+    assert_eq!(destination_reference.session_id, 202);
+    let outgoing = destination.accept_outgoing().await.unwrap();
+    assert_eq!(outgoing.reference, destination_reference);
+    let mut destination_stream = outgoing.endpoint.into_stream().unwrap();
+
+    let (source_endpoint, mut source_peer) = stream_endpoint();
+    source.arrive(source_reference, source_endpoint).unwrap();
+    source_peer.write_all(b"relayed").await.unwrap();
+    let mut bytes = [0; 7];
+    destination_stream.read_exact(&mut bytes).await.unwrap();
+    assert_eq!(&bytes, b"relayed");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn queue_backpressure_does_not_start_or_consume_a_foreign_relay() {
+    let relay_limits = ByteChannelRelayLimits {
+        max_active: 1,
+        buffer_bytes: 64,
+        setup_timeout: Duration::from_secs(30),
+        idle_timeout: Duration::from_secs(30),
+    };
+    let destination = ByteChannelSession::builder(1, 202)
+        .outgoing_capacity(1)
+        .relay_limits(relay_limits)
+        .build()
+        .unwrap();
+    let (occupant, _occupant_peer) = destination.open(64).unwrap();
+    destination.encode(&occupant, &mut EmptyContext).unwrap();
+
+    let source = ByteChannelSession::new(1, 101, ChannelRendezvousLimits::default(), 1).unwrap();
+    let source_reference = ChannelReference::new(1, 101, 1);
+    let foreign = source
+        .decode(&source_reference.to_fields(), &mut EmptyContext)
+        .unwrap();
+    let error = destination.encode(&foreign, &mut EmptyContext).unwrap_err();
+    assert!(error.to_string().contains("queue is full"));
+
+    let _occupant_outgoing = destination.accept_outgoing().await.unwrap();
+    destination
+        .encode(&foreign, &mut EmptyContext)
+        .expect("queue backpressure must not consume or start the relay");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn transparent_relay_limit_is_enforced_synchronously() {
+    let relay_limits = ByteChannelRelayLimits {
+        max_active: 1,
+        buffer_bytes: 64,
+        setup_timeout: Duration::from_secs(30),
+        idle_timeout: Duration::from_secs(30),
+    };
+    let destination = ByteChannelSession::builder(1, 202)
+        .outgoing_capacity(4)
+        .relay_limits(relay_limits)
+        .build()
+        .unwrap();
+    let first_source =
+        ByteChannelSession::new(1, 101, ChannelRendezvousLimits::default(), 1).unwrap();
+    let second_source =
+        ByteChannelSession::new(1, 102, ChannelRendezvousLimits::default(), 1).unwrap();
+    let first = first_source
+        .decode(
+            &ChannelReference::new(1, 101, 1).to_fields(),
+            &mut EmptyContext,
+        )
+        .unwrap();
+    let second = second_source
+        .decode(
+            &ChannelReference::new(1, 102, 1).to_fields(),
+            &mut EmptyContext,
+        )
+        .unwrap();
+
+    destination.encode(&first, &mut EmptyContext).unwrap();
+    let error = destination.encode(&second, &mut EmptyContext).unwrap_err();
+    assert!(error.to_string().contains("relay limit"));
+
+    // Exhausted relay capacity must be checked before the foreign attachment
+    // is consumed. Aborting the first source releases its relay permit.
+    first_source.abort(Error::Message("release test relay".to_owned()));
+    tokio::time::timeout(Duration::from_secs(1), async {
+        loop {
+            match destination.encode(&second, &mut EmptyContext) {
+                Ok(_) => break,
+                Err(error) if error.to_string().contains("relay limit") => {
+                    tokio::task::yield_now().await;
+                }
+                Err(error) => panic!("attachment was consumed by relay backpressure: {error}"),
+            }
+        }
+    })
+    .await
+    .expect("first relay did not release its permit");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn one_way_progress_keeps_a_transparent_relay_alive() {
+    let relay_limits = ByteChannelRelayLimits {
+        max_active: 1,
+        buffer_bytes: 64,
+        setup_timeout: Duration::from_secs(1),
+        idle_timeout: Duration::from_millis(200),
+    };
+    let destination = ByteChannelSession::builder(1, 202)
+        .relay_limits(relay_limits)
+        .build()
+        .unwrap();
+    let source = ByteChannelSession::new(1, 101, ChannelRendezvousLimits::default(), 1).unwrap();
+    let source_reference = ChannelReference::new(1, 101, 1);
+    let received = source
+        .decode(&source_reference.to_fields(), &mut EmptyContext)
+        .unwrap();
+    destination.encode(&received, &mut EmptyContext).unwrap();
+    let outgoing = destination.accept_outgoing().await.unwrap();
+    let mut destination_stream = outgoing.endpoint.into_stream().unwrap();
+    let (source_endpoint, mut source_peer) = stream_endpoint();
+    source.arrive(source_reference, source_endpoint).unwrap();
+
+    for expected in 0..12u8 {
+        source_peer.write_all(&[expected]).await.unwrap();
+        let mut actual = [0; 1];
+        destination_stream.read_exact(&mut actual).await.unwrap();
+        assert_eq!(actual[0], expected);
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn transparent_relay_idle_timeout_closes_both_sides() {
+    let relay_limits = ByteChannelRelayLimits {
+        max_active: 1,
+        buffer_bytes: 64,
+        setup_timeout: Duration::from_secs(1),
+        idle_timeout: Duration::from_millis(10),
+    };
+    let destination = ByteChannelSession::builder(1, 202)
+        .relay_limits(relay_limits)
+        .build()
+        .unwrap();
+    let source = ByteChannelSession::new(1, 101, ChannelRendezvousLimits::default(), 1).unwrap();
+    let source_reference = ChannelReference::new(1, 101, 1);
+    let received = source
+        .decode(&source_reference.to_fields(), &mut EmptyContext)
+        .unwrap();
+    destination.encode(&received, &mut EmptyContext).unwrap();
+    let outgoing = destination.accept_outgoing().await.unwrap();
+    let mut destination_stream = outgoing.endpoint.into_stream().unwrap();
+    let (source_endpoint, mut source_peer) = stream_endpoint();
+    source.arrive(source_reference, source_endpoint).unwrap();
+
+    let mut byte = [0; 1];
+    let count = tokio::time::timeout(Duration::from_secs(1), destination_stream.read(&mut byte))
+        .await
+        .expect("relay idle timeout did not close destination")
+        .unwrap();
+    assert_eq!(count, 0);
+    assert!(source_peer.write_all(b"closed").await.is_err());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn transparent_relay_setup_timeout_closes_the_destination() {
+    let relay_limits = ByteChannelRelayLimits {
+        max_active: 1,
+        buffer_bytes: 64,
+        setup_timeout: Duration::from_millis(10),
+        idle_timeout: Duration::from_secs(30),
+    };
+    let destination = ByteChannelSession::builder(1, 202)
+        .relay_limits(relay_limits)
+        .build()
+        .unwrap();
+    let source = ByteChannelSession::new(1, 101, ChannelRendezvousLimits::default(), 1).unwrap();
+    let received = source
+        .decode(
+            &ChannelReference::new(1, 101, 1).to_fields(),
+            &mut EmptyContext,
+        )
+        .unwrap();
+
+    destination.encode(&received, &mut EmptyContext).unwrap();
+    let outgoing = destination.accept_outgoing().await.unwrap();
+    let mut stream = outgoing.endpoint.into_stream().unwrap();
+    let mut byte = [0; 1];
+    let result = tokio::time::timeout(Duration::from_secs(1), stream.read(&mut byte))
+        .await
+        .expect("relay setup timeout did not close destination");
+    assert_eq!(result.unwrap(), 0);
 }
 
 #[test]

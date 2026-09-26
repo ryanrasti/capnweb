@@ -1,5 +1,9 @@
 # Request as an FD
 
+> The current generic channel API, transparent forwarding model, lifecycle rules, and UDS
+> optimization analysis are specified in [byte-channels.md](byte-channels.md). This document retains
+> the original HTTP/celld motivation and raw descriptor design notes.
+
 ## Goal
 
 Let a local Cap'n Web session transfer file descriptors through celld's framed
@@ -81,6 +85,8 @@ single-use byte-channel seam:
 - `ChannelReference` with protocol version, session ID, and never-reused channel ID;
 - bounded `ChannelRendezvous` pairing references and streams in either order;
 - `ByteChannelSession` for bounded outgoing queues, periodic expiry, and abort;
+- transparent bounded channel relays when proxied capabilities re-encode foreign attachments;
+- setup and whole-channel idle timeouts with one-way activity support;
 - one canonical fixed-size binary header for independent network streams;
 - transport-facing `ByteChannelTransportAdapter` and `ByteChannelTypeHandler`;
 - an asynchronous `SOCK_SEQPACKET` `UdsTransport`;

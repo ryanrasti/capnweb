@@ -16,8 +16,9 @@ use rustix::net::{
 use tokio::io::unix::AsyncFd;
 
 use crate::channel::{
-    ByteChannel, ByteChannelEndpoint, ByteChannelFd, ByteChannelTransportAdapter,
-    ByteChannelTypeHandler, RevocationGroup,
+    ByteChannel, ByteChannelEndpoint, ByteChannelFd, ByteChannelRelayLimits, ByteChannelTransfer,
+    ByteChannelTransportAdapter, ByteChannelTypeHandler, EndpointFuture, RelayManager,
+    RelayReservation, RevocationGroup,
 };
 use crate::core::{
     CapnwebValue, CustomMessageCodec, CustomMessageContext, CustomTypeHandler, CustomTypeRegistry,
@@ -46,6 +47,10 @@ impl UdsTransport {
     /// Wraps a connected, non-blocking Unix `SOCK_SEQPACKET` socket.
     pub fn new(socket: OwnedFd) -> std::io::Result<Self> {
         let revocations = Arc::new(RevocationGroup::default());
+        let relays = Arc::new(
+            RelayManager::new(ByteChannelRelayLimits::default())
+                .map_err(|error| std::io::Error::other(error.to_string()))?,
+        );
         let mut registry = CustomTypeRegistry::new();
         registry
             .register(Arc::new(UdsFdHandler))
@@ -54,6 +59,7 @@ impl UdsTransport {
             .register(Arc::new(ByteChannelTypeHandler::new(Arc::new(
                 UdsByteChannelAdapter {
                     revocations: Arc::clone(&revocations),
+                    relays,
                 },
             ))))
             .map_err(|error| std::io::Error::other(error.to_string()))?;
@@ -411,6 +417,44 @@ impl CustomTypeHandler for UdsFdHandler {
 
 struct UdsByteChannelAdapter {
     revocations: Arc<RevocationGroup>,
+    relays: Arc<RelayManager>,
+}
+
+struct ReservedUdsRelay {
+    attachment: ByteChannelFd,
+    destination: crate::channel::ByteChannelStream,
+    reservation: RelayReservation,
+}
+
+impl UdsByteChannelAdapter {
+    fn reserve_relay_descriptor(&self) -> Result<ReservedUdsRelay> {
+        let reservation = self.relays.reserve()?;
+        let (local, attachment) = socketpair(
+            AddressFamily::UNIX,
+            SocketType::STREAM,
+            SocketFlags::CLOEXEC,
+            None,
+        )
+        .map_err(|error| Error::Message(format!("failed to create relay socketpair: {error}")))?;
+        let local = ByteChannelFd::new(local);
+        local.bind(&self.revocations);
+        let attachment = ByteChannelFd::new(attachment);
+        attachment.bind(&self.revocations);
+        Ok(ReservedUdsRelay {
+            attachment,
+            destination: local.into_relay_stream()?,
+            reservation,
+        })
+    }
+
+    fn start_relay_descriptor(
+        &self,
+        source: EndpointFuture,
+        relay: ReservedUdsRelay,
+    ) -> ByteChannelFd {
+        RelayManager::spawn_to_reserved(source, relay.destination, relay.reservation);
+        relay.attachment
+    }
 }
 
 impl ByteChannelTransportAdapter for UdsByteChannelAdapter {
@@ -419,7 +463,24 @@ impl ByteChannelTransportAdapter for UdsByteChannelAdapter {
         channel: &ByteChannel,
         context: &mut dyn CustomMessageContext,
     ) -> Result<Vec<CapnwebValue>> {
-        let descriptor = channel.take_ready_for_transport()?.into_file_descriptor()?;
+        let relay = channel
+            .needs_fd_relay()?
+            .then(|| self.reserve_relay_descriptor())
+            .transpose()?;
+        let descriptor = match channel.take_for_transport()? {
+            ByteChannelTransfer::Local(ByteChannelEndpoint::FileDescriptor(descriptor)) => {
+                descriptor
+            }
+            ByteChannelTransfer::Local(endpoint @ ByteChannelEndpoint::Stream(_)) => self
+                .start_relay_descriptor(
+                    Box::pin(async move { Ok(endpoint) }),
+                    relay.expect("stream requires a UDS relay reservation"),
+                ),
+            ByteChannelTransfer::Incoming(source) => self.start_relay_descriptor(
+                source,
+                relay.expect("incoming channel requires a UDS relay reservation"),
+            ),
+        };
         validate_connected_stream(&descriptor)?;
         descriptor.bind(&self.revocations);
         let outgoing = descriptor.try_clone_to_owned().map_err(|error| {
@@ -454,7 +515,7 @@ impl ByteChannelTransportAdapter for UdsByteChannelAdapter {
         validate_connected_stream(&descriptor)?;
         let descriptor = ByteChannelFd::new(descriptor);
         descriptor.bind(&self.revocations);
-        Ok(ByteChannel::from_endpoint(
+        Ok(ByteChannel::incoming_endpoint(
             ByteChannelEndpoint::FileDescriptor(descriptor),
         ))
     }
