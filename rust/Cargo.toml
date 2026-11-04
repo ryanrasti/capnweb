@@ -15,6 +15,11 @@ publish = false
 [lib]
 name = "capnweb"
 
+[features]
+default = ["websocket"]
+# the WebSocket transport (tokio-tungstenite)
+websocket = ["dep:tokio-tungstenite"]
+
 [dependencies]
 async-trait = "0.1"
 base64 = "0.22"
@@ -27,10 +32,11 @@ serde_json = { version = "1", features = ["unbounded_depth"] }
 serde_stacker = "0.1"
 stacker = "0.1"
 thiserror = "2"
-tokio = { version = "1", features = ["io-util", "macros", "net", "process", "rt-multi-thread", "sync", "time"] }
-tokio-tungstenite = { version = "0.28", default-features = false, features = ["connect", "handshake"] }
+tokio = { version = "1", features = ["io-util", "macros", "net", "rt", "sync", "time"] }
+tokio-tungstenite = { version = "0.28", default-features = false, features = ["connect", "handshake"], optional = true }
 
 [dev-dependencies]
+tokio = { version = "1", features = ["process", "rt-multi-thread"] }
 
 [lints.rust]
 missing_docs = "warn"

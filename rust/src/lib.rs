@@ -35,7 +35,9 @@ pub use typed::{
 // JS:          type RpcPromise as RpcPromiseType, __RPC_TARGET_BRAND } from "./types.js";
 // JS: import { newWebSocketRpcSession as newWebSocketRpcSessionImpl,
 // JS:          newWorkersWebSocketRpcResponse, WebSocketTransport } from "./websocket.js";
+#[cfg(feature = "websocket")]
 mod websocket;
+#[cfg(feature = "websocket")]
 pub use websocket::{MAX_CLOSE_REASON_BYTES, WebSocketTransport, new_websocket_rpc_session};
 // JS: import { newHttpBatchRpcSession as newHttpBatchRpcSessionImpl,
 // JS:          newHttpBatchRpcResponse, nodeHttpBatchRpcResponse } from "./batch.js";
