@@ -287,6 +287,173 @@ pub fn rpc_target(attribute: TokenStream, item: TokenStream) -> TokenStream {
     .into()
 }
 
+/// Converts a struct with named fields into a Cap'n Web object.
+///
+/// Each field is a member named by its lower camel case name, or by
+/// `#[capnweb(rename = "name")]`. An `Option` field that is `None` is left
+/// out, as JavaScript's `undefined` members are.
+#[proc_macro_derive(IntoCapnwebValue, attributes(capnweb))]
+pub fn derive_into_capnweb_value(item: TokenStream) -> TokenStream {
+    let input = parse_macro_input!(item as syn::DeriveInput);
+    let fields = match struct_fields(&input) {
+        Ok(fields) => fields,
+        Err(error) => return error.into_compile_error().into(),
+    };
+    let name = &input.ident;
+    let inserts = fields.iter().map(|field| {
+        let ident = &field.ident;
+        let wire_name = &field.wire_name;
+        let context = format!("{name}.{wire_name}");
+        let convert = quote! {
+            ::capnweb::IntoCapnwebValue::into_capnweb_value(value).map_err(|error| {
+                ::capnweb::Error::Type(format!("{}: {}", #context, error))
+            })?
+        };
+        if field.optional {
+            quote! {
+                if let Some(value) = self.#ident {
+                    object.insert(#wire_name.to_owned(), #convert);
+                }
+            }
+        } else {
+            quote! {
+                let value = self.#ident;
+                object.insert(#wire_name.to_owned(), #convert);
+            }
+        }
+    });
+    let bounds = fields.iter().map(|field| {
+        let ty = &field.ty;
+        quote!(#ty: ::capnweb::IntoCapnwebValue)
+    });
+    let (impl_generics, type_generics, where_clause) = input.generics.split_for_impl();
+    let predicates = where_clause.map(|clause| &clause.predicates);
+    quote! {
+        impl #impl_generics ::capnweb::IntoCapnwebValue for #name #type_generics
+        where
+            #predicates
+            #(#bounds,)*
+        {
+            fn into_capnweb_value(self) -> ::capnweb::Result<::capnweb::CapnwebValue> {
+                let mut object = ::std::collections::BTreeMap::new();
+                #(#inserts)*
+                Ok(::capnweb::CapnwebValue::Object(object))
+            }
+        }
+    }
+    .into()
+}
+
+/// Converts a Cap'n Web object into a struct with named fields.
+///
+/// Members are named as [`IntoCapnwebValue`](macro@IntoCapnwebValue) names
+/// them. An absent member decodes as `undefined`, so an `Option` field is
+/// `None` when its member is absent, `undefined` or `null`; members the struct
+/// doesn't name are ignored. A failed field's error names the struct and the
+/// member.
+#[proc_macro_derive(FromCapnwebValue, attributes(capnweb))]
+pub fn derive_from_capnweb_value(item: TokenStream) -> TokenStream {
+    let input = parse_macro_input!(item as syn::DeriveInput);
+    let fields = match struct_fields(&input) {
+        Ok(fields) => fields,
+        Err(error) => return error.into_compile_error().into(),
+    };
+    let name = &input.ident;
+    let struct_name = name.to_string();
+    let decoders = fields.iter().map(|field| {
+        let ident = &field.ident;
+        let wire_name = &field.wire_name;
+        let context = format!("{name}.{wire_name}");
+        quote! {
+            #ident: ::capnweb::FromCapnwebValue::from_capnweb_value(
+                object.remove(#wire_name).unwrap_or(::capnweb::CapnwebValue::Undefined),
+            )
+            .map_err(|error| ::capnweb::Error::Type(format!("{}: {}", #context, error)))?
+        }
+    });
+    let bounds = fields.iter().map(|field| {
+        let ty = &field.ty;
+        quote!(#ty: ::capnweb::FromCapnwebValue)
+    });
+    let (impl_generics, type_generics, where_clause) = input.generics.split_for_impl();
+    let predicates = where_clause.map(|clause| &clause.predicates);
+    quote! {
+        impl #impl_generics ::capnweb::FromCapnwebValue for #name #type_generics
+        where
+            #predicates
+            #(#bounds,)*
+        {
+            fn from_capnweb_value(
+                value: ::capnweb::CapnwebValue,
+            ) -> ::capnweb::Result<Self> {
+                let ::capnweb::CapnwebValue::Object(mut object) = value else {
+                    return Err(::capnweb::Error::Type(format!(
+                        "{}: expected object, got {:?}", #struct_name, value
+                    )));
+                };
+                Ok(Self {
+                    #(#decoders,)*
+                })
+            }
+        }
+    }
+    .into()
+}
+
+/// A named field of a derived struct, and its member's name on the wire.
+struct WireField {
+    ident: syn::Ident,
+    ty: Type,
+    wire_name: String,
+    optional: bool,
+}
+
+fn struct_fields(input: &syn::DeriveInput) -> syn::Result<Vec<WireField>> {
+    let syn::Data::Struct(data) = &input.data else {
+        return Err(syn::Error::new_spanned(
+            &input.ident,
+            "Cap'n Web value derives support structs with named fields",
+        ));
+    };
+    let syn::Fields::Named(fields) = &data.fields else {
+        return Err(syn::Error::new_spanned(
+            &input.ident,
+            "Cap'n Web value derives support structs with named fields",
+        ));
+    };
+    fields
+        .named
+        .iter()
+        .map(|field| {
+            let ident = field.ident.clone().expect("named field");
+            let mut wire_name = snake_to_lower_camel(&ident.to_string());
+            for attribute in &field.attrs {
+                if !attribute.path().is_ident("capnweb") {
+                    continue;
+                }
+                attribute.parse_nested_meta(|meta| {
+                    if meta.path.is_ident("rename") {
+                        wire_name = meta.value()?.parse::<syn::LitStr>()?.value();
+                        Ok(())
+                    } else {
+                        Err(meta.error("unsupported capnweb attribute: expected `rename`"))
+                    }
+                })?;
+            }
+            Ok(WireField {
+                ident,
+                ty: field.ty.clone(),
+                wire_name,
+                optional: is_option_type(&field.ty),
+            })
+        })
+        .collect()
+}
+
+fn is_option_type(ty: &Type) -> bool {
+    matches!(ty, Type::Path(path) if path.qself.is_none() && path.path.segments.last().is_some_and(|segment| segment.ident == "Option"))
+}
+
 fn method_arguments(
     inputs: &syn::punctuated::Punctuated<FnArg, syn::token::Comma>,
 ) -> Result<(Vec<proc_macro2::TokenStream>, Vec<syn::Ident>), TokenStream> {

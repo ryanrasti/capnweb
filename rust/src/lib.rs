@@ -11,7 +11,7 @@ mod serialize;
 // JS: import { RpcTransport, RpcTransportWithCustomEncoding, AnyRpcTransport, RpcSession as RpcSessionImpl, RpcSessionOptions } from "./rpc.js";
 mod rpc;
 // JS: import { RpcLimits, DEFAULT_LIMITS, DEFAULT_MAX_DEPTH } from "./serialize.js";
-pub use capnweb_macros::{rpc_interface, rpc_target};
+pub use capnweb_macros::{FromCapnwebValue, IntoCapnwebValue, rpc_interface, rpc_target};
 pub use core::{
     CapnwebError, CapnwebValue, CustomMessageCodec, CustomMessageContext, CustomTypeHandler,
     CustomTypeRegistry, CustomValue, Error, IntoPropertyPath, MapInstructions, MaybePromise,
