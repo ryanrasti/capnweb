@@ -282,10 +282,37 @@ impl AnyRpcTransport for FramedStreamTransport {
                     let length = reader.read_u32().await
                         .map_err(|error| Error::Message(format!("failed to read RPC frame length: {error}")))?
                         as usize;
-                    if length == 0 || length > max_frame_bytes {
-                        return Err(Error::Message(format!(
-                            "invalid RPC frame size {length}; maximum is {max_frame_bytes}"
-                        )));
+                    if length == 0 {
+                        return Err(Error::Message("invalid RPC frame size 0".to_owned()));
+                    }
+                    if length > max_frame_bytes {
+                        // (a push or stream message, by its first bytes, read past unbuffered: its call fails
+                        // alone; anything else ends the session)
+                        let mut head = [0u8; 10];
+                        let seen = head.len().min(length);
+                        reader.read_exact(&mut head[..seen]).await
+                            .map_err(|error| Error::Message(format!("failed to read RPC frame: {error}")))?;
+                        let stream = if head[..seen].starts_with(br#"["push","#) {
+                            false
+                        } else if head[..seen].starts_with(br#"["stream","#) {
+                            true
+                        } else {
+                            return Err(Error::Message(format!(
+                                "invalid RPC frame size {length}; maximum is {max_frame_bytes}"
+                            )));
+                        };
+                        let rest = (length - seen) as u64;
+                        let skipped = tokio::io::copy(&mut (&mut **reader).take(rest), &mut tokio::io::sink()).await
+                            .map_err(|error| Error::Message(format!("failed to read RPC frame: {error}")))?;
+                        if skipped != rest {
+                            return Err(Error::Message("the RPC frame ended early".to_owned()));
+                        }
+                        return Ok(TransportMessage::Oversized {
+                            stream,
+                            error: Error::Type(format!(
+                                "an RPC message of {length} bytes is over the frame limit of {max_frame_bytes} bytes"
+                            )),
+                        });
                     }
                     let mut payload = vec![0; length];
                     reader.read_exact(&mut payload).await

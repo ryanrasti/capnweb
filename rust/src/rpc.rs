@@ -113,6 +113,14 @@ pub enum TransportMessage {
         /// Message-local custom type state.
         codec: Option<Box<CustomMessageCodec>>,
     },
+    /// A received push (or, with `stream`, a stream message) the transport dropped unread, too large: its export
+    /// fails with `error`, and the session goes on. Only a received message is ever one.
+    Oversized {
+        /// a stream message's (pulled already, released once rejected), not a push's
+        stream: bool,
+        /// why: what its export rejects with
+        error: Error,
+    },
 }
 
 /// Result of starting a transport send.
@@ -2383,6 +2391,17 @@ impl RpcSessionImpl {
                 // JS:
                 // JS:       // Only parse JSON at "string" level; otherwise message is already an object
                 // JS:       let msg = this.encodingLevel === "string" ? JSON.parse(raw as string) : raw;
+                if let TransportMessage::Oversized { stream, error } = raw {
+                    if let Err(error) = Self::add_incoming_export(
+                        &state,
+                        Arc::new(ErrorStubHook::new(error)),
+                        stream,
+                    ) {
+                        Self::abort(&state, error, true);
+                        return;
+                    }
+                    continue;
+                }
                 let message = match (encoding, raw) {
                     (EncodingLevel::String, TransportMessage::Text(text)) => {
                         let mut deserializer = serde_json::Deserializer::from_str(&text);
@@ -2530,6 +2549,35 @@ impl RpcSessionImpl {
             .read_loop_abort = Some(task.abort_handle());
     }
 
+    /// A received push's export (a stream message's, with stream: pulled already, released once resolved): the
+    /// next incoming export ID, its hook's result
+    fn add_incoming_export(
+        state: &Arc<Mutex<RpcSessionState>>,
+        hook: StubHook,
+        stream: bool,
+    ) -> Result<()> {
+        hook.ignore_unhandled_rejections();
+        let export_id = {
+            let mut session = state.lock().expect("RPC session mutex poisoned");
+            let export_id = session.next_incoming_export_id;
+            session.next_incoming_export_id += 1;
+            session.exports.insert(
+                export_id,
+                ExportTableEntry {
+                    hook,
+                    refcount: 1,
+                    pulling: false,
+                    auto_release: stream,
+                },
+            );
+            export_id
+        };
+        if stream {
+            Self::ensure_resolving_export(state, export_id)?;
+        }
+        Ok(())
+    }
+
     fn process_message(
         state: &Arc<Mutex<RpcSessionState>>,
         message: CapnwebValue,
@@ -2557,27 +2605,7 @@ impl RpcSessionImpl {
                     custom_codec.as_deref_mut(),
                 )?;
                 let hook: StubHook = Arc::new(PayloadStubHook::new(payload));
-                hook.ignore_unhandled_rejections();
-                let (export_id, auto_release) = {
-                    let mut session = state.lock().expect("RPC session mutex poisoned");
-                    let export_id = session.next_incoming_export_id;
-                    session.next_incoming_export_id += 1;
-                    let auto_release = tag == "stream";
-                    session.exports.insert(
-                        export_id,
-                        ExportTableEntry {
-                            hook,
-                            refcount: 1,
-                            pulling: false,
-                            auto_release,
-                        },
-                    );
-                    (export_id, auto_release)
-                };
-                if auto_release {
-                    Self::ensure_resolving_export(state, export_id)?;
-                }
-                Ok(())
+                Self::add_incoming_export(state, hook, tag == "stream")
             }
             "pipe" => Err(Error::UnsupportedBuiltin("TransformStream")),
             "pull" if message.len() > 1 => {

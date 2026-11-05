@@ -67,7 +67,9 @@ async fn send_and_receive_enforce_the_frame_limit_before_allocation() {
         .expect("oversized send should fail");
     assert!(error.to_string().contains("maximum size"));
 
+    // (not a push or a stream message: the session can't fail it alone)
     peer.write_all(&9u32.to_be_bytes()).await.unwrap();
+    peer.write_all(br#"["pull",1"#).await.unwrap();
     let error = transport
         .receive()
         .await
