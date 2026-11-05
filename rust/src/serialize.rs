@@ -12,6 +12,13 @@ use std::sync::Arc;
 
 use base64::Engine as _;
 
+/// Base64 decoded in one pass with its padding or without (JS pads; a peer may not)
+const BASE64_ANY_PADDING: base64::engine::GeneralPurpose = base64::engine::GeneralPurpose::new(
+    &base64::alphabet::STANDARD,
+    base64::engine::GeneralPurposeConfig::new()
+        .with_decode_padding_mode(base64::engine::DecodePaddingMode::Indifferent),
+);
+
 use crate::core::{
     CapnwebError, CapnwebValue, CustomMessageCodec, Error, PropertyKey, Result, RpcPayload,
     StubHook, unwrap_stub_and_path,
@@ -106,6 +113,10 @@ pub struct RpcLimits {
 // JS: export const DEFAULT_MAX_DEPTH = 256;
 /// Default maximum message depth.
 pub const DEFAULT_MAX_DEPTH: usize = 256;
+
+/// The stack evaluate_impl wants left before a level (more than one level uses), and the segment it adds otherwise
+const EVALUATE_RED_ZONE: usize = 128 * 1024;
+const EVALUATE_STACK_SEGMENT: usize = 2 * 1024 * 1024;
 // JS:
 // JS: export const DEFAULT_LIMITS: RpcLimits = {
 /// Default receiver-side resource limits.
@@ -1320,9 +1331,7 @@ impl<'a> Evaluator<'a> {
     /// Evaluates a complete wire expression.
     pub fn evaluate(&mut self, value: CapnwebValue) -> Result<RpcPayload> {
         // JS:     return this.evaluateWithDepth(value, 0);
-        stacker::maybe_grow(4 * 1024 * 1024, 8 * 1024 * 1024, || {
-            self.evaluate_with_depth(value, 0)
-        })
+        self.evaluate_with_depth(value, 0)
         // JS:   }
     }
     // JS:
@@ -1357,6 +1366,16 @@ impl<'a> Evaluator<'a> {
     // JS:   private evaluateImpl(
     // JS:       value: unknown, parent: object, property: string | number, depth: number): unknown {
     fn evaluate_impl(&mut self, value: CapnwebValue, depth: usize) -> Result<CapnwebValue> {
+        // (checked at each level, a segment added only once the stack runs low: a shallow message, a session's
+        // usual traffic, never allocates one. One check per message would need a red zone for the deepest value,
+        // larger than a wasm guest's whole stack, and allocate and zero a segment for every message: measured as a
+        // third of a 1 MiB stream's time in exobox's guest agent.)
+        stacker::maybe_grow(EVALUATE_RED_ZONE, EVALUATE_STACK_SEGMENT, || {
+            self.evaluate_level(value, depth)
+        })
+    }
+
+    fn evaluate_level(&mut self, value: CapnwebValue, depth: usize) -> Result<CapnwebValue> {
         // JS:     let maxDepth = this.limits.maxDepth;
         let max_depth = self.limits.max_depth;
         // JS:     if (depth >= maxDepth) {
@@ -1524,14 +1543,9 @@ impl<'a> Evaluator<'a> {
                         let bytes = match &expression[1] {
                             CapnwebValue::Bytes(bytes) => bytes.clone(),
                             CapnwebValue::String(encoded) => {
-                                base64::engine::general_purpose::STANDARD_NO_PAD
-                                    .decode(encoded)
-                                    .or_else(|_| {
-                                        base64::engine::general_purpose::STANDARD.decode(encoded)
-                                    })
-                                    .map_err(|_| {
-                                        Error::Type("invalid base64 byte string".to_owned())
-                                    })?
+                                BASE64_ANY_PADDING.decode(encoded).map_err(|_| {
+                                    Error::Type("invalid base64 byte string".to_owned())
+                                })?
                             }
                             _ => return Err(unknown_special(&expression)),
                         };
