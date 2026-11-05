@@ -50,7 +50,8 @@ pub use map::force_init_map;
 // JS: import { forceInitStreams } from "./streams.js";
 mod streams;
 pub use streams::{
-    ByteSink, ByteSource, FlowController, ReadableStream, SendToken, WritableStream,
+    ByteSink, ByteSource, FlowController, MAX_QUEUED_WRITES, ReadableStream, SendToken,
+    WritableStream,
 };
 pub mod channel;
 pub use channel::{BYTE_CHANNEL_VERSION, ByteChannel, ByteChannelSession};

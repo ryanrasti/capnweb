@@ -661,8 +661,9 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::sync::{mpsc, oneshot};
 
 use crate::core::{
-    CapnwebError, CapnwebValue, Error, MapInstructions, MaybePromise, PayloadStubHook,
-    PromiseStubHook, PropertyKey, PropertyPath, Result, RpcPayload, StubHook, StubHookInner,
+    CapnwebError, CapnwebValue, Error, ErrorStubHook, MapInstructions, MaybePromise,
+    PayloadStubHook, PromiseStubHook, PropertyKey, PropertyPath, Result, RpcPayload, StubHook,
+    StubHookInner,
 };
 
 /// A byte source a [`ReadableStream`] sends.
@@ -672,6 +673,11 @@ pub type ByteSink = Pin<Box<dyn AsyncWrite + Send>>;
 
 /// The most a pumped ReadableStream sends per write call.
 const PIPE_CHUNK: usize = 64 * 1024;
+
+/// The most writes an exported WritableStream holds at once (the one being written and those queued behind it): a
+/// sender within flow control has far fewer in flight (capnweb JS: a 256 KiB window of its chunks); one past it is
+/// rejected, not held.
+pub const MAX_QUEUED_WRITES: usize = 64;
 
 /// A byte stream sent to the peer as a JavaScript `ReadableStream` (its chunks `Uint8Array`s).
 ///
@@ -739,25 +745,34 @@ enum WriterOp {
 /// that owns the sink (as JavaScript's writer queues them).
 pub(crate) struct WritableStreamStubHook {
     ops: mpsc::UnboundedSender<WriterOp>,
+    /// writes taken and not yet written (at most MAX_QUEUED_WRITES)
+    writes: Arc<std::sync::atomic::AtomicUsize>,
 }
 
 impl WritableStreamStubHook {
     pub(crate) fn create(sink: ByteSink) -> StubHook {
         let (ops, queue) = mpsc::unbounded_channel();
-        tokio::spawn(write_queue(sink, queue));
-        Arc::new(Self { ops })
+        let writes = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        tokio::spawn(write_queue(sink, queue, Arc::clone(&writes)));
+        Arc::new(Self { ops, writes })
     }
 }
 
 /// The writer: each write's chunk written whole before the next; a failed write fails what follows;
 /// the queue's end without a close (the hook released) drops the sink, as JavaScript's dispose aborts.
-async fn write_queue(sink: ByteSink, mut queue: mpsc::UnboundedReceiver<WriterOp>) {
+async fn write_queue(
+    sink: ByteSink,
+    mut queue: mpsc::UnboundedReceiver<WriterOp>,
+    writes: Arc<std::sync::atomic::AtomicUsize>,
+) {
     let mut sink = Some(sink);
     let mut failed: Option<Error> = None;
     while let Some(op) = queue.recv().await {
         let (result, reply) = match op {
             WriterOp::Write(args, reply) => {
-                (write_chunk(&mut sink, &mut failed, args).await, reply)
+                let result = write_chunk(&mut sink, &mut failed, args).await;
+                writes.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+                (result, reply)
             }
             WriterOp::Close(reply) => {
                 let result = match (failed.clone(), sink.take()) {
@@ -829,7 +844,19 @@ impl StubHookInner for WritableStreamStubHook {
         };
         let (reply, settled) = oneshot::channel();
         let op = match method {
-            "write" => WriterOp::Write(args, reply),
+            "write" => {
+                let held = self
+                    .writes
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                if held >= MAX_QUEUED_WRITES {
+                    self.writes
+                        .fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+                    return Ok(Arc::new(ErrorStubHook::new(Error::Message(format!(
+                        "WritableStream has {MAX_QUEUED_WRITES} writes queued: its sender is ignoring flow control"
+                    )))));
+                }
+                WriterOp::Write(args, reply)
+            }
             "close" => WriterOp::Close(reply),
             "abort" => WriterOp::Abort(reply),
             other => {
@@ -882,7 +909,8 @@ impl StubHookInner for WritableStreamStubHook {
 /// A pipe's writing end: `source` read and sent as write calls on `hook` (the peer's pipe), in order,
 /// as many in flight as the flow controller's window allows; at its end a close, at a read error an
 /// abort. A rejected write (the peer's reader gone) stops it, dropping the source. `hook` is
-/// released at the end.
+/// released at the end. The peer's cancel reaches it only so: JavaScript's protocol has no message
+/// for it, so a source that's silent is held until its next chunk or its end.
 pub(crate) async fn pump(mut source: ByteSource, hook: StubHook) {
     let started = std::time::Instant::now();
     let mut flow = FlowController::new(move || started.elapsed().as_secs_f64() * 1000.0);
