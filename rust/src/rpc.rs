@@ -119,8 +119,12 @@ pub enum TransportMessage {
 pub enum TransportSend {
     /// The send completed synchronously; the optional value is the encoded byte size.
     Done(Option<usize>),
-    /// The send continues asynchronously. String transports may use this form.
-    Pending(Pin<Box<dyn Future<Output = Result<()>> + Send + 'static>>),
+    /// The send continues asynchronously (string transports may use this form); size is the encoded byte size, if
+    /// known already.
+    Pending {
+        size: Option<usize>,
+        sent: Pin<Box<dyn Future<Output = Result<()>> + Send + 'static>>,
+    },
 }
 
 /// Object-safe union of the string and custom-encoding transport interfaces.
@@ -1780,7 +1784,7 @@ impl RpcSessionImpl {
             // JS:         let sent = (this.transport as RpcTransport).send(msgText) as Promise<void> | undefined;
             match transport.send(TransportMessage::Text(message_text.clone())) {
                 Ok(TransportSend::Done(_)) => {}
-                Ok(TransportSend::Pending(pending)) => Self::observe_send(state, pending),
+                Ok(TransportSend::Pending { sent, .. }) => Self::observe_send(state, sent),
                 Err(error) => Self::defer_abort(state, error),
             }
             // JS:         if (sent !== undefined && typeof sent.catch === "function") {
@@ -1808,9 +1812,9 @@ impl RpcSessionImpl {
                 codec: custom_codec,
             }) {
                 Ok(TransportSend::Done(size)) => size,
-                Ok(TransportSend::Pending(pending)) => {
-                    Self::observe_send(state, pending);
-                    None
+                Ok(TransportSend::Pending { size, sent }) => {
+                    Self::observe_send(state, sent);
+                    size
                 }
                 Err(error) => {
                     Self::defer_abort(state, error);

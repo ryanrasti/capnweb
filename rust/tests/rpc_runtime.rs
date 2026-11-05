@@ -59,10 +59,13 @@ impl AnyRpcTransport for RecordingTransport {
             SendBehavior::FailSynchronously => {
                 Err(Error::Message("synchronous send failure".to_owned()))
             }
-            SendBehavior::FailAsynchronously => Ok(TransportSend::Pending(Box::pin(async {
-                tokio::task::yield_now().await;
-                Err(Error::Message("asynchronous send failure".to_owned()))
-            }))),
+            SendBehavior::FailAsynchronously => Ok(TransportSend::Pending {
+                size: None,
+                sent: Box::pin(async {
+                    tokio::task::yield_now().await;
+                    Err(Error::Message("asynchronous send failure".to_owned()))
+                }),
+            }),
         }
     }
 

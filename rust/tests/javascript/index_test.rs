@@ -1352,9 +1352,10 @@ impl AnyRpcTransport for FailingSendTransport {
     }
     fn send(&self, _message: TransportMessage) -> Result<TransportSend> {
         match self.0 {
-            FailingSendMode::AsyncString => Ok(TransportSend::Pending(Box::pin(async {
-                Err(Error::Message("send failed".to_owned()))
-            }))),
+            FailingSendMode::AsyncString => Ok(TransportSend::Pending {
+                size: None,
+                sent: Box::pin(async { Err(Error::Message("send failed".to_owned())) }),
+            }),
             FailingSendMode::SyncString => Err(Error::Message("sync send failed".to_owned())),
             FailingSendMode::SyncCustom => {
                 Err(Error::Message("sync custom send failed".to_owned()))

@@ -239,7 +239,8 @@ impl AnyRpcTransport for UdsTransport {
         };
         let socket = Arc::clone(&self.socket);
         let send_lock = Arc::clone(&self.send_lock);
-        Ok(TransportSend::Pending(Box::pin(async move {
+        let size = Some(bytes.len());
+        let sent = Box::pin(async move {
             let _send_guard = send_lock.lock().await;
             loop {
                 let mut ready = socket.writable().await.map_err(|error| {
@@ -255,7 +256,8 @@ impl AnyRpcTransport for UdsTransport {
                     Err(_would_block) => continue,
                 }
             }
-        })))
+        });
+        Ok(TransportSend::Pending { size, sent })
     }
 
     fn receive(

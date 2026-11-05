@@ -232,7 +232,8 @@ impl AnyRpcTransport for FramedStreamTransport {
             .to_be_bytes();
         let state = Arc::clone(&self.state);
         let mut abort = state.abort_sender.subscribe();
-        Ok(TransportSend::Pending(Box::pin(async move {
+        let size = Some(length.len() + payload.len());
+        let sent = Box::pin(async move {
             let _codec = codec;
             let result = tokio::select! {
                 biased;
@@ -255,7 +256,8 @@ impl AnyRpcTransport for FramedStreamTransport {
                 state.abort(error.clone());
             }
             result
-        })))
+        });
+        Ok(TransportSend::Pending { size, sent })
     }
 
     fn receive(

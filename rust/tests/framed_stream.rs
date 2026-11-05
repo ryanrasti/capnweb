@@ -12,7 +12,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 async fn finish_send(send: TransportSend) -> Result<()> {
     match send {
         TransportSend::Done(_) => Ok(()),
-        TransportSend::Pending(send) => send.await,
+        TransportSend::Pending { sent, .. } => sent.await,
     }
 }
 
