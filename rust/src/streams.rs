@@ -895,6 +895,7 @@ pub(crate) async fn pump(mut source: ByteSource, hook: StubHook) {
             Ok(0) => break 'reading,
             Ok(n) => n,
             Err(error) => {
+                drop(source);
                 let reason =
                     CapnwebValue::Error(CapnwebError::from(Error::Message(error.to_string())));
                 if let Ok(call) = hook.stream(
@@ -946,6 +947,8 @@ pub(crate) async fn pump(mut source: ByteSource, hook: StubHook) {
             }
         }
     }
+    // (the source let go of at its end, not at the close's acknowledgement: a FIFO's reader gone at once)
+    drop(source);
     // (every write acknowledged before the close, so a failed write isn't followed by one)
     while let Some((token, result)) = acks.next().await {
         if result.is_err() {
