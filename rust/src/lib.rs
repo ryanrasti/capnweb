@@ -49,7 +49,9 @@ mod map;
 pub use map::force_init_map;
 // JS: import { forceInitStreams } from "./streams.js";
 mod streams;
-pub use streams::{FlowController, SendToken};
+pub use streams::{
+    ByteSink, ByteSource, FlowController, ReadableStream, SendToken, WritableStream,
+};
 pub mod channel;
 pub use channel::{BYTE_CHANNEL_VERSION, ByteChannel, ByteChannelSession};
 mod framed_stream;

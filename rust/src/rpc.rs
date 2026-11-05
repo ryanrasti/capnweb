@@ -323,6 +323,8 @@ fn estimate_encoded_size(value: &CapnwebValue, depth: usize) -> usize {
         | CapnwebValue::RpcPromise(_)
         | CapnwebValue::Target(_)
         | CapnwebValue::Function(_)
+        | CapnwebValue::ReadableStream(_)
+        | CapnwebValue::WritableStream(_)
         | CapnwebValue::Unsupported(_) => 16,
         // JS:   }
     }
@@ -2714,6 +2716,49 @@ impl Exporter for RpcSessionImpl {
 
     fn on_send_error(&mut self, error: CapnwebError) -> Option<CapnwebError> {
         self.on_send_error_impl(error)
+    }
+
+    // JS:   createPipe(readable: ReadableStream, readableHook: StubHook): ImportId {
+    // JS:     if (this.abortReason) throw this.abortReason;
+    // JS:     this.send(["pipe"]);
+    // JS:     let importId = this.imports.length;
+    // JS:     let entry = new ImportTableEntry(this, importId, false);
+    // JS:     this.imports.push(entry);
+    // JS:     let hook = new RpcImportHook(false, entry);
+    // JS:     let writable = streamImpl.createWritableStreamFromHook(hook);
+    // JS:     readable.pipeTo(writable).catch(() => {}).finally(() => readableHook.dispose());
+    // JS:     return importId;
+    // JS:   }
+    fn create_pipe(&mut self, source: crate::streams::ByteSource) -> Result<ImportId> {
+        if let Some(error) = self
+            .state
+            .lock()
+            .expect("RPC session mutex poisoned")
+            .abort_reason
+            .clone()
+        {
+            return Err(error);
+        }
+        Self::send(&self.state, tagged("pipe", []), None)?;
+        let entry = {
+            let mut session = self.state.lock().expect("RPC session mutex poisoned");
+            let import_id = session.next_import_id;
+            session.next_import_id += 1;
+            let entry = Arc::new(Mutex::new(ImportTableEntry::new(
+                &self.state,
+                session.id,
+                import_id,
+                false,
+            )));
+            session.imports.insert(import_id, Arc::clone(&entry));
+            entry
+        };
+        let import_id = entry.lock().expect("import entry mutex poisoned").import_id;
+        let hook: StubHook = Arc::new(RpcImportHook::new(false, entry));
+        // RUST-DIFF(byte streams): the pump reads the source and drops the import hook (its release)
+        // when it ends, in place of pipeTo() into a writable over the hook.
+        tokio::spawn(crate::streams::pump(source, hook));
+        Ok(import_id)
     }
 }
 

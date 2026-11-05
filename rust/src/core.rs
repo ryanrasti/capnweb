@@ -274,6 +274,10 @@ pub enum CapnwebValue {
     Target(Arc<dyn RpcTargetInner>),
     /// A serialized application error.
     Error(CapnwebError),
+    /// A byte stream sent as a JavaScript `ReadableStream`.
+    ReadableStream(crate::streams::ReadableStream),
+    /// A byte sink the peer receives as a JavaScript `WritableStream`.
+    WritableStream(crate::streams::WritableStream),
     /// A hydrated host value which cannot be represented on the wire.
     Unsupported(String),
 }
@@ -299,6 +303,8 @@ impl std::fmt::Debug for CapnwebValue {
             Self::RpcPromise(_) => formatter.write_str("RpcPromise(..)"),
             Self::Target(_) => formatter.write_str("Target(..)"),
             Self::Error(value) => formatter.debug_tuple("Error").field(value).finish(),
+            Self::ReadableStream(value) => value.fmt(formatter),
+            Self::WritableStream(value) => value.fmt(formatter),
             Self::Unsupported(value) => formatter.debug_tuple("Unsupported").field(value).finish(),
         }
     }
@@ -724,6 +730,8 @@ pub(crate) fn type_for_rpc(value: &CapnwebValue) -> TypeForRpc {
         // JS:       if (value instanceof RpcTarget) {
         // JS:         return "rpc-target";
         CapnwebValue::Target(_) => TypeForRpc::RpcTarget,
+        CapnwebValue::WritableStream(_) => TypeForRpc::Writable,
+        CapnwebValue::ReadableStream(_) => TypeForRpc::Readable,
         // JS:       }
         // JS:
 
@@ -2161,6 +2169,8 @@ impl RpcPayload {
             | CapnwebValue::BigInt(_)
             | CapnwebValue::Bytes(_)
             | CapnwebValue::Error(_)
+            | CapnwebValue::ReadableStream(_)
+            | CapnwebValue::WritableStream(_)
             | CapnwebValue::Unsupported(_) => value.clone(),
             CapnwebValue::Custom(_) => value.clone(),
             // JS:
@@ -2825,6 +2835,7 @@ impl RpcPayload {
             CapnwebValue::Stub(stub) => stub.hook.ignore_unhandled_rejections(),
             CapnwebValue::RpcPromise(promise) => promise.stub.hook.ignore_unhandled_rejections(),
             // JS:         return;
+            CapnwebValue::ReadableStream(_) | CapnwebValue::WritableStream(_) => {}
             CapnwebValue::Unsupported(_) => {
                 let _unsupported_value_has_no_rejection = ();
             } // Unsupported values contain no promises.

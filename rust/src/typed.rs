@@ -180,6 +180,18 @@ impl FromCapnwebValue for ByteChannel {
     }
 }
 
+impl IntoCapnwebValue for crate::streams::ReadableStream {
+    fn into_capnweb_value(self) -> Result<CapnwebValue> {
+        Ok(CapnwebValue::ReadableStream(self))
+    }
+}
+
+impl IntoCapnwebValue for crate::streams::WritableStream {
+    fn into_capnweb_value(self) -> Result<CapnwebValue> {
+        Ok(CapnwebValue::WritableStream(self))
+    }
+}
+
 impl<T: IntoCapnwebValue> IntoCapnwebValue for Vec<T> {
     fn into_capnweb_value(self) -> Result<CapnwebValue> {
         self.into_iter()

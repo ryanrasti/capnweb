@@ -77,7 +77,9 @@ source lines, but its Rust equivalent may be a localized unsupported branch.
 
 This currently includes:
 
-- ReadableStream and WritableStream integration;
+- receiving ReadableStream and WritableStream values (the `["pipe"]` message, and evaluating
+  `["readable", id]` and `["writable", id]`): Rust sends byte streams, `ReadableStream` and
+  `WritableStream` (`src/streams.rs`), on JavaScript's wire protocol, but takes none;
 - Blob;
 - Headers, Request, and Response;
 - HTTP/fetch integration;

@@ -5,9 +5,9 @@
 // JS: import { expect, it, describe } from "vitest"
 // JS: import { FlowController, type SendToken } from "../src/streams.js"
 use crate::streams::{FlowController, SendToken};
-use std::cell::Cell;
 use std::collections::VecDeque;
-use std::rc::Rc;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 // JS:
 // JS: // To emulate random-ish chunk sizes while keeping the test reproducible, we cycle through this
 // JS: // list of sizes.
@@ -23,6 +23,23 @@ const CHUNK_SIZES: [f64; 8] = [
     8.0,
 ];
 // JS:
+// RUST-DIFF(Send clock): the fake clock is shared through an atomic, as the flow controller's clock is Send.
+struct Clock(AtomicU64);
+
+impl Clock {
+    fn new(value: f64) -> Self {
+        Self(AtomicU64::new(value.to_bits()))
+    }
+
+    fn get(&self) -> f64 {
+        f64::from_bits(self.0.load(Ordering::Relaxed))
+    }
+
+    fn set(&self, value: f64) {
+        self.0.store(value.to_bits(), Ordering::Relaxed);
+    }
+}
+
 // JS: // Helper: simulates a stream with a fake clock and set RTT and bandwidth. Sends chunks, advances
 // JS: // time, and acks in order.
 // JS: class StreamSimulator {
@@ -43,7 +60,7 @@ struct StreamSimulator {
     // JS:
     // JS:   // Current simulated time.
     // JS:   t = 0;
-    t: Rc<Cell<f64>>,
+    t: Arc<Clock>,
     // JS:
     // JS:   // Are we currently blocked, according to the flow controller's return values from onSend/onAck?
     // JS:   blocked = false;
@@ -65,7 +82,7 @@ struct StreamSimulator {
 }
 impl StreamSimulator {
     fn new() -> Self {
-        let t = Rc::new(Cell::new(0.0));
+        let t = Arc::new(Clock::new(0.0));
         let clock = t.clone();
         Self {
             rtt: 100.0,

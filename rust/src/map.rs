@@ -409,6 +409,12 @@ impl Exporter for MapBuilder {
     // JS:   }
     // JS:
     // JS:   onSendError(error: Error): Error | void {
+    fn create_pipe(&mut self, _source: crate::streams::ByteSource) -> Result<ImportId> {
+        Err(Error::Message(
+            "Can't send a ReadableStream through map()".to_owned(),
+        ))
+    }
+
     fn on_send_error(&mut self, _error: CapnwebError) -> Option<CapnwebError> {
         // JS:     // TODO(someday): Can we use the error-sender hook from the RPC system somehow?
         None

@@ -223,12 +223,12 @@ pub struct FlowController {
     // JS:   // Time when the current round started.
     // JS:   private roundStartTime = 0;
     round_start_time: f64,
-    now: Box<dyn Fn() -> f64>,
+    now: Box<dyn Fn() -> f64 + Send>,
     // JS:
     // JS:   constructor(private now: () => number) {}
 }
 impl FlowController {
-    pub fn new(now: impl Fn() -> f64 + 'static) -> Self {
+    pub fn new(now: impl Fn() -> f64 + Send + 'static) -> Self {
         Self {
             window: INITIAL_WINDOW,
             bytes_in_flight: 0.0,
@@ -645,3 +645,319 @@ impl FlowController {
 // JS: streamImpl.createReadableStreamHook = ReadableStreamStubHook.create;
 // JS:
 // JS: export function forceInitStreams() {}
+
+// RUST-DIFF(byte streams): JavaScript passes any ReadableStream or WritableStream, whose chunks are
+// any RPC value. Rust passes byte streams: a `ReadableStream` is an `AsyncRead` source whose chunks
+// are sent as `Uint8Array`s, and a `WritableStream` an `AsyncWrite` sink that takes `Uint8Array`
+// chunks. Their wire format is JavaScript's: a ReadableStream is `["readable", importId]` over a
+// pipe the sender creates (`["pipe"]`) and pumps with `["stream"]` write calls under the flow
+// controller above; a WritableStream is `["writable", exportId]`, an exported hook taking
+// `write`, `close` and `abort` calls.
+
+use std::pin::Pin;
+use std::sync::{Arc, Mutex};
+
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
+use tokio::sync::{mpsc, oneshot};
+
+use crate::core::{
+    CapnwebError, CapnwebValue, Error, MapInstructions, MaybePromise, PayloadStubHook,
+    PromiseStubHook, PropertyKey, PropertyPath, Result, RpcPayload, StubHook, StubHookInner,
+};
+
+/// A byte source a [`ReadableStream`] sends.
+pub type ByteSource = Pin<Box<dyn AsyncRead + Send>>;
+/// A byte sink a [`WritableStream`] writes.
+pub type ByteSink = Pin<Box<dyn AsyncWrite + Send>>;
+
+/// The most a pumped ReadableStream sends per write call.
+const PIPE_CHUNK: usize = 64 * 1024;
+
+/// A byte stream sent to the peer as a JavaScript `ReadableStream` (its chunks `Uint8Array`s).
+///
+/// Single use: clones share it, and the first serialization takes the source.
+#[derive(Clone)]
+pub struct ReadableStream(Arc<Mutex<Option<ByteSource>>>);
+
+impl ReadableStream {
+    /// Wraps `source`, read until its end once the stream is sent.
+    pub fn new(source: impl AsyncRead + Send + 'static) -> Self {
+        Self(Arc::new(Mutex::new(Some(Box::pin(source)))))
+    }
+
+    pub(crate) fn take(&self) -> Result<ByteSource> {
+        self.0
+            .lock()
+            .expect("ReadableStream mutex poisoned")
+            .take()
+            .ok_or_else(|| Error::Message("ReadableStream was already sent".to_owned()))
+    }
+}
+
+impl std::fmt::Debug for ReadableStream {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("ReadableStream")
+    }
+}
+
+/// A byte sink the peer receives as a JavaScript `WritableStream` (taking `Uint8Array` chunks).
+///
+/// Single use: clones share it, and the first serialization takes the sink.
+#[derive(Clone)]
+pub struct WritableStream(Arc<Mutex<Option<ByteSink>>>);
+
+impl WritableStream {
+    /// Wraps `sink`: the peer's writes are written to it in order, its close shuts it down, and its
+    /// abort (or the stub's release without a close) drops it.
+    pub fn new(sink: impl AsyncWrite + Send + 'static) -> Self {
+        Self(Arc::new(Mutex::new(Some(Box::pin(sink)))))
+    }
+
+    pub(crate) fn take(&self) -> Result<ByteSink> {
+        self.0
+            .lock()
+            .expect("WritableStream mutex poisoned")
+            .take()
+            .ok_or_else(|| Error::Message("WritableStream was already sent".to_owned()))
+    }
+}
+
+impl std::fmt::Debug for WritableStream {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("WritableStream")
+    }
+}
+
+/// A call on an exported WritableStream, queued for its writer in the order it arrived.
+enum WriterOp {
+    Write(RpcPayload, oneshot::Sender<Result<()>>),
+    Close(oneshot::Sender<Result<()>>),
+    Abort(oneshot::Sender<Result<()>>),
+}
+
+/// An exported WritableStream: `write`, `close` and `abort` calls, taken in order by one writer task
+/// that owns the sink (as JavaScript's writer queues them).
+pub(crate) struct WritableStreamStubHook {
+    ops: mpsc::UnboundedSender<WriterOp>,
+}
+
+impl WritableStreamStubHook {
+    pub(crate) fn create(sink: ByteSink) -> StubHook {
+        let (ops, queue) = mpsc::unbounded_channel();
+        tokio::spawn(write_queue(sink, queue));
+        Arc::new(Self { ops })
+    }
+}
+
+/// The writer: each write's chunk written whole before the next; a failed write fails what follows;
+/// the queue's end without a close (the hook released) drops the sink, as JavaScript's dispose aborts.
+async fn write_queue(sink: ByteSink, mut queue: mpsc::UnboundedReceiver<WriterOp>) {
+    let mut sink = Some(sink);
+    let mut failed: Option<Error> = None;
+    while let Some(op) = queue.recv().await {
+        let (result, reply) = match op {
+            WriterOp::Write(args, reply) => {
+                (write_chunk(&mut sink, &mut failed, args).await, reply)
+            }
+            WriterOp::Close(reply) => {
+                let result = match (failed.clone(), sink.take()) {
+                    (Some(error), _) => Err(error),
+                    (None, Some(mut sink)) => sink.shutdown().await.map_err(io_error),
+                    (None, None) => Err(Error::Message("WritableStream is closed".to_owned())),
+                };
+                (result, reply)
+            }
+            WriterOp::Abort(reply) => {
+                sink = None;
+                failed
+                    .get_or_insert_with(|| Error::Message("WritableStream was aborted".to_owned()));
+                (Ok(()), reply)
+            }
+        };
+        let _ = reply.send(result);
+    }
+}
+
+async fn write_chunk(
+    sink: &mut Option<ByteSink>,
+    failed: &mut Option<Error>,
+    args: RpcPayload,
+) -> Result<()> {
+    if let Some(error) = failed {
+        return Err(error.clone());
+    }
+    let chunk = match args.deliver_resolve().await? {
+        CapnwebValue::Array(mut values) if values.len() == 1 => match values.remove(0) {
+            CapnwebValue::Bytes(bytes) => bytes,
+            other => {
+                return Err(Error::Type(format!(
+                    "WritableStream chunk is not bytes: {other:?}"
+                )));
+            }
+        },
+        other => {
+            return Err(Error::Type(format!(
+                "WritableStream write takes one chunk, got {other:?}"
+            )));
+        }
+    };
+    let Some(writer) = sink.as_mut() else {
+        return Err(Error::Message("WritableStream is closed".to_owned()));
+    };
+    if let Err(error) = writer.write_all(&chunk).await {
+        let error = io_error(error);
+        *failed = Some(error.clone());
+        *sink = None;
+        return Err(error);
+    }
+    Ok(())
+}
+
+fn io_error(error: std::io::Error) -> Error {
+    Error::Message(error.to_string())
+}
+
+impl StubHookInner for WritableStreamStubHook {
+    fn call(&self, path: PropertyPath, args: RpcPayload) -> Result<StubHook> {
+        let method = match path.as_slice() {
+            [PropertyKey::String(method)] => method.as_str(),
+            _ => {
+                return Err(Error::Message(
+                    "WritableStream stub only supports direct method calls".to_owned(),
+                ));
+            }
+        };
+        let (reply, settled) = oneshot::channel();
+        let op = match method {
+            "write" => WriterOp::Write(args, reply),
+            "close" => WriterOp::Close(reply),
+            "abort" => WriterOp::Abort(reply),
+            other => {
+                return Err(Error::Message(format!(
+                    "Unknown WritableStream method: {other}"
+                )));
+            }
+        };
+        if self.ops.send(op).is_err() {
+            return Err(Error::Message("WritableStream writer is gone".to_owned()));
+        }
+        Ok(PromiseStubHook::from_future(async move {
+            settled
+                .await
+                .map_err(|_| Error::Message("WritableStream writer is gone".to_owned()))??;
+            Ok(Arc::new(PayloadStubHook::new(RpcPayload::from_app_return(
+                CapnwebValue::Undefined,
+            ))) as StubHook)
+        }))
+    }
+
+    fn map(
+        &self,
+        _path: PropertyPath,
+        _captures: Vec<StubHook>,
+        _instructions: MapInstructions,
+    ) -> Result<StubHook> {
+        Err(Error::Message(
+            "Cannot use map() on a WritableStream".to_owned(),
+        ))
+    }
+
+    fn get(&self, _path: PropertyPath) -> Result<StubHook> {
+        Err(Error::Message(
+            "Cannot access properties on a WritableStream stub".to_owned(),
+        ))
+    }
+
+    fn pull(&self) -> Result<MaybePromise<RpcPayload>> {
+        Err(Error::Message(
+            "Cannot pull a WritableStream stub".to_owned(),
+        ))
+    }
+
+    fn ignore_unhandled_rejections(&self) {}
+
+    fn on_broken(&self, _callback: Box<dyn FnOnce(Error) + Send + 'static>) {}
+}
+
+/// A pipe's writing end: `source` read and sent as write calls on `hook` (the peer's pipe), in order,
+/// as many in flight as the flow controller's window allows; at its end a close, at a read error an
+/// abort. A rejected write (the peer's reader gone) stops it, dropping the source. `hook` is
+/// released at the end.
+pub(crate) async fn pump(mut source: ByteSource, hook: StubHook) {
+    let started = std::time::Instant::now();
+    let mut flow = FlowController::new(move || started.elapsed().as_secs_f64() * 1000.0);
+    let mut acks = futures::stream::FuturesUnordered::new();
+    let mut buffer = vec![0u8; PIPE_CHUNK];
+    use futures::StreamExt as _;
+    'reading: loop {
+        let read = source.read(&mut buffer).await;
+        let n = match read {
+            Ok(0) => break 'reading,
+            Ok(n) => n,
+            Err(error) => {
+                let reason =
+                    CapnwebValue::Error(CapnwebError::from(Error::Message(error.to_string())));
+                if let Ok(call) = hook.stream(
+                    vec![PropertyKey::String("abort".to_owned())],
+                    RpcPayload::from_app_params(CapnwebValue::Array(vec![reason])),
+                ) {
+                    let _ = call.promise.await;
+                }
+                return;
+            }
+        };
+        let payload = RpcPayload::from_app_params(CapnwebValue::Array(vec![CapnwebValue::Bytes(
+            buffer[..n].to_vec(),
+        )]));
+        let Ok(call) = hook.stream(vec![PropertyKey::String("write".to_owned())], payload) else {
+            return;
+        };
+        match call.size {
+            None => {
+                if call.promise.await.is_err() {
+                    return;
+                }
+            }
+            Some(size) => {
+                let (token, mut blocked) = flow.on_send(size as f64);
+                acks.push(async move { (token, call.promise.await) });
+                while blocked {
+                    match acks.next().await {
+                        Some((token, Ok(()))) => blocked = !flow.on_ack(token),
+                        Some((token, Err(_))) => {
+                            flow.on_error(token);
+                            return;
+                        }
+                        None => break,
+                    }
+                }
+            }
+        }
+        // (acks that have already come in, taken without waiting)
+        while let Some(Some((token, result))) = futures::FutureExt::now_or_never(acks.next()) {
+            match result {
+                Ok(()) => {
+                    flow.on_ack(token);
+                }
+                Err(_) => {
+                    flow.on_error(token);
+                    return;
+                }
+            }
+        }
+    }
+    // (every write acknowledged before the close, so a failed write isn't followed by one)
+    while let Some((token, result)) = acks.next().await {
+        if result.is_err() {
+            flow.on_error(token);
+            return;
+        }
+        flow.on_ack(token);
+    }
+    if let Ok(call) = hook.stream(
+        vec![PropertyKey::String("close".to_owned())],
+        RpcPayload::from_app_params(CapnwebValue::Array(Vec::new())),
+    ) {
+        let _ = call.promise.await;
+    }
+}

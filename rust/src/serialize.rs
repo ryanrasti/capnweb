@@ -246,7 +246,10 @@ pub trait Exporter {
     // JS:   // into the pipe's writable end. Returns the import ID assigned to the pipe. `hook` should be
     // JS:   // disposed when the pipe finishes.
     // JS:   createPipe(readable: ReadableStream, hook: StubHook): ImportId;
-    // RUST-DEFERRED(JS built-in: ReadableStream): pipe creation is not part of this trait yet.
+    /// Creates a pipe by sending a `["pipe"]` message, then pumps `source` into its writable end.
+    /// Returns the import ID assigned to the pipe.
+    // RUST-DIFF(byte streams): the source is an `AsyncRead`; no separate hook keeps it alive.
+    fn create_pipe(&mut self, source: crate::streams::ByteSource) -> Result<ImportId>;
     // JS:
     // JS:   onSendError(error: Error): Error | void;
     /// Optionally replaces an error raised while sending.
@@ -291,6 +294,12 @@ impl Exporter for NullExporter {
     // RUST-DEFERRED(JS built-in: ReadableStream): NullExporter has no pipe method.
     // JS:
     // JS:   onSendError(error: Error): Error | void {}
+    fn create_pipe(&mut self, _source: crate::streams::ByteSource) -> Result<ImportId> {
+        Err(Error::Message(
+            "Can't serialize ReadableStream in this context.".to_owned(),
+        ))
+    }
+
     fn on_send_error(&mut self, _error: CapnwebError) -> Option<CapnwebError> {
         None
     }
@@ -963,7 +972,27 @@ impl<'a> Devaluator<'a> {
             // JS:
             // JS:         return ["readable", importId];
             // JS:       }
-            // RUST-DEFERRED(JS built-in: ReadableStream/WritableStream): no dynamic stream variants exist.
+            CapnwebValue::WritableStream(stream) => {
+                if self.source.is_none() {
+                    return Err(Error::Message(
+                        "Can't serialize WritableStream in this context.".to_owned(),
+                    ));
+                }
+                let hook = crate::streams::WritableStreamStubHook::create(stream.take()?);
+                self.devaluate_hook("writable", hook)
+            }
+            CapnwebValue::ReadableStream(stream) => {
+                if self.source.is_none() {
+                    return Err(Error::Message(
+                        "Can't serialize ReadableStream in this context.".to_owned(),
+                    ));
+                }
+                let import_id = self.exporter.create_pipe(stream.take()?)?;
+                Ok(wire_tag(
+                    "readable",
+                    vec![CapnwebValue::Number(import_id as f64)],
+                ))
+            }
             // JS:
             // JS:       default:
             // JS:         kind satisfies never;
@@ -1109,6 +1138,8 @@ pub(crate) fn capnweb_to_json(value: &CapnwebValue) -> Result<serde_json::Value>
         | CapnwebValue::RpcPromise(_)
         | CapnwebValue::Target(_)
         | CapnwebValue::Error(_)
+        | CapnwebValue::ReadableStream(_)
+        | CapnwebValue::WritableStream(_)
         | CapnwebValue::Unsupported(_) => Err(Error::Type(
             "devalued string-level tree contains a non-JSON value".to_owned(),
         )),
@@ -2044,6 +2075,8 @@ impl<'a> Evaluator<'a> {
             | CapnwebValue::RpcPromise(_)
             | CapnwebValue::Target(_)
             | CapnwebValue::Error(_)
+            | CapnwebValue::ReadableStream(_)
+            | CapnwebValue::WritableStream(_)
             | CapnwebValue::Unsupported(_) => Err(Error::Type(
                 "encoded input contains an unsupported native value".to_owned(),
             )),
